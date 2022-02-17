@@ -31,7 +31,7 @@ target_link_libraries(
   glog::glog
   ${FOLLY_WITH_DEPENDENCIES})
 
-f(${VELOX_ENABLE_CACHELIB})
+if(${VELOX_ENABLE_CACHELIB})
   add_subdirectory(cachelib)
 endif()
 
