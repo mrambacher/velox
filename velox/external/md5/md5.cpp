@@ -24,6 +24,7 @@
  * needed on buffers full of bytes, and then call MD5Final, which
  * will fill a supplied 16-byte array with the digest.
  */
+#define FOLLY_HAVE_INT128_T 1
 #include "md5.h"
 #include <folly/Conv.h>
 #include <folly/Format.h>

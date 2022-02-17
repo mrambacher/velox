@@ -215,7 +215,7 @@ find_library(GMock gmock)
 find_package(glog REQUIRED)
 include_directories(SYSTEM ${GTEST_INCLUDE_DIRS})
 
-find_library(FMT fmt)
+find_package(fmt REQUIRED)
 
 find_library(EVENT event)
 
