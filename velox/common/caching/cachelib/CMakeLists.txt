@@ -13,28 +13,14 @@
 # limitations under the License.
 
 add_library(
-  velox_caching
-  DataCache.cpp
-  FileIds.cpp
-  StringIdMap.cpp
-  AsyncDataCache.cpp
-  ScanTracker.cpp
-  SsdCache.cpp
-  SsdFile.cpp
-  SsdFileTracker.cpp)
+  velox_cachelib
+  CachelibDataCache.cpp)
+
+target_include_directories(
+  velox_cachelib
+  PUBLIC ${CACHELIB_INCLUDE_DIRS})
+
 target_link_libraries(
-  velox_caching
-  velox_memory
-  velox_exception
-  velox_file
-  velox_time
-  glog::glog
+  velox_cachelib
+  ${CACHELIB_LIBRARIES}
   ${FOLLY_WITH_DEPENDENCIES})
-
-f(${VELOX_ENABLE_CACHELIB})
-  add_subdirectory(cachelib)
-endif()
-
-if(${VELOX_BUILD_TESTING})
-  add_subdirectory(tests)
-endif()

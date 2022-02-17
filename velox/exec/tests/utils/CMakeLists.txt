@@ -19,6 +19,12 @@ target_link_libraries(velox_temp_path velox_exception)
 add_library(velox_exec_test_util PlanBuilder.cpp QueryAssertions.cpp Cursor.cpp
                                  OperatorTestBase.cpp HiveConnectorTestBase.cpp)
 
+if(${VELOX_ENABLE_CACHELIB})
+target_link_libraries(
+  velox_exec_test_util
+  velox_cachelib)
+endif()
+
 target_link_libraries(
   velox_exec_test_util
   velox_temp_path

@@ -144,7 +144,6 @@ class HiveConnectorTestBase : public OperatorTestBase {
     return memory::MappedMemory::getInstance();
   }
 
-  SimpleLRUDataCache* dataCache;
   std::unique_ptr<folly::IOThreadPoolExecutor> executor_;
 };
 

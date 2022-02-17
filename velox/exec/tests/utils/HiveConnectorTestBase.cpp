@@ -15,6 +15,9 @@
  */
 
 #include "velox/exec/tests/utils/HiveConnectorTestBase.h"
+#ifdef VELOX_ENABLE_CACHELIB
+#include "velox/common/caching/cachelib/CachelibDataCache.h"
+#endif // VELOX_ENABLE_CACHELIB
 #include "velox/common/file/FileSystems.h"
 #include "velox/connectors/hive/HiveConnector.h"
 #include "velox/dwio/dwrf/reader/DwrfReader.h"
@@ -38,7 +41,16 @@ void HiveConnectorTestBase::SetUp() {
             ->newConnector(kHiveConnectorId, nullptr, nullptr, executor_.get());
     connector::registerConnector(hiveConnector);
   } else {
+#ifdef VELOX_ENABLE_CACHELIB
+    std::unordered_map<std::string, std::string> properties;
+    // 1GB of cache size
+    properties.emplace("cache.max-cache-size", "1024");
+    properties.emplace("cachelib.enable_hybrid_cache", "false");
+    auto config = std::make_shared<core::MemConfig>(properties);
+    auto dataCache = std::make_unique<CachelibDataCache>(std::move(config), "presto");
+#else
     auto dataCache = std::make_unique<SimpleLRUDataCache>(1UL << 30);
+#endif // VELOX_ENABLE_CACHELIB
     auto hiveConnector =
         connector::getConnectorFactory(
             connector::hive::HiveConnectorFactory::kHiveConnectorName)
