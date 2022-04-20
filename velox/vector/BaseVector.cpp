@@ -15,9 +15,12 @@
  */
 
 #include "velox/vector/BaseVector.h"
+#include "velox/type/StringView.h"
+#include "velox/type/Type.h"
 #include "velox/type/Variant.h"
 #include "velox/vector/ComplexVector.h"
 #include "velox/vector/DictionaryVector.h"
+#include "velox/vector/FlatVector.h"
 #include "velox/vector/LazyVector.h"
 #include "velox/vector/SequenceVector.h"
 #include "velox/vector/TypeAliases.h"
@@ -108,7 +111,7 @@ static VectorPtr addDictionary(
       std::move(vector),
       TypeKind::INTEGER,
       std::move(indices),
-      cdvi::EMPTY_METADATA,
+      SimpleVectorStats<typename KindToFlatVector<kind>::WrapperType>{},
       indicesBuffer->size() / sizeof(vector_size_t) /*distinctValueCount*/,
       base->getNullCount(),
       false /*isSorted*/,
@@ -141,7 +144,7 @@ addSequence(BufferPtr lengths, vector_size_t size, VectorPtr vector) {
       size,
       std::move(vector),
       std::move(lengths),
-      cdvi::EMPTY_METADATA,
+      SimpleVectorStats<typename KindToFlatVector<kind>::WrapperType>{},
       std::nullopt /*distinctCount*/,
       std::nullopt,
       false /*sorted*/,
@@ -174,7 +177,7 @@ addConstant(vector_size_t size, vector_size_t index, VectorPtr vector) {
       auto singleNull = BaseVector::create(vector->type(), 1, pool);
       singleNull->setNull(0, true);
       return std::make_shared<ConstantVector<T>>(
-          pool, size, 0, singleNull, cdvi::EMPTY_METADATA);
+          pool, size, 0, singleNull, SimpleVectorStats<T>{});
     } else {
       return std::make_shared<ConstantVector<T>>(
           pool, size, true, vector->type(), T());
@@ -204,7 +207,7 @@ addConstant(vector_size_t size, vector_size_t index, VectorPtr vector) {
   }
 
   return std::make_shared<ConstantVector<T>>(
-      pool, size, index, std::move(vector), cdvi::EMPTY_METADATA);
+      pool, size, index, std::move(vector), SimpleVectorStats<T>{});
 }
 
 // static
@@ -231,7 +234,7 @@ static VectorPtr createEmpty(
       size,
       std::move(values),
       std::vector<BufferPtr>(),
-      cdvi::EMPTY_METADATA,
+      SimpleVectorStats<T>{},
       0 /*distinctValueCount*/,
       0 /*nullCount*/,
       false /*isSorted*/,
@@ -329,7 +332,7 @@ VectorPtr BaseVector::create(
           size,
           BufferPtr(nullptr),
           std::vector<BufferPtr>(),
-          cdvi::EMPTY_METADATA,
+          SimpleVectorStats<UnknownValue>{},
           1 /*distinctValueCount*/,
           size /*nullCount*/,
           true /*isSorted*/,
@@ -342,13 +345,13 @@ VectorPtr BaseVector::create(
 }
 
 void BaseVector::addNulls(const uint64_t* bits, const SelectivityVector& rows) {
-  VELOX_CHECK(mayAddNulls());
+  VELOX_CHECK(isNullsWritable());
   VELOX_CHECK(length_ >= rows.end());
   ensureNulls();
   auto target = nulls_->asMutable<uint64_t>();
   const uint64_t* selected = rows.asRange().bits();
   if (!bits) {
-    // A A 1 in rows makes a 0 in nulls.
+    // A 1 in rows makes a 0 in nulls.
     bits::andWithNegatedBits(target, selected, rows.begin(), rows.end());
     return;
   }
@@ -365,7 +368,7 @@ void BaseVector::addNulls(const uint64_t* bits, const SelectivityVector& rows) {
 }
 
 void BaseVector::clearNulls(const SelectivityVector& rows) {
-  VELOX_CHECK(mayAddNulls());
+  VELOX_CHECK(isNullsWritable());
   if (!nulls_) {
     return;
   }
@@ -387,7 +390,7 @@ void BaseVector::clearNulls(const SelectivityVector& rows) {
 }
 
 void BaseVector::clearNulls(vector_size_t begin, vector_size_t end) {
-  VELOX_CHECK(mayAddNulls());
+  VELOX_CHECK(isNullsWritable());
   if (!nulls_) {
     return;
   }
@@ -536,7 +539,7 @@ VectorPtr newConstant(
       value.isNull(),
       Type::create<kind>(),
       std::move(copy),
-      cdvi::EMPTY_METADATA,
+      SimpleVectorStats<T>{},
       sizeof(T) /*representedByteCount*/);
 }
 
@@ -554,7 +557,7 @@ VectorPtr newConstant<TypeKind::OPAQUE>(
       value.isNull(),
       capsule.type,
       std::shared_ptr<void>(capsule.obj),
-      cdvi::EMPTY_METADATA,
+      SimpleVectorStats<std::shared_ptr<void>>{},
       sizeof(std::shared_ptr<void>) /*representedByteCount*/);
 }
 
@@ -622,16 +625,85 @@ bool BaseVector::isReusableFlatVector(const VectorPtr& vector) {
     return false;
   }
 
-  // Now check if nulls and values buffers also have a single reference and are
-  // mutable.
-  const auto& nulls = vector->nulls();
-  if (!nulls || (vector->nulls()->unique() && vector->nulls()->isMutable())) {
-    const auto& values = vector->values();
-    if (!values || (values->unique() && values->isMutable())) {
-      return true;
+  // Now check if nulls and values buffers also have a single reference and
+  // are mutable.
+  auto checkNullsAndValueBuffers = [&]() {
+    const auto& nulls = vector->nulls();
+    if (!nulls || (nulls->unique() && nulls->isMutable())) {
+      const auto& values = vector->values();
+      if (!values || (values->unique() && values->isMutable())) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  // Check that all string buffers are single referenced.
+  auto checkStringBuffers = [&]() {
+    if (vector->typeKind_ == TypeKind::VARBINARY ||
+        vector->typeKind_ == TypeKind::VARCHAR) {
+      for (auto& buffer : vector->asFlatVector<StringView>()->stringBuffers()) {
+        if (buffer->refCount() > 1) {
+          return false;
+        }
+      }
+    }
+    return true;
+  };
+  return checkNullsAndValueBuffers() && checkStringBuffers();
+}
+
+uint64_t BaseVector::estimateFlatSize() const {
+  if (length_ == 0) {
+    return 0;
+  }
+
+  if (isLazyNotLoaded(*this)) {
+    return 0;
+  }
+
+  auto leaf = wrappedVector();
+  VELOX_DCHECK_GT(leaf->size(), 0);
+  auto avgRowSize = 1.0 * leaf->retainedSize() / leaf->size();
+  return length_ * avgRowSize;
+}
+
+namespace {
+bool isFlatEncoding(VectorEncoding::Simple encoding) {
+  return encoding == VectorEncoding::Simple::FLAT ||
+      encoding == VectorEncoding::Simple::ARRAY ||
+      encoding == VectorEncoding::Simple::MAP ||
+      encoding == VectorEncoding::Simple::ROW;
+}
+} // namespace
+
+// static
+void BaseVector::prepareForReuse(
+    std::shared_ptr<BaseVector>& vector,
+    vector_size_t size) {
+  if (!vector.unique() || !isFlatEncoding(vector->encoding())) {
+    vector = BaseVector::create(vector->type(), size, vector->pool());
+    return;
+  }
+
+  vector->prepareForReuse();
+  vector->resize(size);
+}
+
+void BaseVector::prepareForReuse() {
+  // Check nulls buffer. Keep the buffer if singly-referenced and mutable and
+  // there is at least one null bit set. Reset otherwise.
+  if (nulls_) {
+    if (nulls_->unique() && nulls_->isMutable()) {
+      if (0 == BaseVector::countNulls(nulls_, length_)) {
+        nulls_ = nullptr;
+        rawNulls_ = nullptr;
+      }
+    } else {
+      nulls_ = nullptr;
+      rawNulls_ = nullptr;
     }
   }
-  return false;
 }
 
 } // namespace velox

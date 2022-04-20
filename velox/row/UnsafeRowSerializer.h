@@ -84,11 +84,8 @@ struct UnsafeRowSerializer {
   static std::optional<size_t>
   serialize(const DataType& data, char* buffer, size_t idx = 0) {
     VELOX_CHECK_NOT_NULL(buffer);
-    if constexpr (std::is_same<SqlType, TimestampType>::value) {
-      // Follow Spark, serialize timestamp as micros.
-      return serializeTimestampMicros(data, buffer, idx);
-    } else if constexpr (UnsafeRowStaticUtilities::isFixedWidth<SqlType>()) {
-      return serializeFixedLength<
+    if constexpr (UnsafeRowStaticUtilities::isFixedWidth<SqlType>()) {
+      return UnsafeRowSerializer::serializeFixedLength<
           UnsafeRowStaticUtilities::simpleSqlTypeToTypeKind<SqlType>()>(
           data, buffer, idx);
     } else if constexpr (
@@ -164,11 +161,16 @@ struct UnsafeRowSerializer {
   /// \return size of variable length data written, 0 if no variable length data
   /// is written or only fixed data length data is written, std::nullopt
   /// otherwise
-  template <TypeKind Kind, typename DataType>
-  inline static std::optional<size_t>
-  serializeFixedLength(const DataType& data, char* buffer, size_t idx = 0) {
-    constexpr size_t width = sizeof(typename TypeTraits<Kind>::NativeType);
-    reinterpret_cast<DataType*>(buffer)[0] = data;
+  template <TypeKind Kind>
+  inline static std::optional<size_t> serializeFixedLength(
+      const typename TypeTraits<Kind>::NativeType& data,
+      char* buffer,
+      size_t idx = 0) {
+    if constexpr (Kind == TypeKind::TIMESTAMP) {
+      *reinterpret_cast<int64_t*>(buffer) = data.toMicros();
+    } else {
+      *reinterpret_cast<typename TypeTraits<Kind>::NativeType*>(buffer) = data;
+    }
     return 0;
   }
 
@@ -183,20 +185,20 @@ struct UnsafeRowSerializer {
   /// otherwise
   template <TypeKind Kind>
   inline static std::optional<size_t>
-  serializeFixedLength(const VectorPtr& data, char* buffer, size_t idx) {
-    auto* rawData = data->loadedVector();
+  serializeFixedLength(const VectorPtr& vector, char* buffer, size_t idx) {
+    static_assert(TypeTraits<Kind>::isFixedWidth);
     // TODO: refactor to merge the decoding of a vector of fixed length,
     // Timestamp and StringView data.
     using NativeType = typename TypeTraits<Kind>::NativeType;
-    DCHECK_EQ(data->type()->kind(), Kind);
-    const auto& simple = static_cast<const SimpleVector<NativeType>&>(*rawData);
-
-    VELOX_CHECK(data->isIndexInRange(idx));
+    DCHECK_EQ(vector->type()->kind(), Kind);
+    const auto& simple =
+        *vector->loadedVector()->asUnchecked<SimpleVector<NativeType>>();
+    VELOX_CHECK(vector->isIndexInRange(idx));
 
     if (simple.isNullAt(idx)) {
       return std::nullopt;
     }
-    *reinterpret_cast<NativeType*>(buffer) = simple.valueAt(idx);
+    serializeFixedLength<Kind>(simple.valueAt(idx), buffer);
     return 0;
   }
 
@@ -243,44 +245,6 @@ struct UnsafeRowSerializer {
     throw("Unsupported data type for serializeStringView()");
   }
 
-  /// Serializes a Timestamp as microseconds since the epoch.
-  /// \param data
-  /// \param buffer Pre allocated buffer for the return value
-  /// \param idx This argument is ignored because data is not a Vector.
-  /// \return size of variable length data written, 0 if no variable length data
-  /// is written or only fixed data length data is written, std::nullopt
-  /// otherwise
-  inline static std::optional<size_t>
-  serializeTimestampMicros(const Timestamp data, char* buffer, size_t idx) {
-    // Spark Java writes the timestamp in micros as a Long.
-    return serializeFixedLength<TypeKind::BIGINT>(data.toMicros(), buffer, idx);
-  }
-
-  /// Serializes an element in a VectorPtr of Timestamps as microseconds.
-  /// \param data
-  /// \param buffer Pre allocated buffer for the return value
-  /// \param idx
-  /// \return size of variable length data written, 0 if no variable length data
-  /// is written or only fixed data length data is written, std::nullopt
-  /// otherwise
-  inline static std::optional<size_t>
-  serializeTimestampMicros(const VectorPtr& data, char* buffer, size_t idx) {
-    const auto& simple =
-        static_cast<SimpleVector<Timestamp>&>(*data->loadedVector());
-    VELOX_DCHECK(data->isIndexInRange(idx));
-    if (simple.isNullAt(idx)) {
-      return std::nullopt;
-    }
-    return serializeTimestampMicros(simple.valueAt(idx), buffer, idx);
-  }
-
-  /// Template definition for unsupported types.
-  template <typename T>
-  inline static std::optional<size_t>
-  serializeTimestampMicros(const T& data, char* buffer, size_t idx) {
-    throw("Unsupported data type for serializeTimestampMicros()");
-  }
-
   /// Write the data as a uint64_t at the given location.
   /// \param buffer
   /// \param data
@@ -292,34 +256,37 @@ struct UnsafeRowSerializer {
     return 0;
   }
 
-  /// Serializes a flat vector of data.
+  /// Serializes a vector of data.
   /// \tparam T
   /// \param nullSet pointer to where we should write the nullability
   /// \param offset
   /// \param size
-  /// \param flatVector non-null flatVector
+  /// \param data non-null vector
   /// \return size of variable length data written, 0 if no variable length data
   /// is written or only fixed data length data is written, std::nullopt
   /// otherwise
-  template <typename T>
-  inline static std::optional<size_t> serializeFlatVector(
+  template <TypeKind Kind>
+  inline static std::optional<size_t> serializeSimpleVector(
       char* nullSet,
       int32_t offset,
       size_t size,
-      const FlatVector<T>* flatVector) {
+      const BaseVector* data) {
+    using NativeType = typename TypeTraits<Kind>::NativeType;
+    const auto& simple =
+        *data->loadedVector()->asUnchecked<SimpleVector<NativeType>>();
     auto [nullLength, fixedDataStart] = computeFixedDataStart(nullSet, size);
-
+    size_t dataSize = size * sizeof(NativeType);
+    auto stride = Kind == TypeKind::TIMESTAMP ? 8 : sizeof(NativeType);
     for (int i = 0; i < size; i++) {
-      bool isNull = flatVector->isNullAt(i + offset);
+      bool isNull = simple.isNullAt(i + offset);
       if (isNull) {
         bits::setBit(nullSet, i);
       } else {
         bits::clearBit(nullSet, i);
-        reinterpret_cast<T*>(fixedDataStart)[i] =
-            flatVector->valueAt(i + offset);
+        serializeFixedLength<Kind>(
+            simple.valueAt(i + offset), fixedDataStart + i * stride);
       }
     }
-    size_t dataSize = size * sizeof(T);
     return UnsafeRow::alignToFieldWidth(dataSize);
   }
 
@@ -550,7 +517,7 @@ struct UnsafeRowSerializer {
         throw("Cannot cast to FlatVector\n");
       }
       auto serializedDataSize =
-          serializeFlatVector(nullSet, offset, size, flatVector);
+          serializeSimpleVector<kind>(nullSet, offset, size, vector.get());
       return UnsafeRow::alignToFieldWidth(
           nullSet - buffer + serializedDataSize.value_or(0));
     } else {

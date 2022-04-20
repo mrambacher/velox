@@ -46,6 +46,7 @@ void registerSimpleFunctions() {
   registerFunction<DayOfYearFunction, int64_t, Date>({"doy", "day_of_year"});
   registerFunction<HourFunction, int64_t, Timestamp>({"hour"});
   registerFunction<HourFunction, int64_t, Date>({"hour"});
+  registerFunction<HourFunction, int64_t, TimestampWithTimezone>({"hour"});
   registerFunction<MinuteFunction, int64_t, Timestamp>({"minute"});
   registerFunction<MinuteFunction, int64_t, Date>({"minute"});
   registerFunction<SecondFunction, int64_t, Timestamp>({"second"});
@@ -58,20 +59,28 @@ void registerSimpleFunctions() {
   registerFunction<DateAddFunction, Date, Varchar, int64_t, Date>({"date_add"});
   registerFunction<DateAddFunction, Timestamp, Varchar, int64_t, Timestamp>(
       {"date_add"});
+  registerFunction<DateDiffFunction, int64_t, Varchar, Date, Date>(
+      {"date_diff"});
+  registerFunction<DateDiffFunction, int64_t, Varchar, Timestamp, Timestamp>(
+      {"date_diff"});
+  registerFunction<DateFormatFunction, Varchar, Timestamp, Varchar>(
+      {"date_format"});
   registerFunction<
       ParseDateTimeFunction,
       TimestampWithTimezone,
       Varchar,
       Varchar>({"parse_datetime"});
+  registerFunction<DateFormatFunction, Varchar, Timestamp, Varchar>(
+      {"date_format"});
 }
 } // namespace
 
 void registerDateTimeFunctions() {
   registerSimpleFunctions();
 
-  registerType("timestamp with time zone", [](auto /*childTypes*/) {
-    return TIMESTAMP_WITH_TIME_ZONE();
-  });
+  registerType(
+      "timestamp with time zone",
+      std::make_unique<const TimestampWithTimeZoneTypeFactories>());
   VELOX_REGISTER_VECTOR_FUNCTION(udf_from_unixtime, "from_unixtime");
 }
 } // namespace facebook::velox::functions

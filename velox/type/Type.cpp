@@ -15,11 +15,15 @@
  */
 
 #include "velox/type/Type.h"
-#include <boost/algorithm/string.hpp>
-#include <boost/regex.hpp>
-#include <folly/Demangle.h>
+
 #include <sstream>
 #include <typeindex>
+
+#include <boost/algorithm/string.hpp>
+#include <boost/regex.hpp>
+
+#include <folly/Demangle.h>
+
 #include "velox/common/base/Exceptions.h"
 
 namespace std {
@@ -40,8 +44,10 @@ bool isColumnNameRequiringEscaping(const std::string& name) {
 
 namespace facebook::velox {
 
-TypeKind mapNameToTypeKind(const std::string& name) {
-  static std::unordered_map<std::string, TypeKind> typeStringMap{
+// Static variable intialization is not thread safe for non
+// constant-initialization, but scoped static initialization is thread safe.
+const std::unordered_map<std::string, TypeKind>& getTypeStringMap() {
+  static const std::unordered_map<std::string, TypeKind> kTypeStringMap{
       {"BOOLEAN", TypeKind::BOOLEAN},
       {"TINYINT", TypeKind::TINYINT},
       {"SMALLINT", TypeKind::SMALLINT},
@@ -60,10 +66,23 @@ TypeKind mapNameToTypeKind(const std::string& name) {
       {"UNKNOWN", TypeKind::UNKNOWN},
       {"OPAQUE", TypeKind::OPAQUE},
       {"INVALID", TypeKind::INVALID}};
+  return kTypeStringMap;
+}
 
-  auto found = typeStringMap.find(name);
+std::optional<TypeKind> tryMapNameToTypeKind(const std::string& name) {
+  auto found = getTypeStringMap().find(name);
 
-  if (found == typeStringMap.end()) {
+  if (found == getTypeStringMap().end()) {
+    return std::nullopt;
+  }
+
+  return found->second;
+}
+
+TypeKind mapNameToTypeKind(const std::string& name) {
+  auto found = getTypeStringMap().find(name);
+
+  if (found == getTypeStringMap().end()) {
     VELOX_USER_FAIL("Specified element is not found : {}", name);
   }
 
@@ -215,7 +234,9 @@ const std::shared_ptr<const Type>& MapType::childAt(uint32_t idx) const {
   } else if (idx == 1) {
     return valueType();
   }
-  VELOX_USER_FAIL("Map type should have only two children");
+  VELOX_USER_FAIL(
+      "Map type should have only two children. Tried to access child '{}'",
+      idx);
 }
 
 MapType::MapType(
@@ -348,7 +369,7 @@ size_t Type::hashKind() const {
 }
 
 bool Type::kindEquals(const std::shared_ptr<const Type>& other) const {
-  // recursive kind hasing (ignores names)
+  // recursive kind match (ignores names)
   if (this->kind() != other->kind()) {
     return false;
   }
@@ -611,18 +632,21 @@ bool Type::containsUnknown() const {
 
 namespace {
 
-using CustomTypeFactory =
-    std::function<TypePtr(std::vector<TypePtr> childTypes)>;
-
-std::unordered_map<std::string, CustomTypeFactory>& typeFactories() {
-  static std::unordered_map<std::string, CustomTypeFactory> factories;
+std::unordered_map<std::string, std::unique_ptr<const CustomTypeFactories>>&
+typeFactories() {
+  static std::
+      unordered_map<std::string, std::unique_ptr<const CustomTypeFactories>>
+          factories;
   return factories;
 }
+
 } // namespace
 
-void registerType(const std::string& name, CustomTypeFactory factory) {
+void registerType(
+    const std::string& name,
+    std::unique_ptr<const CustomTypeFactories> factories) {
   auto uppercaseName = boost::algorithm::to_upper_copy(name);
-  typeFactories().emplace(uppercaseName, factory);
+  typeFactories().emplace(uppercaseName, std::move(factories));
 }
 
 bool typeExists(const std::string& name) {
@@ -630,14 +654,34 @@ bool typeExists(const std::string& name) {
   return typeFactories().count(uppercaseName) > 0;
 }
 
-TypePtr getType(const std::string& name, std::vector<TypePtr> childTypes) {
+const CustomTypeFactories* FOLLY_NULLABLE
+getTypeFactories(const std::string& name) {
   auto uppercaseName = boost::algorithm::to_upper_copy(name);
   auto it = typeFactories().find(uppercaseName);
-  if (it == typeFactories().end()) {
-    return nullptr;
+
+  if (it != typeFactories().end()) {
+    return it->second.get();
   }
 
-  return it->second(std::move(childTypes));
+  return nullptr;
+}
+
+TypePtr getType(const std::string& name, std::vector<TypePtr> childTypes) {
+  auto factories = getTypeFactories(name);
+  if (factories) {
+    return factories->getType(std::move(childTypes));
+  }
+
+  return nullptr;
+}
+
+exec::CastOperatorPtr getCastOperator(const std::string& name) {
+  auto factories = getTypeFactories(name);
+  if (factories) {
+    return factories->getCastOperator();
+  }
+
+  return nullptr;
 }
 
 } // namespace facebook::velox

@@ -22,27 +22,12 @@
 #include "velox/dwio/type/fbhive/HiveTypeParser.h"
 #include "velox/exec/ContainerRowSerde.h"
 #include "velox/exec/VectorHasher.h"
-#include "velox/vector/tests/VectorMaker.h"
+#include "velox/vector/tests/VectorTestBase.h"
 
 using namespace facebook::velox;
 using namespace facebook::velox::exec;
 using namespace facebook::velox::test;
 using namespace facebook::velox::dwio;
-
-namespace {
-static void assertEqualVectors(
-    const VectorPtr& expected,
-    const VectorPtr& actual,
-    const std::string& additionalContext = "") {
-  ASSERT_EQ(expected->size(), actual->size());
-
-  for (auto i = 0; i < expected->size(); i++) {
-    ASSERT_TRUE(expected->equalValueAt(actual.get(), i, i))
-        << "at " << i << ": " << expected->toString(i) << " vs. "
-        << actual->toString(i) << additionalContext;
-  }
-}
-} // namespace
 
 class RowContainerTest : public testing::Test {
  protected:
@@ -124,8 +109,17 @@ class RowContainerTest : public testing::Test {
     for (size_t row = 0; row < size; ++row) {
       EXPECT_TRUE(expected->equalValueAt(result.get(), row, row))
           << "at " << row << ": expected " << expected->toString(row)
-          << ", got " << result->toString();
+          << ", got " << result->toString(row);
     }
+  }
+
+  void checkSizes(std::vector<char*>& rows, RowContainer& data) {
+    int64_t sum = 0;
+    for (auto row : rows) {
+      sum += data.rowSize(row) - data.fixedRowSize();
+    }
+    auto usage = data.stringAllocator().cumulativeBytes();
+    EXPECT_EQ(usage, sum);
   }
 
   // Stores the input vector in Row Container, extracts it and compares.
@@ -330,6 +324,7 @@ TEST_F(RowContainerTest, types) {
   EXPECT_EQ(kNumRows, data->listRows(&iter, kNumRows, rows.data()));
   EXPECT_EQ(data->listRows(&iter, kNumRows, rows.data()), 0);
 
+  checkSizes(rows, *data);
   SelectivityVector allRows(kNumRows);
   for (auto column = 0; column < batch->childrenSize(); ++column) {
     if (column < keys.size()) {
@@ -343,6 +338,7 @@ TEST_F(RowContainerTest, types) {
       data->store(decoded, index, rows[index], column);
     }
   }
+  checkSizes(rows, *data);
   data->checkConsistency();
   auto copy = std::static_pointer_cast<RowVector>(
       BaseVector::create(batch->type(), batch->size(), pool_.get()));

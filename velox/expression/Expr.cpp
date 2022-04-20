@@ -13,10 +13,14 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <boost/lexical_cast.hpp>
+#include <boost/uuid/uuid_generators.hpp>
+#include <boost/uuid/uuid_io.hpp>
 
-#include "velox/expression/Expr.h"
+#include "velox/common/base/SuccinctPrinter.h"
 #include "velox/core/Expressions.h"
 #include "velox/expression/ControlExpr.h"
+#include "velox/expression/Expr.h"
 #include "velox/expression/ExprCompiler.h"
 #include "velox/expression/VarSetter.h"
 #include "velox/expression/VectorFunction.h"
@@ -28,6 +32,43 @@ DEFINE_bool(
     "use of simplified expression evaluation path.");
 
 namespace facebook::velox::exec {
+
+namespace {
+folly::Synchronized<std::vector<std::shared_ptr<ExprSetListener>>>&
+listeners() {
+  static folly::Synchronized<std::vector<std::shared_ptr<ExprSetListener>>>
+      kListeners;
+  return kListeners;
+}
+} // namespace
+
+bool registerExprSetListener(std::shared_ptr<ExprSetListener> listener) {
+  return listeners().withWLock([&](auto& listeners) {
+    for (const auto& existingListener : listeners) {
+      if (existingListener == listener) {
+        // Listener already registered. Do not register again.
+        return false;
+      }
+    }
+    listeners.push_back(std::move(listener));
+    return true;
+  });
+}
+
+bool unregisterExprSetListener(
+    const std::shared_ptr<ExprSetListener>& listener) {
+  return listeners().withWLock([&](auto& listeners) {
+    for (auto it = listeners.begin(); it != listeners.end(); ++it) {
+      if ((*it) == listener) {
+        listeners.erase(it);
+        return true;
+      }
+    }
+
+    // Listener not found.
+    return false;
+  });
+}
 
 namespace {
 
@@ -220,51 +261,49 @@ void Expr::eval(
     const SelectivityVector& rows,
     EvalCtx* context,
     VectorPtr* result) {
-  try {
-    if (!rows.hasSelections()) {
-      // empty input, return an empty vector of the right type
-      *result = BaseVector::createNullConstant(type(), 0, context->pool());
-      return;
-    }
+  // Make sure to include current expression in the error message in case of an
+  // exception.
+  ExceptionContextSetter exceptionContext(
+      {[](auto* expr) { return static_cast<Expr*>(expr)->toString(); }, this});
 
-    // Check if there are any IFs, ANDs or ORs. These expressions are special
-    // because not all of their sub-expressions get evaluated on all the rows
-    // all the time. Therefore, we should delay loading lazy vectors until we
-    // know the minimum subset of rows needed to be loaded.
-    //
-    // If there is only one field, load it unconditionally. The very first IF,
-    // AND or OR will have to load it anyway. Pre-loading enables peeling of
-    // encodings at a higher level in the expression tree and avoids repeated
-    // peeling and wrapping in the sub-nodes.
-    //
-    // TODO: Re-work the logic of deciding when to load which field.
-    if (!hasConditionals_ || distinctFields_.size() == 1) {
-      // Load lazy vectors if any.
-      for (const auto& field : distinctFields_) {
-        context->ensureFieldLoaded(field->index(context), rows);
-      }
-    }
-
-    if (inputs_.empty()) {
-      evalAll(rows, context, result);
-      return;
-    }
-
-    // Check if this expression has been evaluated already. If so, fetch and
-    // return the previously computed result.
-    if (checkGetSharedSubexprValues(rows, context, result)) {
-      return;
-    }
-
-    evalEncodings(rows, context, result);
-
-    checkUpdateSharedSubexprValues(rows, context, *result);
-  } catch (const std::exception& e) {
-    LOG(INFO) << "Inside: " << rows.countSelected() << " from " << rows.begin()
-              << " to " << rows.end() << " wrap " << context->wrapEncoding()
-              << " expr " << toString();
-    throw;
+  if (!rows.hasSelections()) {
+    // empty input, return an empty vector of the right type
+    *result = BaseVector::createNullConstant(type(), 0, context->pool());
+    return;
   }
+
+  // Check if there are any IFs, ANDs or ORs. These expressions are special
+  // because not all of their sub-expressions get evaluated on all the rows
+  // all the time. Therefore, we should delay loading lazy vectors until we
+  // know the minimum subset of rows needed to be loaded.
+  //
+  // If there is only one field, load it unconditionally. The very first IF,
+  // AND or OR will have to load it anyway. Pre-loading enables peeling of
+  // encodings at a higher level in the expression tree and avoids repeated
+  // peeling and wrapping in the sub-nodes.
+  //
+  // TODO: Re-work the logic of deciding when to load which field.
+  if (!hasConditionals_ || distinctFields_.size() == 1) {
+    // Load lazy vectors if any.
+    for (const auto& field : distinctFields_) {
+      context->ensureFieldLoaded(field->index(context), rows);
+    }
+  }
+
+  if (inputs_.empty()) {
+    evalAll(rows, context, result);
+    return;
+  }
+
+  // Check if this expression has been evaluated already. If so, fetch and
+  // return the previously computed result.
+  if (checkGetSharedSubexprValues(rows, context, result)) {
+    return;
+  }
+
+  evalEncodings(rows, context, result);
+
+  checkUpdateSharedSubexprValues(rows, context, *result);
 }
 
 bool Expr::checkGetSharedSubexprValues(
@@ -634,13 +673,19 @@ void Expr::addNulls(
     return;
   }
 
-  if (!result->unique() || !(*result)->mayAddNulls()) {
+  if (!result->unique() || !(*result)->isNullsWritable()) {
     BaseVector::ensureWritable(
         SelectivityVector::empty(), type(), context->pool(), result);
   }
+
   if ((*result)->size() < rows.end()) {
-    (*result)->resize(rows.end());
+    // Not all Vectors support resize.  Since we only want to append nulls,
+    // we can work around that by calling setSize to resize the vector and
+    // ensureNullsCapacity to resize the nulls_ bit vector.
+    (*result)->setSize(rows.end());
+    (*result)->ensureNullsCapacity(rows.end(), true);
   }
+
   (*result)->addNulls(rawNulls, rows);
 }
 
@@ -901,6 +946,25 @@ void Expr::evalAll(
     }
   }
 
+  // If any errors occurred evaluating the arguments, it's possible (even
+  // likely) that the values for those arguments were not defined which could
+  // lead to undefined behavior if we try to evaluate the current function on
+  // them.  It's safe to skip evaluating them since the value for this branch
+  // of the expression tree will be NULL for those rows anyway.
+  if (context->errors()) {
+    if (remainingRows == &rows) {
+      nonNulls.allocate(rows.end());
+      *nonNulls.get() = rows;
+      remainingRows = nonNulls.get();
+    }
+    deselectErrors(context, *nonNulls.get());
+    if (!remainingRows->hasSelections()) {
+      inputValues_.clear();
+      setAllNulls(rows, context, result);
+      return;
+    }
+  }
+
   if (!tryPeelArgs ||
       !applyFunctionWithPeeling(rows, *remainingRows, context, result)) {
     applyFunction(*remainingRows, context, result);
@@ -1053,6 +1117,9 @@ void Expr::applyFunction(
     const SelectivityVector& rows,
     EvalCtx* context,
     VectorPtr* result) {
+  stats_.numProcessedRows += rows.countSelected();
+  CpuWallTimer timer(stats_.timing);
+
   computeIsAsciiForInputs(vectorFunction_.get(), inputValues_, rows);
   auto isAscii = type()->isVarchar()
       ? computeIsAsciiForResult(vectorFunction_.get(), inputValues_, rows)
@@ -1120,20 +1187,28 @@ void Expr::applySingleConstArgVectorFunction(
   }
 }
 
-std::string Expr::toString() const {
-  std::stringstream out;
-  out << name_;
+std::string Expr::toString(bool recursive) const {
+  if (recursive) {
+    std::stringstream out;
+    out << name_;
+    appendInputs(out);
+    return out.str();
+  }
+
+  return name_;
+}
+
+void Expr::appendInputs(std::stringstream& stream) const {
   if (!inputs_.empty()) {
-    out << "(";
+    stream << "(";
     for (auto i = 0; i < inputs_.size(); ++i) {
       if (i > 0) {
-        out << ", ";
+        stream << ", ";
       }
-      out << inputs_[i]->toString();
+      stream << inputs_[i]->toString();
     }
-    out << ")";
+    stream << ")";
   }
-  return out.str();
 }
 
 ExprSet::ExprSet(
@@ -1143,6 +1218,41 @@ ExprSet::ExprSet(
     : execCtx_(execCtx) {
   exprs_ = compileExpressions(
       std::move(sources), execCtx, this, enableConstantFolding);
+}
+
+namespace {
+void addStats(
+    const exec::Expr& expr,
+    std::unordered_map<std::string, exec::ExprStats>& stats) {
+  // Do not aggregate empty stats.
+  if (expr.stats().numProcessedRows) {
+    stats[expr.name()].add(expr.stats());
+  }
+
+  for (const auto& input : expr.inputs()) {
+    addStats(*input, stats);
+  }
+}
+
+std::string makeUuid() {
+  return boost::lexical_cast<std::string>(boost::uuids::random_generator()());
+}
+} // namespace
+
+ExprSet::~ExprSet() {
+  listeners().withRLock([&](auto& listeners) {
+    if (!listeners.empty()) {
+      std::unordered_map<std::string, exec::ExprStats> stats;
+      for (const auto& expr : exprs()) {
+        addStats(*expr, stats);
+      }
+
+      auto uuid = makeUuid();
+      for (auto& listener : listeners) {
+        listener->onCompletion(uuid, {stats});
+      }
+    }
+  });
 }
 
 void ExprSet::eval(
@@ -1200,4 +1310,33 @@ std::unique_ptr<ExprSet> makeExprSetFromFlag(
   return std::make_unique<ExprSet>(std::move(source), execCtx);
 }
 
+namespace {
+void printExprWithStats(
+    const exec::Expr& expr,
+    const std::string& indent,
+    std::stringstream& out) {
+  const auto& stats = expr.stats();
+  out << indent << expr.toString(false)
+      << " [cpu time: " << succinctNanos(stats.timing.cpuNanos)
+      << ", rows: " << stats.numProcessedRows << "] -> "
+      << expr.type()->toString() << std::endl;
+
+  auto newIndent = indent + "   ";
+  for (const auto& input : expr.inputs()) {
+    printExprWithStats(*input, newIndent, out);
+  }
+}
+} // namespace
+
+std::string printExprWithStats(const exec::ExprSet& exprSet) {
+  const auto& exprs = exprSet.exprs();
+  std::stringstream out;
+  for (auto i = 0; i < exprs.size(); ++i) {
+    if (i > 0) {
+      out << std::endl;
+    }
+    printExprWithStats(*exprs[i], "", out);
+  }
+  return out.str();
+}
 } // namespace facebook::velox::exec

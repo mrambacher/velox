@@ -19,7 +19,7 @@ set -eufx -o pipefail
 # Folly must be built with the same compiler flags so that some low level types
 # are the same size.
 export COMPILER_FLAGS="-mavx2 -mfma -mavx -mf16c -masm=intel -mlzcnt"
-FB_OS_VERSION=v2021.05.10.00
+FB_OS_VERSION=v2022.03.14.00
 NPROC=$(getconf _NPROCESSORS_ONLN)
 DEPENDENCY_DIR=${DEPENDENCY_DIR:-$(pwd)}
 
@@ -98,8 +98,11 @@ function cmake_install {
     rm -rf "${BINARY_DIR}"
   fi
   mkdir -p "${BINARY_DIR}"
+
+  # CMAKE_POSITION_INDEPENDENT_CODE is required so that Velox can be built into dynamic libraries \
   cmake -Wno-dev -B"${BINARY_DIR}" \
     -GNinja \
+    -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
     -DCMAKE_CXX_STANDARD=17 \
     "${INSTALL_PREFIX+-DCMAKE_PREFIX_PATH=}${INSTALL_PREFIX-}" \
     "${INSTALL_PREFIX+-DCMAKE_INSTALL_PREFIX=}${INSTALL_PREFIX-}" \
@@ -110,7 +113,7 @@ function cmake_install {
 }
 
 function install_fmt {
-  github_checkout fmtlib/fmt 7.1.3
+  github_checkout fmtlib/fmt 8.0.0
   cmake_install -DFMT_TEST=OFF
 }
 
@@ -121,8 +124,6 @@ function install_folly {
 
 function install_velox_deps {
   run_and_time install_fmt
-  sudo ln -s /usr/local/lib/libfmt.a /usr/lib/x86_64-linux-gnu/libfmt.a
-
   run_and_time install_folly
 }
 

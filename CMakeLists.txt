@@ -28,7 +28,6 @@ option(
   VELOX_BUILD_MINIMAL
   "Build a minimal set of components only. This will override other build options."
   OFF)
-option(VELOX_BUILD_BENCHMARKS "Build top level benchmarks." OFF)
 
 option(VELOX_ENABLE_DUCKDB "Build duckDB to enable differential testing." ON)
 option(VELOX_ENABLE_EXEC "Build exec." ON)
@@ -40,8 +39,10 @@ option(VELOX_ENABLE_EXPRESSION "Build expression." ON)
 option(VELOX_ENABLE_PARSE "Build parser used for unit tests." ON)
 option(VELOX_ENABLE_EXAMPLES
        "Build examples. This will enable VELOX_ENABLE_EXPRESSION automatically."
-       ON)
+       OFF)
+option(VELOX_ENABLE_SUBSTRAIT "Buid Substrait-to-Velox converter." OFF)
 option(VELOX_ENABLE_BENCHMARKS "Build velox top level benchmarks." OFF)
+option(VELOX_ENABLE_BENCHMARKS_BASIC "Build velox basic benchmarks." OFF)
 option(VELOX_ENABLE_S3 "Build S3 Connector" OFF)
 option(VELOX_ENABLE_CACHELIB "Build CacheLib DataCache" OFF)
 option(VELOX_ENABLE_PARQUET "Enable Parquet support" OFF)
@@ -51,7 +52,6 @@ if(${VELOX_BUILD_MINIMAL})
   # Enable and disable components for velox base build
   set(VELOX_BUILD_TESTING OFF)
   set(VELOX_ENABLE_PRESTO_FUNCTIONS ON)
-  set(VELOX_ENABLE_BENCHMARKS OFF)
   set(VELOX_ENABLE_DUCKDB OFF)
   set(VELOX_ENABLE_EXPRESSION ON)
   set(VELOX_ENABLE_PARSE OFF)
@@ -62,6 +62,8 @@ if(${VELOX_BUILD_MINIMAL})
   set(VELOX_ENABLE_EXAMPLES OFF)
   set(VELOX_ENABLE_CACHELIB OFF)
   set(VELOX_ENABLE_S3 OFF)
+  set(VELOX_ENABLE_SUBSTRAIT OFF)
+  set(VELOX_CODEGEN_SUPPORT OFF)
 endif()
 
 if(${VELOX_BUILD_TESTING})
@@ -75,16 +77,25 @@ if(${VELOX_BUILD_TESTING})
   set(VELOX_ENABLE_HIVE_CONNECTOR ON)
   set(VELOX_ENABLE_SPARK_FUNCTIONS ON)
   set(VELOX_ENABLE_TEST_UTILS OFF)
+  set(VELOX_ENABLE_EXAMPLES ON)
 endif()
 
 if(${VELOX_ENABLE_EXAMPLES})
   set(VELOX_ENABLE_EXPRESSION ON)
+  set(VELOX_ENABLE_TEST_UTILS ON)
 endif()
 
-if(${VELOX_BUILD_BENCHMARKS})
-  set(VELOX_ENABLE_BENCHMARKS ON)
+if(${VELOX_ENABLE_BENCHMARKS} OR ${VELOX_ENABLE_BENCHMARKS_BASIC})
   set(VELOX_ENABLE_DUCKDB ON)
   set(VELOX_ENABLE_PARSE ON)
+endif()
+
+if(${VELOX_BUILD_BENCHMARKS_LARGE})
+  set(VELOX_ENABLE_PARQUET ON)
+  set(VELOX_ENABLE_PRESTO_FUNCTIONS ON)
+  set(VELOX_ENABLE_PARSE ON)
+  set(VELOX_ENABLE_AGGREGATES ON)
+  set(VELOX_ENABLE_EXEC ON)
   set(VELOX_BUILD_TEST_UTILS ON)
 endif()
 
@@ -218,13 +229,8 @@ include_directories(SYSTEM ${Boost_INCLUDE_DIRS})
 # Range-v3 will be enable when the codegen code actually lands keeping it here
 # for reference. find_package(range-v3)
 
-find_package(GTest REQUIRED)
 find_package(gflags COMPONENTS shared)
-
-find_library(GMock gmock)
-
 find_package(glog REQUIRED)
-include_directories(SYSTEM ${GTEST_INCLUDE_DIRS})
 
 find_package(fmt REQUIRED)
 
@@ -232,12 +238,15 @@ find_library(EVENT event)
 
 find_library(DOUBLE_CONVERSION double-conversion)
 
-find_library(LZ4 lz4)
-find_library(LZO lzo2)
+if(NOT ${VELOX_BUILD_MINIMAL})
+  find_library(LZ4 lz4)
+  find_library(LZO lzo2)
+  find_library(ZSTD zstd)
+  find_package(ZLIB)
+  find_library(SNAPPY snappy)
+endif()
+
 find_library(RE2 re2 REQUIRED)
-find_library(ZSTD zstd)
-find_package(ZLIB)
-find_library(SNAPPY snappy)
 
 if(CMAKE_SYSTEM_NAME MATCHES "Darwin")
   set(CMAKE_PREFIX_PATH "/usr/local/opt/icu4c" ${CMAKE_PREFIX_PATH})
@@ -254,14 +263,18 @@ set(FOLLY_WITH_DEPENDENCIES
 set(FOLLY ${FOLLY_LIBRARIES})
 set(FOLLY_BENCHMARK Folly::follybenchmark)
 
-find_package(BZip2 MODULE)
-if(BZIP2_FOUND)
-  list(APPEND FOLLY_WITH_DEPENDENCIES ${BZIP2_LIBRARIES})
+if(NOT ${VELOX_BUILD_MINIMAL})
+  find_package(BZip2 MODULE)
+  if(BZIP2_FOUND)
+    list(APPEND FOLLY_WITH_DEPENDENCIES ${BZIP2_LIBRARIES})
+  endif()
 endif()
 
 include_directories(SYSTEM ${FOLLY_INCLUDE_DIRS})
 
-find_package(Protobuf 3.0.0 REQUIRED)
+if(NOT ${VELOX_BUILD_MINIMAL})
+  find_package(Protobuf 3.0.0 REQUIRED)
+endif()
 
 # GCC needs to link a library to enable std::filesystem.
 if("${CMAKE_CXX_COMPILER_ID}" MATCHES "GNU")
@@ -286,6 +299,7 @@ endif()
 include_directories(SYSTEM velox)
 include_directories(SYSTEM velox/external)
 include_directories(SYSTEM velox/external/duckdb)
+include_directories(SYSTEM velox/external/duckdb/tpch/dbgen/include)
 
 include(CTest) # include after project() but before add_subdirectory()
 
@@ -295,4 +309,5 @@ include_directories(.)
 # generates an installable makefile.
 install(FILES velox/type/Type.h DESTINATION "include/velox")
 
+add_subdirectory(third_party)
 add_subdirectory(velox)

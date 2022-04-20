@@ -122,6 +122,10 @@ class ApproxDistinctAggregate : public exec::Aggregate {
     return sizeof(HllAccumulator);
   }
 
+  bool isFixedSize() const override {
+    return false;
+  }
+
   void initializeNewGroups(
       char** groups,
       folly::Range<const vector_size_t*> indices) override {
@@ -144,7 +148,7 @@ class ApproxDistinctAggregate : public exec::Aggregate {
       VELOX_CHECK(result);
       auto flatResult = (*result)->asFlatVector<int64_t>();
 
-      extract(
+      extract<true>(
           groups,
           numGroups,
           flatResult,
@@ -161,7 +165,7 @@ class ApproxDistinctAggregate : public exec::Aggregate {
     VELOX_CHECK(result);
     auto flatResult = (*result)->asFlatVector<StringView>();
 
-    extract(
+    extract<false>(
         groups,
         numGroups,
         flatResult,
@@ -201,6 +205,7 @@ class ApproxDistinctAggregate : public exec::Aggregate {
         }
 
         auto group = groups[row];
+        auto tracker = trackRowSize(group);
         auto accumulator = value<HllAccumulator>(group);
         if (clearNull(group)) {
           accumulator->setIndexBitLength(indexBitLength_);
@@ -225,6 +230,7 @@ class ApproxDistinctAggregate : public exec::Aggregate {
       }
 
       auto group = groups[row];
+      auto tracker = trackRowSize(group);
       clearNull(group);
 
       auto serialized = decodedHll_.valueAt<StringView>(row);
@@ -239,6 +245,7 @@ class ApproxDistinctAggregate : public exec::Aggregate {
       const SelectivityVector& rows,
       const std::vector<VectorPtr>& args,
       bool /*mayPushdown*/) override {
+    auto tracker = trackRowSize(group);
     if (hllAsRawInput_) {
       addSingleGroupIntermediateResults(group, rows, args, false /*unused*/);
     } else {
@@ -267,6 +274,7 @@ class ApproxDistinctAggregate : public exec::Aggregate {
       bool /*mayPushdown*/) override {
     decodedHll_.decode(*args[0], row, true);
 
+    auto tracker = trackRowSize(group);
     row.applyToSelected([&](auto row) {
       if (decodedHll_.isNullAt(row)) {
         return;
@@ -282,7 +290,10 @@ class ApproxDistinctAggregate : public exec::Aggregate {
   }
 
  private:
-  template <typename ExtractResult, typename ExtractFunc>
+  template <
+      bool convertNullToZero,
+      typename ExtractResult,
+      typename ExtractFunc>
   void extract(
       char** groups,
       int32_t numGroups,
@@ -300,7 +311,14 @@ class ApproxDistinctAggregate : public exec::Aggregate {
     for (auto i = 0; i < numGroups; ++i) {
       char* group = groups[i];
       if (isNull(group)) {
-        result->setNull(i, true);
+        if constexpr (convertNullToZero) {
+          // This condition is for approx_distinct. approx_distinct is an
+          // approximation of count(distinct), hence, it makes sense for it to
+          // be consistent with count(distinct) which returns 0 for null input.
+          result->set(i, 0);
+        } else {
+          result->setNull(i, true);
+        }
       } else {
         if (rawNulls) {
           bits::clearBit(rawNulls, i);

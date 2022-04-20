@@ -13,6 +13,7 @@
 # limitations under the License.
 add_subdirectory(json)
 add_subdirectory(hyperloglog)
+add_subdirectory(types)
 
 add_library(
   velox_functions_prestosql_impl OBJECT
@@ -23,7 +24,6 @@ add_library(
   ArrayIntersectExcept.cpp
   ArrayMinMax.cpp
   ArrayPosition.cpp
-  Cardinality.cpp
   Coalesce.cpp
   ElementAt.cpp
   FilterFunctions.cpp
@@ -56,7 +56,8 @@ target_link_libraries(
   velox_functions_lib
   velox_expression
   md5
-  velox_type_tz)
+  velox_type_tz
+  velox_presto_types)
 
 set_property(TARGET velox_functions_prestosql_impl PROPERTY JOB_POOL_COMPILE
                                                             high_memory_pool)

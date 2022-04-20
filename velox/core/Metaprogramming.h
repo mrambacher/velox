@@ -21,6 +21,12 @@
 
 namespace facebook::velox::util {
 
+template <typename T>
+struct is_shared_ptr : std::false_type {};
+
+template <typename T>
+struct is_shared_ptr<std::shared_ptr<T>> : std::true_type {};
+
 template <template <typename> class Transformer, typename E>
 struct tuple_xform {};
 
@@ -173,4 +179,21 @@ struct has_method {
     }                                                          \
   };
 
+// Calling Name::resolve<T>::type will return T::TypeName if T::TypeName
+// exists, and otherwise will return T::OtherTypeName (it's existence is not
+// checked)
+#define DECLARE_CONDITIONAL_TYPE_NAME(Name, TypeName, OtherTypeName) \
+  struct Name {                                                      \
+    template <typename __T, typename = void>                         \
+    struct resolve {                                                 \
+      using type = typename __T::OtherTypeName;                      \
+    };                                                               \
+                                                                     \
+    template <typename __T>                                          \
+    struct resolve<                                                  \
+        __T,                                                         \
+        std::void_t<decltype(sizeof(typename __T::TypeName))>> {     \
+      using type = typename __T::TypeName;                           \
+    };                                                               \
+  };
 } // namespace facebook::velox::util
