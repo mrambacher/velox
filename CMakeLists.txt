@@ -270,7 +270,7 @@ if(NOT ${VELOX_BUILD_MINIMAL})
   endif()
 endif()
 
-include_directories(SYSTEM ${FOLLY_INCLUDE_DIRS})
+include_directories(SYSTEM ${FOLLY_INCLUDE_DIR})
 
 if(NOT ${VELOX_BUILD_MINIMAL})
   find_package(Protobuf 3.0.0 REQUIRED)

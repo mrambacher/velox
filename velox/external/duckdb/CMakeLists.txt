@@ -21,5 +21,6 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wno-deprecated-declarations)
 endif()
 add_library(duckdb duckdb.cpp parquet-amalgamation.cpp)
+target_link_libraries(duckdb ${CMAKE_DL_LIBS})
 
 set_property(TARGET duckdb PROPERTY JOB_POOL_COMPILE high_memory_pool)
