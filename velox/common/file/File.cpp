@@ -26,14 +26,6 @@
 
 namespace facebook::velox {
 
-std::string_view InMemoryReadFile::pread(
-    uint64_t offset,
-    uint64_t length,
-    Arena* /*unused_arena*/) const {
-  bytesRead_ += length;
-  return file_.substr(offset, length);
-}
-
 std::string_view
 InMemoryReadFile::pread(uint64_t offset, uint64_t length, void* buf) const {
   bytesRead_ += length;
@@ -95,20 +87,12 @@ void LocalReadFile::preadInternal(uint64_t offset, uint64_t length, char* pos)
 }
 
 std::string_view
-LocalReadFile::pread(uint64_t offset, uint64_t length, Arena* arena) const {
-  char* pos = arena->reserve(length);
-  preadInternal(offset, length, pos);
-  return {pos, length};
-}
-
-std::string_view
 LocalReadFile::pread(uint64_t offset, uint64_t length, void* buf) const {
   preadInternal(offset, length, static_cast<char*>(buf));
   return {static_cast<char*>(buf), length};
 }
 
 std::string LocalReadFile::pread(uint64_t offset, uint64_t length) const {
-  // TODO: use allocator that doesn't initialize memory?
   std::string result(length, 0);
   char* pos = result.data();
   preadInternal(offset, length, pos);
@@ -165,8 +149,9 @@ LocalWriteFile::LocalWriteFile(std::string_view path) {
     VELOX_CHECK(
         !exists, "Failure in LocalWriteFile: path '{}' already exists.", path);
   }
-  file_ = fopen(buf.get(), "ab");
-  VELOX_CHECK(file_, "fread failure in LocalWriteFile constructor, {}.", path);
+  auto file = fopen(buf.get(), "ab");
+  VELOX_CHECK(file, "fopen failure in LocalWriteFile constructor, {}.", path);
+  file_ = file;
 }
 
 LocalWriteFile::~LocalWriteFile() {

@@ -13,11 +13,9 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
-#include <immintrin.h>
-
 #include <folly/hash/Hash.h>
 
+#include <velox/vector/BaseVector.h>
 #include "velox/common/base/Exceptions.h"
 #include "velox/common/base/SimdUtil.h"
 #include "velox/vector/BuilderTypeUtils.h"
@@ -69,9 +67,13 @@ Range<T> FlatVector<T>::asRange() const {
 }
 
 template <typename T>
-__m256i FlatVector<T>::loadSIMDValueBufferAt(size_t byteOffset) const {
-  return _mm256_loadu_si256(reinterpret_cast<const __m256i*>(
-      reinterpret_cast<uint8_t*>(rawValues_) + byteOffset));
+xsimd::batch<T> FlatVector<T>::loadSIMDValueBufferAt(size_t byteOffset) const {
+  auto mem = reinterpret_cast<uint8_t*>(rawValues_) + byteOffset;
+  if constexpr (std::is_same_v<T, bool>) {
+    return xsimd::batch<T>(xsimd::load_unaligned(mem));
+  } else {
+    return xsimd::load_unaligned(reinterpret_cast<T*>(mem));
+  }
 }
 
 template <typename T>
@@ -111,7 +113,7 @@ std::unique_ptr<SimpleVector<uint64_t>> FlatVector<T>::hashAll() const {
       BaseVector::length_,
       std::move(hashBuffer),
       std::vector<BufferPtr>() /*stringBuffers*/,
-      folly::F14FastMap<std::string, std::string>(),
+      SimpleVectorStats<uint64_t>{}, /* stats */
       std::nullopt /*distinctValueCount*/,
       0 /*nullCount*/,
       false /*sorted*/,
@@ -128,7 +130,7 @@ bool FlatVector<T>::useSimdEquality(size_t numCmpVals) const {
     // whether or not to pursue the SIMD path or the fallback path.
     auto fallbackCost = SET_CMP_COST * BaseVector::length_;
     auto simdCost = SIMD_CMP_COST * numCmpVals * BaseVector::length_ /
-        simd::Vectors<T>::VSize;
+        xsimd::batch<T>::size;
     return simdCost <= fallbackCost;
   }
 }
@@ -149,8 +151,15 @@ void FlatVector<T>::copyValuesAndNulls(
   if (source->mayHaveNulls()) {
     rawNulls = BaseVector::mutableRawNulls();
   }
+
+  // Allocate values buffer if not allocated yet. This may happen if vector
+  // contains only null values.
+  if (!values_) {
+    mutableRawValues();
+  }
+
   if (source->encoding() == VectorEncoding::Simple::FLAT) {
-    auto flat = source->as<FlatVector<T>>();
+    auto flat = source->asUnchecked<FlatVector<T>>();
     auto* sourceValues =
         source->typeKind() != TypeKind::UNKNOWN ? flat->rawValues() : nullptr;
     if (toSourceRow) {
@@ -168,7 +177,7 @@ void FlatVector<T>::copyValuesAndNulls(
       }
     } else {
       VELOX_CHECK_GE(source->size(), rows.end());
-      while (iter.next(row)) {
+      rows.applyToSelected([&](vector_size_t row) {
         if (sourceValues) {
           rawValues_[row] = sourceValues[row];
         }
@@ -176,24 +185,20 @@ void FlatVector<T>::copyValuesAndNulls(
           bits::setNull(
               rawNulls, row, sourceNulls && bits::isBitNull(sourceNulls, row));
         }
-      }
+      });
     }
   } else if (source->isConstantEncoding()) {
     if (source->isNullAt(0)) {
       BaseVector::addNulls(nullptr, rows);
       return;
     }
-    auto constant = source->as<ConstantVector<T>>();
+    auto constant = source->asUnchecked<ConstantVector<T>>();
     T value = constant->valueAt(0);
-    while (iter.next(row)) {
-      rawValues_[row] = value;
-    }
-    if (rawNulls) {
-      bits::orBits(rawNulls, rows.asRange().bits(), rows.begin(), rows.end());
-    }
+    rows.applyToSelected([&](int32_t row) { rawValues_[row] = value; });
+    rows.clearNulls(rawNulls);
   } else {
     auto sourceVector = source->typeKind() != TypeKind::UNKNOWN
-        ? source->as<SimpleVector<T>>()
+        ? source->asUnchecked<SimpleVector<T>>()
         : nullptr;
     while (iter.next(row)) {
       auto sourceRow = toSourceRow ? toSourceRow[row] : row;
@@ -227,9 +232,20 @@ void FlatVector<T>::copyValuesAndNulls(
   if (source->mayHaveNulls()) {
     rawNulls = BaseVector::mutableRawNulls();
   }
+
+  // Allocate values buffer if not allocated yet. This may happen if vector
+  // contains only null values.
+  if (!values_) {
+    mutableRawValues();
+  }
+
   if (source->encoding() == VectorEncoding::Simple::FLAT) {
-    auto flat = source->as<FlatVector<T>>();
-    if (source->typeKind() != TypeKind::UNKNOWN) {
+    auto flat = source->asUnchecked<FlatVector<T>>();
+    if (!flat->values() || flat->values()->size() == 0) {
+      // The vector must have all-null values.
+      VELOX_CHECK_EQ(
+          BaseVector::countNulls(flat->nulls(), 0, flat->size()), flat->size());
+    } else if (source->typeKind() != TypeKind::UNKNOWN) {
       if (Buffer::is_pod_like_v<T>) {
         memcpy(
             &rawValues_[targetIndex],
@@ -256,17 +272,17 @@ void FlatVector<T>::copyValuesAndNulls(
       bits::fillBits(rawNulls, targetIndex, targetIndex + count, bits::kNull);
       return;
     }
-    auto constant = source->as<ConstantVector<T>>();
+    auto constant = source->asUnchecked<ConstantVector<T>>();
     T value = constant->valueAt(0);
     for (auto row = targetIndex; row < targetIndex + count; ++row) {
       rawValues_[row] = value;
-      if (rawNulls) {
-        bits::fillBits(
-            rawNulls, targetIndex, targetIndex + count, bits::kNotNull);
-      }
+    }
+    if (rawNulls) {
+      bits::fillBits(
+          rawNulls, targetIndex, targetIndex + count, bits::kNotNull);
     }
   } else {
-    auto sourceVector = source->as<SimpleVector<T>>();
+    auto sourceVector = source->asUnchecked<SimpleVector<T>>();
     for (int32_t i = 0; i < count; ++i) {
       if (!source->isNullAt(sourceIndex + i)) {
         rawValues_[targetIndex + i] = sourceVector->valueAt(sourceIndex + i);
@@ -296,7 +312,7 @@ void FlatVector<T>::resize(vector_size_t size, bool setNotNull) {
 
   if (std::is_same<T, StringView>::value) {
     if (size < previousSize) {
-      auto vector = this->template as<SimpleVector<StringView>>();
+      auto vector = this->template asUnchecked<SimpleVector<StringView>>();
       vector->invalidateIsAscii();
     }
     if (size == 0) {
@@ -315,8 +331,14 @@ template <typename T>
 void FlatVector<T>::ensureWritable(const SelectivityVector& rows) {
   auto newSize = std::max<vector_size_t>(rows.size(), BaseVector::length_);
   if (values_ && !values_->unique()) {
-    BufferPtr newValues =
-        AlignedBuffer::allocate<T>(newSize, BaseVector::pool_);
+    BufferPtr newValues;
+    if constexpr (std::is_same<T, StringView>::value) {
+      // Make sure to initialize StringView values so they can be safely
+      // accessed.
+      newValues = AlignedBuffer::allocate<T>(newSize, BaseVector::pool_, T());
+    } else {
+      newValues = AlignedBuffer::allocate<T>(newSize, BaseVector::pool_);
+    }
 
     auto rawNewValues = newValues->asMutable<T>();
     SelectivityVector rowsToCopy(BaseVector::length_);
@@ -324,7 +346,10 @@ void FlatVector<T>::ensureWritable(const SelectivityVector& rows) {
     rowsToCopy.applyToSelected(
         [&](vector_size_t row) { rawNewValues[row] = rawValues_[row]; });
 
-    // string buffers are append only, hence, safe to share
+    // Keep the string buffers even if multiply referenced. These are
+    // append-only and are written to in FlatVector::set which calls
+    // getBufferWithSpace which allocates a new buffer if existing buffers
+    // are multiply-referenced.
 
     // TODO Optimization: check and remove string buffers not referenced by
     // rowsToCopy
@@ -334,6 +359,18 @@ void FlatVector<T>::ensureWritable(const SelectivityVector& rows) {
   }
 
   BaseVector::ensureWritable(rows);
+}
+
+template <typename T>
+void FlatVector<T>::prepareForReuse() {
+  BaseVector::prepareForReuse();
+
+  // Check values buffer. Keep the buffer if singly-referenced and mutable.
+  // Reset otherwise.
+  if (values_ && !(values_->unique() && values_->isMutable())) {
+    values_ = nullptr;
+    rawValues_ = nullptr;
+  }
 }
 } // namespace velox
 } // namespace facebook

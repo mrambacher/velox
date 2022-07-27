@@ -28,9 +28,13 @@ void deselectRowsWithNulls(
     core::ExecCtx& execCtx) {
   bool anyChange = false;
   auto numRows = input.size();
-  EvalCtx evalCtx(&execCtx, nullptr, &input);
+
+  DecodedVector scratchDecodedVector;
+  SelectivityVector scratchRows;
   for (auto channel : channels) {
-    evalCtx.ensureFieldLoaded(channel, rows);
+    auto& child = const_cast<VectorPtr&>(input.childAt(channel));
+    LazyVector::ensureLoadedRows(
+        child, rows, scratchDecodedVector, scratchRows);
     auto key = input.loadedChildAt(channel);
     if (key->mayHaveNulls()) {
       auto nulls = key->flatRawNulls(rows);
@@ -147,20 +151,16 @@ vector_size_t processFilterResults(
   }
 }
 
-VectorPtr
-wrapChild(vector_size_t size, BufferPtr mapping, const VectorPtr& child) {
+VectorPtr wrapChild(
+    vector_size_t size,
+    BufferPtr mapping,
+    const VectorPtr& child,
+    BufferPtr nulls) {
   if (!mapping) {
     return child;
   }
 
-  if (child->encoding() == VectorEncoding::Simple::CONSTANT) {
-    if (size == child->size()) {
-      return child;
-    }
-    return BaseVector::wrapInConstant(size, 0, child);
-  }
-
-  return BaseVector::wrapInDictionary(BufferPtr(nullptr), mapping, size, child);
+  return BaseVector::wrapInDictionary(nulls, mapping, size, child);
 }
 
 RowVectorPtr
@@ -182,4 +182,25 @@ wrap(vector_size_t size, BufferPtr mapping, const RowVectorPtr& vector) {
       size,
       wrappedChildren);
 }
+
+void loadColumns(const RowVectorPtr& input, core::ExecCtx& execCtx) {
+  LocalDecodedVector decodedHolder(execCtx);
+  LocalSelectivityVector baseRowsHolder(&execCtx);
+  LocalSelectivityVector rowsHolder(&execCtx);
+  SelectivityVector* rows = nullptr;
+  for (auto& child : input->children()) {
+    if (isLazyNotLoaded(*child)) {
+      if (!rows) {
+        rows = rowsHolder.get(input->size());
+        rows->setAll();
+      }
+      LazyVector::ensureLoadedRows(
+          child,
+          *rows,
+          *decodedHolder.get(),
+          *baseRowsHolder.get(input->size()));
+    }
+  }
+}
+
 } // namespace facebook::velox::exec

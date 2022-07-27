@@ -21,6 +21,30 @@
 namespace facebook {
 namespace velox {
 
+ExceptionContext& getExceptionContext() {
+  thread_local ExceptionContext context;
+  return context;
+}
+
+// Retrieves the message of the top-level ancestor of the current exception
+// context. If the top-level context message is not empty and is the same as the
+// current one, returns a string indicating they are the same.
+std::string getTopLevelExceptionContextString() {
+  auto* context = &getExceptionContext();
+  auto currentMessage = context->message();
+
+  while (context->parent && context->parent->parent) {
+    context = context->parent;
+  }
+  auto topLevelMessage = context->message();
+
+  if (!topLevelMessage.empty() && topLevelMessage == currentMessage) {
+    return "Same as context.";
+  } else {
+    return topLevelMessage;
+  }
+}
+
 VeloxException::VeloxException(
     const char* file,
     size_t line,
@@ -40,6 +64,8 @@ VeloxException::VeloxException(
         state.message = message;
         state.errorSource = errorSource;
         state.errorCode = errorCode;
+        state.context = getExceptionContext().message();
+        state.topLevelContext = getTopLevelExceptionContextString();
         state.isRetriable = isRetriable;
       })) {}
 
@@ -134,6 +160,14 @@ void VeloxException::State::finalize() const {
     elaborateMessage += "Expression: ";
     elaborateMessage += failingExpression;
     elaborateMessage += '\n';
+  }
+
+  if (!context.empty()) {
+    elaborateMessage += "Context: " + context + "\n";
+  }
+
+  if (!topLevelContext.empty()) {
+    elaborateMessage += "Top-Level Context: " + topLevelContext + "\n";
   }
 
   if (function) {

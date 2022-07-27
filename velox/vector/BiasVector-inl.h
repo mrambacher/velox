@@ -24,30 +24,11 @@
 namespace facebook {
 namespace velox {
 
-namespace {
-template <typename T>
-static inline __m256i simdAdd(const __m256i& left, const __m256i& right) {
-  if constexpr (std::is_same_v<T, int64_t> || std::is_same_v<T, size_t>) {
-    return _mm256_add_epi64(left, right);
-  } else if constexpr (std::is_same_v<T, int32_t>) {
-    return _mm256_add_epi32(left, right);
-  } else if constexpr (std::is_same_v<T, int16_t>) {
-    return _mm256_add_epi16(left, right);
-  } else if constexpr (std::is_same_v<T, int8_t>) {
-    return _mm256_add_epi8(left, right);
-  } else {
-    VELOX_UNSUPPORTED("Unsupported type");
-  }
-}
-} // namespace
-
 /*
  * NOTE - biased vector is stored solely as a standard numeric flat array in
  * 2 buffers.
  *
  * Buffer order: [nullData, valueData]
- *
- * The bias value is stored in the metaData block via the BIAS_VALUE key.
  */
 template <typename T>
 BiasVector<T>::BiasVector(
@@ -56,7 +37,8 @@ BiasVector<T>::BiasVector(
     size_t length,
     TypeKind valueType,
     BufferPtr values,
-    const folly::F14FastMap<std::string, std::string>& metaData,
+    T bias,
+    const SimpleVectorStats<T>& stats,
     std::optional<vector_size_t> distinctCount,
     std::optional<vector_size_t> nullCount,
     std::optional<bool> sorted,
@@ -64,40 +46,24 @@ BiasVector<T>::BiasVector(
     std::optional<ByteCount> storageByteCount)
     : SimpleVector<T>(
           pool,
+          VectorEncoding::Simple::BIASED,
           nulls,
           length,
-          metaData,
+          stats,
           distinctCount,
           nullCount,
           sorted,
           representedBytes,
           storageByteCount),
       valueType_(valueType),
-      values_(std::move(values)) {
+      values_(std::move(values)),
+      bias_(bias) {
   VELOX_CHECK(
       valueType_ == TypeKind::INTEGER || valueType_ == TypeKind::SMALLINT ||
           valueType_ == TypeKind::TINYINT,
       "Invalid array type for biased values");
 
-  auto bias =
-      SimpleVector<T>::template getMetaDataValue<T>(metaData, BIAS_VALUE);
-  VELOX_CHECK(bias.has_value(), "Bias value is required");
-  bias_ = bias.value();
-  biasBuffer_ = simd::setAll256i(bias_);
-
-  switch (valueType_) {
-    case TypeKind::INTEGER:
-      int32Ptr_ = values_->as<int32_t>();
-      break;
-    case TypeKind::SMALLINT:
-      int16Ptr_ = values_->as<int16_t>();
-      break;
-    case TypeKind::TINYINT:
-      int8Ptr_ = values_->as<int8_t>();
-      break;
-    default:
-      VELOX_UNREACHABLE("Invalid type - cannot get here");
-  }
+  biasBuffer_ = simd::setAll(bias_);
   rawValues_ = values_->as<uint8_t>();
   BaseVector::inMemoryBytes_ += values_->size();
 }
@@ -122,7 +88,7 @@ std::unique_ptr<SimpleVector<uint64_t>> BiasVector<T>::hashAll() const {
       BaseVector::length_,
       hashes,
       std::vector<BufferPtr>(0) /*stringBuffers*/,
-      cdvi::EMPTY_METADATA,
+      SimpleVectorStats<uint64_t>{},
       std::nullopt /*distinctValueCount*/,
       0 /* nullCount */,
       false /*isSorted*/,
@@ -144,31 +110,31 @@ const T BiasVector<T>::valueAtFast(vector_size_t idx) const {
 }
 
 template <typename T>
-__m256i BiasVector<T>::loadSIMDValueBufferAt(size_t index) const {
+xsimd::batch<T> BiasVector<T>::loadSIMDValueBufferAt(size_t index) const {
   if constexpr (std::is_same<T, int64_t>::value) {
     switch (valueType_) {
       case TypeKind::INTEGER:
-        return simdAdd<T>(biasBuffer_, loadSIMDInternal<4>(index));
+        return biasBuffer_ + loadSIMDInternal<int32_t>(index);
       case TypeKind::SMALLINT:
-        return simdAdd<T>(biasBuffer_, loadSIMDInternal<2>(index));
+        return biasBuffer_ + loadSIMDInternal<int16_t>(index);
       case TypeKind::TINYINT:
-        return simdAdd<T>(biasBuffer_, loadSIMDInternal<1>(index));
+        return biasBuffer_ + loadSIMDInternal<int8_t>(index);
       default:
         VELOX_UNSUPPORTED("Invalid type");
     }
   } else if constexpr (std::is_same<T, int32_t>::value) {
     switch (valueType_) {
       case TypeKind::SMALLINT:
-        return simdAdd<T>(biasBuffer_, loadSIMDInternal<2>(index));
+        return biasBuffer_ + loadSIMDInternal<int16_t>(index);
       case TypeKind::TINYINT:
-        return simdAdd<T>(biasBuffer_, loadSIMDInternal<1>(index));
+        return biasBuffer_ + loadSIMDInternal<int8_t>(index);
       default:
         VELOX_UNSUPPORTED("Invalid type");
     }
   } else if constexpr (std::is_same<T, int16_t>::value) {
     switch (valueType_) {
       case TypeKind::TINYINT:
-        return simdAdd<T>(biasBuffer_, loadSIMDInternal<1>(index));
+        return biasBuffer_ + loadSIMDInternal<int8_t>(index);
       default:
         VELOX_UNSUPPORTED("Invalid type");
     }

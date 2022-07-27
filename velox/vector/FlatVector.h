@@ -20,6 +20,7 @@
 #include <gflags/gflags_declare.h>
 
 #include "velox/common/base/SimdUtil.h"
+#include "velox/vector/BaseVector.h"
 #include "velox/vector/BuilderTypeUtils.h"
 #include "velox/vector/SimpleVector.h"
 #include "velox/vector/TypeAliases.h"
@@ -40,8 +41,15 @@ class FlatVector final : public SimpleVector<T> {
        std::is_same<T, int16_t>::value || std::is_same<T, int8_t>::value ||
        std::is_same<T, bool>::value || std::is_same<T, size_t>::value);
 
+  // Minimum size of a string buffer. 32 KB value is chosen to ensure that a
+  // single buffer is sufficient for a "typical" vector: 1K rows, medium size
+  // strings.
   static constexpr vector_size_t kInitialStringSize =
-      (8 * 1024) - sizeof(AlignedBuffer);
+      (32 * 1024) - sizeof(AlignedBuffer);
+  /// Maximum size of a string buffer to re-use (see
+  /// BaseVector::prepareForReuse): 1MB.
+  static constexpr vector_size_t kMaxStringSizeForReuse =
+      (1 << 20) - sizeof(AlignedBuffer);
 
   FlatVector(
       velox::memory::MemoryPool* pool,
@@ -49,8 +57,7 @@ class FlatVector final : public SimpleVector<T> {
       size_t length,
       BufferPtr values,
       std::vector<BufferPtr>&& stringBuffers,
-      const folly::F14FastMap<std::string, std::string>& metaData =
-          cdvi::EMPTY_METADATA,
+      const SimpleVectorStats<T>& stats = {},
       std::optional<vector_size_t> distinctValueCount = std::nullopt,
       std::optional<vector_size_t> nullCount = std::nullopt,
       std::optional<bool> isSorted = std::nullopt,
@@ -63,7 +70,7 @@ class FlatVector final : public SimpleVector<T> {
             length,
             values,
             std::move(stringBuffers),
-            metaData,
+            stats,
             distinctValueCount,
             nullCount,
             isSorted,
@@ -77,8 +84,7 @@ class FlatVector final : public SimpleVector<T> {
       size_t length,
       BufferPtr values,
       std::vector<BufferPtr>&& stringBuffers,
-      const folly::F14FastMap<std::string, std::string>& metaData =
-          cdvi::EMPTY_METADATA,
+      const SimpleVectorStats<T>& stats = {},
       std::optional<vector_size_t> distinctValueCount = std::nullopt,
       std::optional<vector_size_t> nullCount = std::nullopt,
       std::optional<bool> isSorted = std::nullopt,
@@ -87,9 +93,10 @@ class FlatVector final : public SimpleVector<T> {
       : SimpleVector<T>(
             pool,
             type,
+            VectorEncoding::Simple::FLAT,
             std::move(nulls),
             length,
-            metaData,
+            stats,
             distinctValueCount,
             nullCount,
             isSorted,
@@ -122,10 +129,6 @@ class FlatVector final : public SimpleVector<T> {
 
   virtual ~FlatVector() override = default;
 
-  inline VectorEncoding::Simple encoding() const override {
-    return VectorEncoding::Simple::FLAT;
-  }
-
   const T valueAtFast(vector_size_t idx) const;
 
   const T valueAt(vector_size_t idx) const override {
@@ -135,15 +138,15 @@ class FlatVector final : public SimpleVector<T> {
   std::unique_ptr<SimpleVector<uint64_t>> hashAll() const override;
 
   /**
-   * Loads a 256bit vector of data at the virtual byteOffset given
+   * Loads a SIMD vector of data at the virtual byteOffset given
    * Note this method is implemented on each vector type, but is intentionally
    * not virtual for performance reasons
    *
-   * @param byteOffset - the byte offset to laod from
+   * @param byteOffset - the byte offset to load from
    */
-  __m256i loadSIMDValueBufferAt(size_t index) const;
+  xsimd::batch<T> loadSIMDValueBufferAt(size_t index) const;
 
-  // dictionary vector makes internal use here for SIMD functions
+  // dictionary vector makes internal usehere for SIMD functions
   template <typename X>
   friend class DictionaryVector;
 
@@ -186,6 +189,11 @@ class FlatVector final : public SimpleVector<T> {
     return rawValues_;
   }
 
+  bool isRecyclable() const final {
+    return (!BaseVector::nulls_ || BaseVector::nulls_->unique()) &&
+        (values_ && values_->unique());
+  }
+
   template <typename As>
   const As* rawValues() const {
     return reinterpret_cast<const As*>(rawValues_);
@@ -196,7 +204,7 @@ class FlatVector final : public SimpleVector<T> {
   T* mutableRawValues() {
     if (!values_ || !values_->unique()) {
       BufferPtr newValues =
-          AlignedBuffer::allocate<T>(BaseVector::length_, values_->pool());
+          AlignedBuffer::allocate<T>(BaseVector::length_, BaseVector::pool());
       if (values_) {
         // This codepath is not yet enabled for OPAQUE types (asMutable will
         // fail below)
@@ -233,6 +241,9 @@ class FlatVector final : public SimpleVector<T> {
       const BaseVector* source,
       const SelectivityVector& rows,
       const vector_size_t* toSourceRow) override {
+    if (!rows.hasSelections()) {
+      return;
+    }
     copyValuesAndNulls(source, rows, toSourceRow);
   }
 
@@ -245,6 +256,28 @@ class FlatVector final : public SimpleVector<T> {
   }
 
   void resize(vector_size_t size, bool setNotNull = true) override;
+
+  std::optional<int32_t> compare(
+      const BaseVector* other,
+      vector_size_t index,
+      vector_size_t otherIndex,
+      CompareFlags flags) const override {
+    if (other->encoding() == VectorEncoding::Simple::FLAT) {
+      auto otherFlat = other->asUnchecked<FlatVector<T>>();
+      bool otherNull = otherFlat->isNullAt(otherIndex);
+      bool isNull = BaseVector::isNullAt(index);
+      if (isNull || otherNull) {
+        return BaseVector::compareNulls(isNull, otherNull, flags);
+      }
+
+      auto thisValue = valueAtFast(index);
+      auto otherValue = otherFlat->valueAtFast(otherIndex);
+      auto result = SimpleVector<T>::comparePrimitiveAsc(thisValue, otherValue);
+      return flags.ascending ? result : result * -1;
+    }
+
+    return SimpleVector<T>::compare(other, index, otherIndex, flags);
+  }
 
   bool isScalar() const override {
     return true;
@@ -259,7 +292,7 @@ class FlatVector final : public SimpleVector<T> {
     return size;
   }
 
-  bool mayAddNulls() const override {
+  bool isNullsWritable() const override {
     return true;
   }
 
@@ -288,6 +321,12 @@ class FlatVector final : public SimpleVector<T> {
   }
 
   void ensureWritable(const SelectivityVector& rows) override;
+
+  /// Calls BaseVector::prapareForReuse() to check and reset nulls buffer if
+  /// needed, checks and resets values buffer. Resets all strings buffers except
+  /// the first one. Keeps the first string buffer if singly-referenced and
+  /// mutable. Resizes the buffer to zero to allow for reuse instead of append.
+  void prepareForReuse() override;
 
  private:
   void copyValuesAndNulls(
@@ -362,6 +401,9 @@ void FlatVector<bool>::copyValuesAndNulls(
 
 template <>
 Buffer* FlatVector<StringView>::getBufferWithSpace(vector_size_t size);
+
+template <>
+void FlatVector<StringView>::prepareForReuse();
 
 template <typename T>
 using FlatVectorPtr = std::shared_ptr<FlatVector<T>>;

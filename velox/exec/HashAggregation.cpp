@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #include "velox/exec/HashAggregation.h"
+#include <optional>
 #include "velox/exec/Aggregate.h"
 #include "velox/exec/Task.h"
 
@@ -31,16 +32,12 @@ HashAggregation::HashAggregation(
           aggregationNode->step() == core::AggregationNode::Step::kPartial
               ? "PartialAggregation"
               : "Aggregation"),
-      outputBatchSize_{
-          driverCtx->execCtx->queryCtx()->config().preferredOutputBatchSize()},
+      outputBatchSize_{driverCtx->queryConfig().preferredOutputBatchSize()},
       maxPartialAggregationMemoryUsage_(
-          driverCtx->execCtx->queryCtx()
-              ->config()
-              .maxPartialAggregationMemoryUsage()),
+          driverCtx->queryConfig().maxPartialAggregationMemoryUsage()),
       isPartialOutput_(isPartialOutput(aggregationNode->step())),
       isDistinct_(aggregationNode->aggregates().empty()),
-      isGlobal_(aggregationNode->groupingKeys().empty()),
-      hasPreGroupedKeys_(!aggregationNode->preGroupedKeys().empty()) {
+      isGlobal_(aggregationNode->groupingKeys().empty()) {
   auto inputType = aggregationNode->sources()[0]->outputType();
 
   auto numHashers = aggregationNode->groupingKeys().size();
@@ -67,8 +64,10 @@ HashAggregation::HashAggregation(
   aggregates.reserve(numAggregates);
   std::vector<std::optional<ChannelIndex>> aggrMaskChannels;
   aggrMaskChannels.reserve(numAggregates);
+  auto numMasks = aggregationNode->aggregateMasks().size();
   std::vector<std::vector<ChannelIndex>> args;
   std::vector<std::vector<VectorPtr>> constantLists;
+  std::vector<TypePtr> intermediateTypes;
   for (auto i = 0; i < numAggregates; i++) {
     const auto& aggregate = aggregationNode->aggregates()[i];
 
@@ -86,15 +85,29 @@ HashAggregation::HashAggregation(
         constants.push_back(nullptr);
       }
     }
-
+    if (isRawInput(aggregationNode->step())) {
+      intermediateTypes.push_back(
+          Aggregate::intermediateType(aggregate->name(), argTypes));
+    } else {
+      assert(!argTypes.empty()); // lint
+      intermediateTypes.push_back(argTypes[0]);
+      VELOX_CHECK_EQ(
+          argTypes.size(),
+          1,
+          "Intermediate aggregates must have a single argument");
+    }
     // Setup aggregation mask: convert the Variable Reference name to the
     // channel (projection) index, if there is a mask.
-    const auto& aggrMask = aggregationNode->aggregateMasks()[i];
-    if (aggrMask == nullptr) {
-      aggrMaskChannels.emplace_back(std::optional<ChannelIndex>{});
+    if (i < numMasks) {
+      const auto& aggrMask = aggregationNode->aggregateMasks()[i];
+      if (aggrMask == nullptr) {
+        aggrMaskChannels.emplace_back(std::nullopt);
+      } else {
+        aggrMaskChannels.emplace_back(
+            inputType->asRow().getChildIdx(aggrMask->name()));
+      }
     } else {
-      aggrMaskChannels.emplace_back(
-          inputType->asRow().getChildIdx(aggrMask->name()));
+      aggrMaskChannels.emplace_back(std::nullopt);
     }
 
     const auto& resultType = outputType_->childAt(numHashers + i);
@@ -113,11 +126,11 @@ HashAggregation::HashAggregation(
         "Unexpected result type for an aggregation: {}, expected {}, step {}",
         aggResultType->toString(),
         expectedType->toString(),
-        static_cast<int32_t>(aggregationNode->step()));
+        core::AggregationNode::stepName(aggregationNode->step()));
   }
 
   if (isDistinct_) {
-    for (ChannelIndex i = 0; i < hashers.size(); ++i) {
+    for (auto i = 0; i < hashers.size(); ++i) {
       identityProjections_.emplace_back(hashers[i]->channel(), i);
     }
   }
@@ -129,23 +142,47 @@ HashAggregation::HashAggregation(
       std::move(aggrMaskChannels),
       std::move(args),
       std::move(constantLists),
+      std::move(intermediateTypes),
       aggregationNode->ignoreNullKeys(),
+      isPartialOutput_,
       isRawInput(aggregationNode->step()),
       operatorCtx_.get());
 }
 
 void HashAggregation::addInput(RowVectorPtr input) {
-  input_ = input;
   if (!pushdownChecked_) {
     mayPushdown_ = operatorCtx_->driver()->mayPushdownAggregation(this);
     pushdownChecked_ = true;
   }
-  groupingSet_->addInput(input_, mayPushdown_);
+  groupingSet_->addInput(input, mayPushdown_);
+  auto spilled = groupingSet_->spilledBytesAndRows();
+  stats_.spilledBytes = spilled.first;
+  stats_.spilledRows = spilled.second;
+
   if (isPartialOutput_ &&
       groupingSet_->allocatedBytes() > maxPartialAggregationMemoryUsage_) {
     partialFull_ = true;
   }
-  newDistincts_ = isDistinct_ && !groupingSet_->hashLookup().newGroups.empty();
+
+  if (isDistinct_) {
+    newDistincts_ = !groupingSet_->hashLookup().newGroups.empty();
+
+    if (newDistincts_) {
+      // Save input to use for output in getOutput().
+      input_ = input;
+    }
+  }
+}
+
+void HashAggregation::prepareOutput(vector_size_t size) {
+  if (output_) {
+    VectorPtr output = std::move(output_);
+    BaseVector::prepareForReuse(output, size);
+    output_ = std::static_pointer_cast<RowVector>(output);
+  } else {
+    output_ = std::static_pointer_cast<RowVector>(
+        BaseVector::create(outputType_, size, pool()));
+  }
 }
 
 RowVectorPtr HashAggregation::getOutput() {
@@ -194,12 +231,10 @@ RowVectorPtr HashAggregation::getOutput() {
 
   auto batchSize = isGlobal_ ? 1 : outputBatchSize_;
 
-  // TODO Figure out how to re-use 'result' safely.
-  auto result = std::static_pointer_cast<RowVector>(
-      BaseVector::create(outputType_, batchSize, operatorCtx_->pool()));
+  // Reuse output vectors if possible.
+  prepareOutput(batchSize);
 
-  bool hasData = groupingSet_->getOutput(
-      batchSize, isPartialOutput_, &resultIterator_, result);
+  bool hasData = groupingSet_->getOutput(batchSize, resultIterator_, output_);
   if (!hasData) {
     resultIterator_.reset();
 
@@ -213,7 +248,7 @@ RowVectorPtr HashAggregation::getOutput() {
     }
     return nullptr;
   }
-  return result;
+  return output_;
 }
 
 bool HashAggregation::isFinished() {

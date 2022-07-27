@@ -73,61 +73,22 @@ FooterStatisticsImpl::FooterStatisticsImpl(
   }
 }
 
-namespace {
-
-// Key for the DataCache for the 'tail' of the file, i.e. the data we need to
-// read when opening a file.
-std::string TailKey(uint64_t filenum) {
-  return fmt::format("{}_tail", filenum);
-}
-
-} // namespace
-
 ReaderBase::ReaderBase(
     MemoryPool& pool,
     std::unique_ptr<InputStream> stream,
-    DecrypterFactory* factory,
-    BufferedInputFactory* bufferedInputFactory,
-    dwio::common::DataCacheConfig* dataCacheConfig)
+    std::shared_ptr<DecrypterFactory> decryptorFactory,
+    std::shared_ptr<dwio::common::BufferedInputFactory> bufferedInputFactory,
+    uint64_t fileNum)
     : pool_{pool},
       stream_{std::move(stream)},
       arena_(std::make_unique<google::protobuf::Arena>()),
-      bufferedInputFactory_(bufferedInputFactory),
-      dataCacheConfig_(dataCacheConfig) {
-  input_ = bufferedInputFactory_->create(*stream_, pool, dataCacheConfig);
-
-  // We may have cached the tail before, in which case we can skip the read.
-  if (dataCacheConfig && dataCacheConfig->cache) {
-    const std::string tailKey = TailKey(dataCacheConfig->filenum);
-    std::string tail;
-    if (dataCacheConfig->cache->get(tailKey, &tail)) {
-      psLength_ = tail.data()[tail.size() - 1] & 0xff;
-      postScript_ = ProtoUtils::readProto<proto::PostScript>(
-          std::make_unique<SeekableArrayInputStream>(
-              tail.data() + tail.size() - 1 - psLength_, psLength_));
-      footer_ =
-          google::protobuf::Arena::CreateMessage<proto::Footer>(arena_.get());
-      ProtoUtils::readProtoInto(
-          createDecompressedStream(
-              std::make_unique<SeekableArrayInputStream>(
-                  tail.data() + tail.size() - 1 - psLength_ -
-                      postScript_->footerlength(),
-                  postScript_->footerlength()),
-              "File Footer"),
-          footer_);
-      schema_ = std::dynamic_pointer_cast<const RowType>(convertType(*footer_));
-      DWIO_ENSURE_NOT_NULL(schema_, "invalid schema");
-      if (postScript_->cachesize() > 0) {
-        auto cacheBuffer = std::make_shared<dwio::common::DataBuffer<char>>(
-            pool, postScript_->cachesize());
-        memcpy(cacheBuffer->data(), tail.data(), postScript_->cachesize());
-        cache_ = std::make_unique<StripeMetadataCache>(
-            *postScript_, *footer_, std::move(cacheBuffer));
-      }
-      handler_ = DecryptionHandler::create(*footer_, factory);
-      return;
-    }
-  }
+      fileNum_(fileNum),
+      decryptorFactory_(decryptorFactory),
+      bufferedInputFactory_(
+          bufferedInputFactory
+              ? bufferedInputFactory
+              : dwio::common::BufferedInputFactory::baseFactoryShared()) {
+  input_ = bufferedInputFactory_->create(*stream_, pool, fileNum);
 
   // read last bytes into buffer to get PostScript
   // If file is small, load the entire file.
@@ -205,14 +166,6 @@ ReaderBase::ReaderBase(
         *postScript_, *footer_, std::move(cacheBuffer));
   }
 
-  // Insert the tail in the data cache so we can skip the disk read next time.
-  if (dataCacheConfig && dataCacheConfig->cache) {
-    std::unique_ptr<char[]> tail(new char[tailSize]);
-    input_->read(fileLength_ - tailSize, tailSize, LogType::FOOTER)
-        ->readFully(tail.get(), tailSize);
-    const std::string tailKey = TailKey(dataCacheConfig->filenum);
-    dataCacheConfig->cache->put(tailKey, {tail.get(), tailSize});
-  }
   if (input_->shouldPrefetchStripes()) {
     auto numStripes = getFooter().stripes_size();
     for (auto i = 0; i < numStripes; i++) {
@@ -226,7 +179,7 @@ ReaderBase::ReaderBase(
     }
   }
   // initialize file decrypter
-  handler_ = DecryptionHandler::create(*footer_, factory);
+  handler_ = DecryptionHandler::create(*footer_, decryptorFactory_.get());
 }
 
 std::vector<uint64_t> ReaderBase::getRowsPerStripe() const {

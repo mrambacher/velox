@@ -32,6 +32,9 @@ namespace facebook::velox {
 
 using ChannelIndex = uint32_t;
 
+constexpr ChannelIndex kConstantChannel =
+    std::numeric_limits<ChannelIndex>::max();
+
 class RowVector : public BaseVector {
  public:
   RowVector(
@@ -41,7 +44,15 @@ class RowVector : public BaseVector {
       size_t length,
       std::vector<VectorPtr> children,
       std::optional<vector_size_t> nullCount = std::nullopt)
-      : BaseVector(pool, type, nulls, length, std::nullopt, nullCount, 1),
+      : BaseVector(
+            pool,
+            type,
+            VectorEncoding::Simple::ROW,
+            nulls,
+            length,
+            std::nullopt,
+            nullCount,
+            1),
         childrenSize_(children.size()),
         children_(std::move(children)) {
     // Some columns may not be projected out
@@ -69,16 +80,7 @@ class RowVector : public BaseVector {
 
   virtual ~RowVector() override {}
 
-  VectorEncoding::Simple encoding() const override {
-    return VectorEncoding::Simple::ROW;
-  }
-
-  bool equalValueAt(
-      const BaseVector* other,
-      vector_size_t index,
-      vector_size_t otherIndex) const override;
-
-  int32_t compare(
+  std::optional<int32_t> compare(
       const BaseVector* other,
       vector_size_t index,
       vector_size_t otherIndex,
@@ -139,9 +141,17 @@ class RowVector : public BaseVector {
     return size;
   }
 
+  uint64_t estimateFlatSize() const override;
+
+  using BaseVector::toString;
+
   std::string toString(vector_size_t index) const override;
 
   void ensureWritable(const SelectivityVector& rows) override;
+
+  /// Calls BaseVector::prepareForReuse() to check and reset nulls buffer if
+  /// needed, then calls BaseVector::prepareForReuse(child, 0) for all children.
+  void prepareForReuse() override;
 
   bool mayHaveNullsRecursive() const override {
     if (BaseVector::mayHaveNullsRecursive()) {
@@ -201,6 +211,7 @@ class ArrayVector : public BaseVector {
       : BaseVector(
             pool,
             type,
+            VectorEncoding::Simple::ARRAY,
             nulls,
             length,
             std::nullopt /*distinctValueCount*/,
@@ -266,16 +277,7 @@ class ArrayVector : public BaseVector {
 
   virtual ~ArrayVector() override {}
 
-  VectorEncoding::Simple encoding() const override {
-    return VectorEncoding::Simple::ARRAY;
-  }
-
-  bool equalValueAt(
-      const BaseVector* other,
-      vector_size_t index,
-      vector_size_t otherIndex) const override;
-
-  int32_t compare(
+  std::optional<int32_t> compare(
       const BaseVector* other,
       vector_size_t index,
       vector_size_t otherIndex,
@@ -365,9 +367,19 @@ class ArrayVector : public BaseVector {
         sizes_->capacity() + elements_->retainedSize();
   }
 
+  uint64_t estimateFlatSize() const override;
+
+  using BaseVector::toString;
+
   std::string toString(vector_size_t index) const override;
 
   void ensureWritable(const SelectivityVector& rows) override;
+
+  /// Calls BaseVector::prepareForReuse() to check and reset nulls buffer if
+  /// needed, checks and resets offsets and sizes buffers, zeros out offsets and
+  /// sizes if reusable, calls BaseVector::prepareForReuse(elements, 0) for the
+  /// elements vector.
+  void prepareForReuse() override;
 
   bool mayHaveNullsRecursive() const override {
     return BaseVector::mayHaveNullsRecursive() ||
@@ -397,6 +409,7 @@ class MapVector : public BaseVector {
       : BaseVector(
             pool,
             type,
+            VectorEncoding::Simple::MAP,
             nulls,
             length,
             std::nullopt /*distinctValueCount*/,
@@ -430,16 +443,7 @@ class MapVector : public BaseVector {
 
   virtual ~MapVector() override {}
 
-  VectorEncoding::Simple encoding() const override {
-    return VectorEncoding::Simple::MAP;
-  }
-
-  bool equalValueAt(
-      const BaseVector* other,
-      vector_size_t index,
-      vector_size_t otherIndex) const override;
-
-  int32_t compare(
+  std::optional<int32_t> compare(
       const BaseVector* other,
       vector_size_t index,
       vector_size_t otherIndex,
@@ -541,6 +545,10 @@ class MapVector : public BaseVector {
         sizes_->capacity() + keys_->retainedSize() + values_->retainedSize();
   }
 
+  uint64_t estimateFlatSize() const override;
+
+  using BaseVector::toString;
+
   std::string toString(vector_size_t index) const override;
 
   // Sorts all maps smallest key first. This enables linear time
@@ -557,6 +565,12 @@ class MapVector : public BaseVector {
   std::vector<vector_size_t> sortedKeyIndices(vector_size_t index) const;
 
   void ensureWritable(const SelectivityVector& rows) override;
+
+  /// Calls BaseVector::prepareForReuse() to check and reset nulls buffer if
+  /// needed, checks and resets offsets and sizes buffers, zeros out offsets and
+  /// sizes if reusable, calls BaseVector::prepareForReuse(keys|values, 0) for
+  /// the keys and values vectors.
+  void prepareForReuse() override;
 
   bool mayHaveNullsRecursive() const override {
     return BaseVector::mayHaveNullsRecursive() ||

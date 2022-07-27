@@ -18,6 +18,15 @@
 
 namespace facebook::velox::test {
 
+BufferPtr makeIndicesInReverse(vector_size_t size, memory::MemoryPool* pool) {
+  auto indices = AlignedBuffer::allocate<vector_size_t>(size, pool);
+  auto rawIndices = indices->asMutable<vector_size_t>();
+  for (auto i = 0; i < size; i++) {
+    rawIndices[i] = size - 1 - i;
+  }
+  return indices;
+}
+
 // static
 VectorPtr VectorTestBase::wrapInDictionary(
     BufferPtr indices,
@@ -47,6 +56,36 @@ BufferPtr VectorTestBase::makeIndices(
   }
 
   return indices;
+}
+
+BufferPtr VectorTestBase::makeNulls(
+    vector_size_t size,
+    std::function<bool(vector_size_t /*row*/)> isNullAt) {
+  auto nulls = AlignedBuffer::allocate<bool>(size, pool());
+  auto rawNulls = nulls->asMutable<uint64_t>();
+  for (auto i = 0; i < size; i++) {
+    bits::setNull(rawNulls, i, isNullAt(i));
+  }
+  return nulls;
+}
+
+void assertEqualVectors(
+    const VectorPtr& expected,
+    const VectorPtr& actual,
+    const std::string& additionalContext) {
+  ASSERT_EQ(expected->size(), actual->size()) << additionalContext;
+  ASSERT_EQ(expected->typeKind(), actual->typeKind());
+  for (auto i = 0; i < expected->size(); i++) {
+    ASSERT_TRUE(expected->equalValueAt(actual.get(), i, i))
+        << "at " << i << ": expected " << expected->toString(i) << ", but got "
+        << actual->toString(i) << additionalContext;
+  }
+}
+
+void assertCopyableVector(const VectorPtr& vector) {
+  auto copy =
+      BaseVector::create(vector->type(), vector->size(), vector->pool());
+  copy->copy(vector.get(), 0, 0, vector->size());
 }
 
 } // namespace facebook::velox::test

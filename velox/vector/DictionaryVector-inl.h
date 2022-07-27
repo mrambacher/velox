@@ -43,6 +43,8 @@ void DictionaryVector<T>::setInternalState() {
   }
   initialized_ = true;
 
+  BaseVector::inMemoryBytes_ =
+      BaseVector::nulls_ ? BaseVector::nulls_->capacity() : 0;
   BaseVector::inMemoryBytes_ += indices_->capacity();
   BaseVector::inMemoryBytes_ += dictionaryValues_->inMemoryBytes();
 }
@@ -55,7 +57,7 @@ DictionaryVector<T>::DictionaryVector(
     std::shared_ptr<BaseVector> dictionaryValues,
     TypeKind indexType,
     BufferPtr dictionaryIndices,
-    const folly::F14FastMap<std::string, std::string>& metaData,
+    const SimpleVectorStats<T>& stats,
     std::optional<vector_size_t> distinctValueCount,
     std::optional<vector_size_t> nullCount,
     std::optional<bool> isSorted,
@@ -64,15 +66,15 @@ DictionaryVector<T>::DictionaryVector(
     : SimpleVector<T>(
           pool,
           dictionaryValues->type(),
+          VectorEncoding::Simple::DICTIONARY,
           nulls,
           length,
-          metaData,
+          stats,
           distinctValueCount,
           nullCount,
           isSorted,
           representedBytes,
-          storageByteCount),
-      dictionaryMetaData_(metaData) {
+          storageByteCount) {
   VELOX_CHECK(dictionaryValues != nullptr, "dictionaryValues must not be null");
   VELOX_CHECK(
       dictionaryIndices != nullptr, "dictionaryIndices must not be null");
@@ -139,7 +141,7 @@ std::unique_ptr<SimpleVector<uint64_t>> DictionaryVector<T>::hashAll() const {
       BaseVector::length_,
       hashes,
       std::vector<BufferPtr>(0) /* stringBuffers */,
-      folly::F14FastMap<std::string, std::string>(),
+      SimpleVectorStats<uint64_t>{},
       BaseVector::distinctValueCount_.value() +
           (BaseVector::nullCount_.value_or(0) > 0 ? 1 : 0),
       0 /* nullCount */,
@@ -148,13 +150,19 @@ std::unique_ptr<SimpleVector<uint64_t>> DictionaryVector<T>::hashAll() const {
 }
 
 template <typename T>
-__m256i DictionaryVector<T>::loadSIMDValueBufferAt(size_t byteOffset) const {
-  auto startIndex = byteOffset / sizeof(T);
-  return _mm256_set_epi64x(
-      valueAtFast(startIndex + 3),
-      valueAtFast(startIndex + 2),
-      valueAtFast(startIndex + 1),
-      valueAtFast(startIndex));
+xsimd::batch<T> DictionaryVector<T>::loadSIMDValueBufferAt(
+    size_t byteOffset) const {
+  if constexpr (can_simd) {
+    constexpr int N = xsimd::batch<T>::size;
+    alignas(xsimd::default_arch::alignment()) T tmp[N];
+    auto startIndex = byteOffset / sizeof(T);
+    for (int i = 0; i < N; ++i) {
+      tmp[i] = valueAtFast(startIndex + i);
+    }
+    return xsimd::load_aligned(tmp);
+  } else {
+    VELOX_UNREACHABLE();
+  }
 }
 
 template <typename T>

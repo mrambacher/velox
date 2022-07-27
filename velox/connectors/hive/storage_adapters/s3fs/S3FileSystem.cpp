@@ -85,13 +85,6 @@ class S3ReadFile final : public ReadFile {
     VELOX_CHECK_GE(length_, 0);
   }
 
-  std::string_view pread(uint64_t offset, uint64_t length, Arena* arena)
-      const override {
-    char* position = arena->reserve(length);
-    preadInternal(offset, length, position);
-    return {position, length};
-  }
-
   std::string_view pread(uint64_t offset, uint64_t length, void* buffer)
       const override {
     preadInternal(offset, length, static_cast<char*>(buffer));
@@ -99,7 +92,6 @@ class S3ReadFile final : public ReadFile {
   }
 
   std::string pread(uint64_t offset, uint64_t length) const override {
-    // TODO: use allocator that doesn't initialize memory?
     std::string result(length, 0);
     char* position = result.data();
     preadInternal(offset, length, position);
@@ -223,7 +215,7 @@ class S3Config {
   }
 
  private:
-  const Config* config_;
+  const Config* FOLLY_NONNULL config_;
 };
 
 class S3FileSystem::Impl {
@@ -378,7 +370,13 @@ static std::function<std::shared_ptr<FileSystem>(std::shared_ptr<const Config>)>
       // Initialize on first access and reuse after that.
       static std::shared_ptr<FileSystem> s3fs;
       folly::call_once(S3FSInstantiationFlag, [&properties]() {
-        auto fs = std::make_shared<S3FileSystem>(properties);
+        std::shared_ptr<S3FileSystem> fs;
+        if (properties != nullptr) {
+          fs = std::make_shared<S3FileSystem>(properties);
+        } else {
+          fs = std::make_shared<S3FileSystem>(
+              std::make_shared<core::MemConfig>());
+        }
         fs->initializeClient();
         s3fs = fs;
       });

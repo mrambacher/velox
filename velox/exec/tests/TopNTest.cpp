@@ -19,15 +19,11 @@
 using namespace facebook::velox;
 using namespace facebook::velox::exec::test;
 
-static const core::SortOrder kAscNullsFirst(true, true);
-static const core::SortOrder kAscNullsLast(true, false);
-static const core::SortOrder kDescNullsFirst(false, true);
-static const core::SortOrder kDescNullsLast(false, false);
-
 class TopNTest : public OperatorTestBase {
  protected:
-  static std::vector<core::SortOrder> kSortOrders;
-  static std::vector<std::string> kSortOrderSqls;
+  static std::vector<std::string> getSortOrderSqls() {
+    return {"NULLS LAST", "NULLS FIRST", "DESC NULLS FIRST", "DESC NULLS LAST"};
+  }
 
   void testSingleKey(
       const std::vector<RowVectorPtr>& input,
@@ -35,19 +31,17 @@ class TopNTest : public OperatorTestBase {
       int32_t limit) {
     auto keyIndex = input[0]->type()->asRow().getChildIdx(key);
 
-    for (auto i = 0; i < kSortOrders.size(); i++) {
-      auto plan = PlanBuilder()
-                      .values(input)
-                      .topN({keyIndex}, {kSortOrders[i]}, limit, false)
-                      .planNode();
+    auto sortOrderSqls = getSortOrderSqls();
+
+    for (const auto& sortOrderSql : sortOrderSqls) {
+      auto sql = fmt::format("{} {}", key, sortOrderSql);
+
+      auto plan =
+          PlanBuilder().values(input).topN({sql}, limit, false).planNode();
 
       assertQueryOrdered(
           plan,
-          fmt::format(
-              "SELECT * FROM tmp ORDER BY {} {} LIMIT {}",
-              key,
-              kSortOrderSqls[i],
-              limit),
+          fmt::format("SELECT * FROM tmp ORDER BY {} LIMIT {}", sql, limit),
           {keyIndex});
     }
   }
@@ -58,20 +52,21 @@ class TopNTest : public OperatorTestBase {
       const std::string& filter) {
     auto keyIndex = input[0]->type()->asRow().getChildIdx(key);
 
-    for (auto i = 0; i < kSortOrders.size(); i++) {
+    auto sortOrderSqls = getSortOrderSqls();
+
+    for (const auto& sortOrderSql : sortOrderSqls) {
+      auto sql = fmt::format("{} {}", key, sortOrderSql);
+
       auto plan = PlanBuilder()
                       .values(input)
                       .filter(filter)
-                      .topN({keyIndex}, {kSortOrders[i]}, 10, false)
+                      .topN({sql}, 10, false)
                       .planNode();
 
       assertQueryOrdered(
           plan,
           fmt::format(
-              "SELECT * FROM tmp WHERE {} ORDER BY {} {} LIMIT 10",
-              filter,
-              key,
-              kSortOrderSqls[i]),
+              "SELECT * FROM tmp WHERE {} ORDER BY {} LIMIT 10", filter, sql),
           {keyIndex});
     }
   }
@@ -84,41 +79,30 @@ class TopNTest : public OperatorTestBase {
     auto rowType = input[0]->type()->asRow();
     auto keyIndices = {rowType.getChildIdx(key1), rowType.getChildIdx(key2)};
 
-    for (int i = 0; i < kSortOrders.size(); i++) {
-      for (int j = 0; j < kSortOrders.size(); j++) {
-        auto plan =
-            PlanBuilder()
-                .values(input)
-                .topN(
-                    keyIndices, {kSortOrders[i], kSortOrders[j]}, limit, false)
-                .planNode();
+    auto sortOrderSqls = getSortOrderSqls();
+
+    for (const auto& sortOrderSql1 : sortOrderSqls) {
+      for (const auto& sortOrderSql2 : sortOrderSqls) {
+        auto sql1 = fmt::format("{} {}", key1, sortOrderSql1);
+        auto sql2 = fmt::format("{} {}", key2, sortOrderSql2);
+
+        auto plan = PlanBuilder()
+                        .values(input)
+                        .topN({sql1, sql2}, limit, false)
+                        .planNode();
 
         assertQueryOrdered(
             plan,
             fmt::format(
-                "SELECT * FROM tmp ORDER BY {} {}, {} {} LIMIT {}",
-                key1,
-                kSortOrderSqls[i],
-                key2,
-                kSortOrderSqls[j],
+                "SELECT * FROM tmp ORDER BY {}, {} LIMIT {}",
+                sql1,
+                sql2,
                 limit),
             keyIndices);
       }
     }
   }
 };
-
-std::vector<core::SortOrder> TopNTest::kSortOrders = {
-    kAscNullsFirst,
-    kAscNullsLast,
-    kDescNullsFirst,
-    kDescNullsLast};
-
-std::vector<std::string> TopNTest::kSortOrderSqls = {
-    "NULLS FIRST",
-    "NULLS LAST",
-    "DESC NULLS FIRST",
-    "DESC NULLS LAST"};
 
 TEST_F(TopNTest, selectiveFilter) {
   vector_size_t batchSize = 1000;

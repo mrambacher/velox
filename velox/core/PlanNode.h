@@ -77,6 +77,11 @@ class SortOrder {
   const bool nullsFirst_;
 };
 
+extern const SortOrder kAscNullsFirst;
+extern const SortOrder kAscNullsLast;
+extern const SortOrder kDescNullsFirst;
+extern const SortOrder kDescNullsLast;
+
 class PlanNode {
  public:
   explicit PlanNode(const PlanNodeId& id) : id_{id} {}
@@ -92,9 +97,37 @@ class PlanNode {
   virtual const std::vector<std::shared_ptr<const PlanNode>>& sources()
       const = 0;
 
-  std::string toString(bool detailed = false, bool recursive = false) const {
+  /// Returns true if this is a leaf plan node and corresponding operator
+  /// requires splits to make progress. ValueNode is a leaf node that doesn't
+  /// require splits, but TableScanNode and ExchangeNode are leaf nodes that
+  /// require splits.
+  virtual bool requiresSplits() const {
+    return false;
+  }
+
+  /// Returns a set of leaf plan node IDs.
+  std::unordered_set<core::PlanNodeId> leafPlanNodeIds() const;
+
+  /// Returns human-friendly representation of the plan. By default, returns the
+  /// plan node name. Includes plan node details such as join keys and aggregate
+  /// function names if 'detailed' is true. Returns the whole sub-tree if
+  /// 'recursive' is true. Includes additional context for each plan node if
+  /// 'addContext' is not null.
+  ///
+  /// @param addContext Optional lambda to add context for a given plan node.
+  /// Receives plan node ID, indentation and std::stringstring where to append
+  /// the context. Use indentation for second and subsequent lines of a
+  /// mult-line context. Do not use indentation for single-line context. Do not
+  /// add trailing new-line character for the last or only line of context.
+  std::string toString(
+      bool detailed = false,
+      bool recursive = false,
+      std::function<void(
+          const PlanNodeId& planNodeId,
+          const std::string& indentation,
+          std::stringstream& stream)> addContext = nullptr) const {
     std::stringstream stream;
-    toString(stream, detailed, recursive, 0);
+    toString(stream, detailed, recursive, 0, addContext);
     return stream.str();
   }
 
@@ -103,7 +136,7 @@ class PlanNode {
 
  private:
   /// The details of the plan node in textual format.
-  virtual void addDetails(std::stringstream& stream) const {}
+  virtual void addDetails(std::stringstream& stream) const = 0;
 
   // Format when detailed and recursive are enabled is:
   //  -> name[details]
@@ -113,34 +146,18 @@ class PlanNode {
   //         ...
   void toString(
       std::stringstream& stream,
-      bool detailed = false,
-      bool recursive = false,
-      size_t indentation = 0) const {
-    auto addIndentation = [&]() {
-      auto counter = indentation;
-      while (counter) {
-        stream << " ";
-        counter--;
-      }
-    };
-
-    addIndentation();
-    stream << "->" << name();
-    if (detailed) {
-      stream << "[";
-      addDetails(stream);
-      stream << "]";
-    }
-    stream << "\n";
-    if (recursive) {
-      for (auto& source : sources()) {
-        source->toString(stream, detailed, true, indentation + 2);
-      }
-    }
-  }
+      bool detailed,
+      bool recursive,
+      size_t indentationSize,
+      std::function<void(
+          const PlanNodeId& planNodeId,
+          const std::string& indentation,
+          std::stringstream& stream)> addContext) const;
 
   const std::string id_;
 };
+
+using PlanNodePtr = std::shared_ptr<const PlanNode>;
 
 class ValuesNode : public PlanNode {
  public:
@@ -172,7 +189,7 @@ class ValuesNode : public PlanNode {
     return outputType_;
   }
 
-  const std::vector<std::shared_ptr<const PlanNode>>& sources() const override;
+  const std::vector<PlanNodePtr>& sources() const override;
 
   const std::vector<RowVectorPtr>& values() const {
     return values_;
@@ -184,10 +201,12 @@ class ValuesNode : public PlanNode {
   }
 
   std::string_view name() const override {
-    return "values";
+    return "Values";
   }
 
  private:
+  void addDetails(std::stringstream& stream) const override;
+
   const std::vector<RowVectorPtr> values_;
   const RowTypePtr outputType_;
   const bool parallelizable_;
@@ -195,26 +214,28 @@ class ValuesNode : public PlanNode {
 
 class FilterNode : public PlanNode {
  public:
-  FilterNode(
-      const PlanNodeId& id,
-      std::shared_ptr<const ITypedExpr> filter,
-      std::shared_ptr<const PlanNode> source)
-      : PlanNode(id), sources_{source}, filter_(filter) {}
+  FilterNode(const PlanNodeId& id, TypedExprPtr filter, PlanNodePtr source)
+      : PlanNode(id), sources_{std::move(source)}, filter_(std::move(filter)) {
+    VELOX_CHECK(
+        filter_->type()->isBoolean(),
+        "Filter expression must be of type BOOLEAN. Got {}.",
+        filter_->type()->toString());
+  }
 
   const RowTypePtr& outputType() const override {
     return sources_[0]->outputType();
   }
 
-  const std::vector<std::shared_ptr<const PlanNode>>& sources() const override {
+  const std::vector<PlanNodePtr>& sources() const override {
     return sources_;
   }
 
-  const std::shared_ptr<const ITypedExpr>& filter() const {
+  const TypedExprPtr& filter() const {
     return filter_;
   }
 
   std::string_view name() const override {
-    return "filter";
+    return "Filter";
   }
 
  private:
@@ -222,8 +243,8 @@ class FilterNode : public PlanNode {
     stream << "expression: " << filter_->toString();
   }
 
-  const std::vector<std::shared_ptr<const PlanNode>> sources_;
-  const std::shared_ptr<const ITypedExpr> filter_;
+  const std::vector<PlanNodePtr> sources_;
+  const TypedExprPtr filter_;
 };
 
 class ProjectNode : public PlanNode {
@@ -231,8 +252,8 @@ class ProjectNode : public PlanNode {
   ProjectNode(
       const PlanNodeId& id,
       std::vector<std::string>&& names,
-      std::vector<std::shared_ptr<const ITypedExpr>>&& projections,
-      std::shared_ptr<const PlanNode> source)
+      std::vector<TypedExprPtr>&& projections,
+      PlanNodePtr source)
       : PlanNode(id),
         sources_{source},
         names_(std::move(names)),
@@ -242,8 +263,8 @@ class ProjectNode : public PlanNode {
   ProjectNode(
       const PlanNodeId& id,
       const std::vector<std::string>& names,
-      const std::vector<std::shared_ptr<const ITypedExpr>>& projections,
-      std::shared_ptr<const PlanNode> source)
+      const std::vector<TypedExprPtr>& projections,
+      PlanNodePtr source)
       : PlanNode(id),
         sources_{source},
         names_(names),
@@ -254,7 +275,7 @@ class ProjectNode : public PlanNode {
     return outputType_;
   }
 
-  const std::vector<std::shared_ptr<const PlanNode>>& sources() const override {
+  const std::vector<PlanNodePtr>& sources() const override {
     return sources_;
   }
 
@@ -262,28 +283,21 @@ class ProjectNode : public PlanNode {
     return names_;
   }
 
-  const std::vector<std::shared_ptr<const ITypedExpr>>& projections() const {
+  const std::vector<TypedExprPtr>& projections() const {
     return projections_;
   }
 
   std::string_view name() const override {
-    return "project";
+    return "Project";
   }
 
  private:
-  void addDetails(std::stringstream& stream) const override {
-    stream << "expressions: ";
-    for (auto i = 0; i < projections_.size(); i++) {
-      auto& projection = projections_[i];
-      stream << "(" << names_[i] << ":" << projection->type()->toString()
-             << ", " << projection->toString() << "), ";
-    }
-  }
+  void addDetails(std::stringstream& stream) const override;
 
   static RowTypePtr makeOutputType(
       const std::vector<std::string>& names,
-      const std::vector<std::shared_ptr<const ITypedExpr>>& projections) {
-    std::vector<std::shared_ptr<const Type>> types;
+      const std::vector<TypedExprPtr>& projections) {
+    std::vector<TypePtr> types;
     for (auto& projection : projections) {
       types.push_back(projection->type());
     }
@@ -292,9 +306,9 @@ class ProjectNode : public PlanNode {
     return std::make_shared<RowType>(std::move(namesCopy), std::move(types));
   }
 
-  const std::vector<std::shared_ptr<const PlanNode>> sources_;
+  const std::vector<PlanNodePtr> sources_;
   const std::vector<std::string> names_;
-  const std::vector<std::shared_ptr<const ITypedExpr>> projections_;
+  const std::vector<TypedExprPtr> projections_;
   const RowTypePtr outputType_;
 };
 
@@ -312,10 +326,14 @@ class TableScanNode : public PlanNode {
         tableHandle_(tableHandle),
         assignments_(assignments) {}
 
-  const std::vector<std::shared_ptr<const PlanNode>>& sources() const override;
+  const std::vector<PlanNodePtr>& sources() const override;
 
   const RowTypePtr& outputType() const override {
     return outputType_;
+  }
+
+  bool requiresSplits() const override {
+    return true;
   }
 
   const std::shared_ptr<connector::ConnectorTableHandle>& tableHandle() const {
@@ -329,10 +347,12 @@ class TableScanNode : public PlanNode {
   }
 
   std::string_view name() const override {
-    return "table scan";
+    return "TableScan";
   }
 
  private:
+  void addDetails(std::stringstream& stream) const override;
+
   const RowTypePtr outputType_;
   const std::shared_ptr<connector::ConnectorTableHandle> tableHandle_;
   const std::
@@ -348,7 +368,7 @@ class TableWriteNode : public PlanNode {
       const std::vector<std::string>& columnNames,
       const std::shared_ptr<InsertTableHandle>& insertTableHandle,
       const RowTypePtr& outputType,
-      const std::shared_ptr<const PlanNode>& source)
+      const PlanNodePtr& source)
       : PlanNode(id),
         sources_{source},
         columns_{columns},
@@ -361,7 +381,7 @@ class TableWriteNode : public PlanNode {
     }
   }
 
-  const std::vector<std::shared_ptr<const PlanNode>>& sources() const override {
+  const std::vector<PlanNodePtr>& sources() const override {
     return sources_;
   }
 
@@ -386,11 +406,13 @@ class TableWriteNode : public PlanNode {
   }
 
   std::string_view name() const override {
-    return "table write";
+    return "TableWrite";
   }
 
  private:
-  const std::vector<std::shared_ptr<const PlanNode>> sources_;
+  void addDetails(std::stringstream& stream) const override;
+
+  const std::vector<PlanNodePtr> sources_;
   const RowTypePtr columns_;
   const std::vector<std::string> columnNames_;
   const std::shared_ptr<InsertTableHandle> insertTableHandle_;
@@ -410,6 +432,20 @@ class AggregationNode : public PlanNode {
     kSingle
   };
 
+  static const char* stepName(Step step) {
+    switch (step) {
+      case Step::kPartial:
+        return "PARTIAL";
+      case Step::kFinal:
+        return "FINAL";
+      case Step::kIntermediate:
+        return "INTERMEDIATE";
+      case Step::kSingle:
+        return "SINGLE";
+    }
+    VELOX_UNREACHABLE();
+  }
+
   /**
    * @param preGroupedKeys A subset of the 'groupingKeys' on which the input is
    * clustered, i.e. identical sets of values for these keys always appear next
@@ -422,18 +458,15 @@ class AggregationNode : public PlanNode {
   AggregationNode(
       const PlanNodeId& id,
       Step step,
-      const std::vector<std::shared_ptr<const FieldAccessTypedExpr>>&
-          groupingKeys,
-      const std::vector<std::shared_ptr<const FieldAccessTypedExpr>>&
-          preGroupedKeys,
+      const std::vector<FieldAccessTypedExprPtr>& groupingKeys,
+      const std::vector<FieldAccessTypedExprPtr>& preGroupedKeys,
       const std::vector<std::string>& aggregateNames,
-      const std::vector<std::shared_ptr<const CallTypedExpr>>& aggregates,
-      const std::vector<std::shared_ptr<const FieldAccessTypedExpr>>&
-          aggregateMasks,
+      const std::vector<CallTypedExprPtr>& aggregates,
+      const std::vector<FieldAccessTypedExprPtr>& aggregateMasks,
       bool ignoreNullKeys,
-      std::shared_ptr<const PlanNode> source);
+      PlanNodePtr source);
 
-  const std::vector<std::shared_ptr<const PlanNode>>& sources() const override {
+  const std::vector<PlanNodePtr>& sources() const override {
     return sources_;
   }
 
@@ -445,13 +478,11 @@ class AggregationNode : public PlanNode {
     return step_;
   }
 
-  const std::vector<std::shared_ptr<const FieldAccessTypedExpr>>& groupingKeys()
-      const {
+  const std::vector<FieldAccessTypedExprPtr>& groupingKeys() const {
     return groupingKeys_;
   }
 
-  const std::vector<std::shared_ptr<const FieldAccessTypedExpr>>&
-  preGroupedKeys() const {
+  const std::vector<FieldAccessTypedExprPtr>& preGroupedKeys() const {
     return preGroupedKeys_;
   }
 
@@ -459,12 +490,11 @@ class AggregationNode : public PlanNode {
     return aggregateNames_;
   }
 
-  const std::vector<std::shared_ptr<const CallTypedExpr>>& aggregates() const {
+  const std::vector<CallTypedExprPtr>& aggregates() const {
     return aggregates_;
   }
 
-  const std::vector<std::shared_ptr<const FieldAccessTypedExpr>>&
-  aggregateMasks() const {
+  const std::vector<FieldAccessTypedExprPtr>& aggregateMasks() const {
     return aggregateMasks_;
   }
 
@@ -473,22 +503,22 @@ class AggregationNode : public PlanNode {
   }
 
   std::string_view name() const override {
-    return "aggregation";
+    return "Aggregation";
   }
 
  private:
+  void addDetails(std::stringstream& stream) const override;
+
   const Step step_;
-  const std::vector<std::shared_ptr<const FieldAccessTypedExpr>> groupingKeys_;
-  const std::vector<std::shared_ptr<const FieldAccessTypedExpr>>
-      preGroupedKeys_;
+  const std::vector<FieldAccessTypedExprPtr> groupingKeys_;
+  const std::vector<FieldAccessTypedExprPtr> preGroupedKeys_;
   const std::vector<std::string> aggregateNames_;
-  const std::vector<std::shared_ptr<const CallTypedExpr>> aggregates_;
+  const std::vector<CallTypedExprPtr> aggregates_;
   // Keeps mask/'no mask' for every aggregation. Mask, if given, is a reference
   // to a boolean projection column, used to mask out rows for the aggregation.
-  const std::vector<std::shared_ptr<const FieldAccessTypedExpr>>
-      aggregateMasks_;
+  const std::vector<FieldAccessTypedExprPtr> aggregateMasks_;
   const bool ignoreNullKeys_;
-  const std::vector<std::shared_ptr<const PlanNode>> sources_;
+  const std::vector<PlanNodePtr> sources_;
   const RowTypePtr outputType_;
 };
 
@@ -514,6 +544,76 @@ inline std::string mapAggregationStepToName(const AggregationNode::Step& step) {
   return ss.str();
 }
 
+/// Plan node used to implement aggregations over grouping sets. Duplicates the
+/// aggregation input for each set of grouping keys. The output contains one
+/// column for each grouping key, followed by aggregation inputs, followed by a
+/// column containing grouping set ID. For a given grouping set, a subset
+/// of the grouping key columns present in the set are populated with values.
+/// The rest of the grouping key columns are filled in with nulls.
+class GroupIdNode : public PlanNode {
+ public:
+  /// @param id Plan node ID.
+  /// @param groupingSets A list of grouping key sets. Grouping keys within the
+  /// set must be unique, but grouping keys across sets may repeat.
+  /// @param outputGroupingKeyNames Output names for the grouping keys.
+  /// @param aggregationInputs Columns that contain inputs to the aggregate
+  /// functions.
+  /// @param groupIdName Name of the column that will contain the grouping set
+  /// ID (a zero based integer).
+  /// @param source Input plan node.
+  GroupIdNode(
+      PlanNodeId id,
+      std::vector<std::vector<FieldAccessTypedExprPtr>> groupingSets,
+      std::map<std::string, FieldAccessTypedExprPtr> outputGroupingKeyNames,
+      std::vector<FieldAccessTypedExprPtr> aggregationInputs,
+      std::string groupIdName,
+      PlanNodePtr source);
+
+  const RowTypePtr& outputType() const override {
+    return outputType_;
+  }
+
+  const std::vector<PlanNodePtr>& sources() const override {
+    return sources_;
+  }
+
+  const std::vector<std::vector<FieldAccessTypedExprPtr>>& groupingSets()
+      const {
+    return groupingSets_;
+  }
+
+  const std::map<std::string, FieldAccessTypedExprPtr>& outputGroupingKeyNames()
+      const {
+    return outputGroupingKeyNames_;
+  }
+
+  const std::vector<FieldAccessTypedExprPtr>& aggregationInputs() const {
+    return aggregationInputs_;
+  }
+
+  const std::string& groupIdName() {
+    return groupIdName_;
+  }
+
+  int32_t numGroupingKeys() const {
+    return outputType_->size() - aggregationInputs_.size() - 1;
+  }
+
+  std::string_view name() const override {
+    return "GroupId";
+  }
+
+ private:
+  void addDetails(std::stringstream& stream) const override;
+
+  const std::vector<PlanNodePtr> sources_;
+  const RowTypePtr outputType_;
+  const std::vector<std::vector<FieldAccessTypedExprPtr>> groupingSets_;
+  const std::map<std::string, FieldAccessTypedExprPtr> outputGroupingKeyNames_;
+  const std::vector<FieldAccessTypedExprPtr> aggregationInputs_;
+  const std::string groupIdName_;
+};
+
 class ExchangeNode : public PlanNode {
  public:
   ExchangeNode(const PlanNodeId& id, RowTypePtr type)
@@ -523,13 +623,19 @@ class ExchangeNode : public PlanNode {
     return outputType_;
   }
 
-  const std::vector<std::shared_ptr<const PlanNode>>& sources() const override;
+  const std::vector<PlanNodePtr>& sources() const override;
+
+  bool requiresSplits() const override {
+    return true;
+  }
 
   std::string_view name() const override {
-    return "exchange";
+    return "Exchange";
   }
 
  private:
+  void addDetails(std::stringstream& stream) const override;
+
   RowTypePtr outputType_;
 };
 
@@ -538,15 +644,13 @@ class MergeExchangeNode : public ExchangeNode {
   explicit MergeExchangeNode(
       const PlanNodeId& id,
       const RowTypePtr& type,
-      const std::vector<std::shared_ptr<const FieldAccessTypedExpr>>&
-          sortingKeys,
+      const std::vector<FieldAccessTypedExprPtr>& sortingKeys,
       const std::vector<SortOrder>& sortingOrders)
       : ExchangeNode(id, type),
         sortingKeys_(sortingKeys),
         sortingOrders_(sortingOrders) {}
 
-  const std::vector<std::shared_ptr<const FieldAccessTypedExpr>>& sortingKeys()
-      const {
+  const std::vector<FieldAccessTypedExprPtr>& sortingKeys() const {
     return sortingKeys_;
   }
 
@@ -555,11 +659,13 @@ class MergeExchangeNode : public ExchangeNode {
   }
 
   std::string_view name() const override {
-    return "merge exchange";
+    return "MergeExchange";
   }
 
  private:
-  const std::vector<std::shared_ptr<const FieldAccessTypedExpr>> sortingKeys_;
+  void addDetails(std::stringstream& stream) const override;
+
+  const std::vector<FieldAccessTypedExprPtr> sortingKeys_;
   const std::vector<SortOrder> sortingOrders_;
 };
 
@@ -567,9 +673,9 @@ class LocalMergeNode : public PlanNode {
  public:
   LocalMergeNode(
       const PlanNodeId& id,
-      std::vector<std::shared_ptr<const FieldAccessTypedExpr>> sortingKeys,
+      std::vector<FieldAccessTypedExprPtr> sortingKeys,
       std::vector<SortOrder> sortingOrders,
-      std::vector<std::shared_ptr<const PlanNode>> sources)
+      std::vector<PlanNodePtr> sources)
       : PlanNode(id),
         sources_{std::move(sources)},
         sortingKeys_{std::move(sortingKeys)},
@@ -579,12 +685,11 @@ class LocalMergeNode : public PlanNode {
     return sources_[0]->outputType();
   }
 
-  const std::vector<std::shared_ptr<const PlanNode>>& sources() const override {
+  const std::vector<PlanNodePtr>& sources() const override {
     return sources_;
   }
 
-  const std::vector<std::shared_ptr<const FieldAccessTypedExpr>>& sortingKeys()
-      const {
+  const std::vector<FieldAccessTypedExprPtr>& sortingKeys() const {
     return sortingKeys_;
   }
 
@@ -593,12 +698,14 @@ class LocalMergeNode : public PlanNode {
   }
 
   std::string_view name() const override {
-    return "local merge";
+    return "LocalMerge";
   }
 
  private:
-  const std::vector<std::shared_ptr<const PlanNode>> sources_;
-  const std::vector<std::shared_ptr<const FieldAccessTypedExpr>> sortingKeys_;
+  void addDetails(std::stringstream& stream) const override;
+
+  const std::vector<PlanNodePtr> sources_;
+  const std::vector<FieldAccessTypedExprPtr> sortingKeys_;
   const std::vector<SortOrder> sortingOrders_;
 };
 
@@ -624,44 +731,62 @@ using PartitionFunctionFactory =
 /// different from input.
 class LocalPartitionNode : public PlanNode {
  public:
+  enum class Type {
+    // N-to-1 exchange.
+    kGather,
+    // N-to-M shuffle.
+    kRepartition,
+  };
+
   LocalPartitionNode(
       const PlanNodeId& id,
+      Type type,
       PartitionFunctionFactory partitionFunctionFactory,
       RowTypePtr outputType,
-      std::vector<std::shared_ptr<const PlanNode>> sources)
+      std::vector<PlanNodePtr> sources,
+      RowTypePtr inputTypeFromSource)
       : PlanNode(id),
+        type_{type},
         sources_{std::move(sources)},
         partitionFunctionFactory_{std::move(partitionFunctionFactory)},
-        outputType_{std::move(outputType)} {
+        outputType_{std::move(outputType)},
+        inputTypeFromSource_{std::move(inputTypeFromSource)} {
     VELOX_CHECK_GT(
         sources_.size(),
         0,
         "Local repartitioning node requires at least one source");
   }
 
-  static std::shared_ptr<LocalPartitionNode> single(
+  static std::shared_ptr<LocalPartitionNode> gather(
       const PlanNodeId& id,
       RowTypePtr outputType,
-      std::vector<std::shared_ptr<const PlanNode>> sources) {
+      std::vector<PlanNodePtr> sources,
+      RowTypePtr inputTypeFromSource) {
     return std::make_shared<LocalPartitionNode>(
         id,
+        Type::kGather,
         [](auto /*numPartitions*/) -> std::unique_ptr<PartitionFunction> {
           VELOX_UNREACHABLE();
         },
         std::move(outputType),
-        std::move(sources));
+        std::move(sources),
+        std::move(inputTypeFromSource));
+  }
+
+  Type type() const {
+    return type_;
   }
 
   const RowTypePtr& outputType() const override {
     return outputType_;
   }
 
-  const std::vector<std::shared_ptr<const PlanNode>>& sources() const override {
+  const std::vector<PlanNodePtr>& sources() const override {
     return sources_;
   }
 
-  const RowTypePtr& inputType() const {
-    return sources_[0]->outputType();
+  const RowTypePtr& inputTypeFromSource() const {
+    return inputTypeFromSource_;
   }
 
   const PartitionFunctionFactory& partitionFunctionFactory() const {
@@ -669,27 +794,35 @@ class LocalPartitionNode : public PlanNode {
   }
 
   std::string_view name() const override {
-    return "local repartitioning";
+    return "LocalPartition";
   }
 
  private:
-  const std::vector<std::shared_ptr<const PlanNode>> sources_;
+  void addDetails(std::stringstream& stream) const override;
+
+  const Type type_;
+  const std::vector<PlanNodePtr> sources_;
   const PartitionFunctionFactory partitionFunctionFactory_;
   const RowTypePtr outputType_;
+  /// Input layout from source, describing how data should be fed to our node.
+  /// For all sources the layout should be the same, so we store only one (we
+  /// use the 1st source for that).
+  /// This layout and the output layout for the 1st source would be used to
+  /// created the column mapping in the operator.
+  const RowTypePtr inputTypeFromSource_;
 };
 
 class PartitionedOutputNode : public PlanNode {
  public:
   PartitionedOutputNode(
       const PlanNodeId& id,
-      const std::vector<std::shared_ptr<const core::FieldAccessTypedExpr>>&
-          keys,
+      const std::vector<TypedExprPtr>& keys,
       int numPartitions,
       bool broadcast,
       bool replicateNullsAndAny,
       PartitionFunctionFactory partitionFunctionFactory,
       RowTypePtr outputType,
-      std::shared_ptr<const PlanNode> source)
+      PlanNodePtr source)
       : PlanNode(id),
         sources_{{std::move(source)}},
         keys_(keys),
@@ -715,8 +848,8 @@ class PartitionedOutputNode : public PlanNode {
       const PlanNodeId& id,
       int numPartitions,
       RowTypePtr outputType,
-      std::shared_ptr<const PlanNode> source) {
-    std::vector<std::shared_ptr<const core::FieldAccessTypedExpr>> noKeys;
+      PlanNodePtr source) {
+    std::vector<TypedExprPtr> noKeys;
     return std::make_shared<PartitionedOutputNode>(
         id,
         noKeys,
@@ -730,11 +863,9 @@ class PartitionedOutputNode : public PlanNode {
         std::move(source));
   }
 
-  static std::shared_ptr<PartitionedOutputNode> single(
-      const PlanNodeId& id,
-      RowTypePtr outputType,
-      std::shared_ptr<const PlanNode> source) {
-    std::vector<std::shared_ptr<const core::FieldAccessTypedExpr>> noKeys;
+  static std::shared_ptr<PartitionedOutputNode>
+  single(const PlanNodeId& id, RowTypePtr outputType, PlanNodePtr source) {
+    std::vector<TypedExprPtr> noKeys;
     return std::make_shared<PartitionedOutputNode>(
         id,
         noKeys,
@@ -752,7 +883,7 @@ class PartitionedOutputNode : public PlanNode {
     return outputType_;
   }
 
-  const std::vector<std::shared_ptr<const PlanNode>>& sources() const override {
+  const std::vector<PlanNodePtr>& sources() const override {
     return sources_;
   }
 
@@ -760,7 +891,7 @@ class PartitionedOutputNode : public PlanNode {
     return sources_[0]->outputType();
   }
 
-  const std::vector<std::shared_ptr<const FieldAccessTypedExpr>>& keys() const {
+  const std::vector<TypedExprPtr>& keys() const {
     return keys_;
   }
 
@@ -785,12 +916,14 @@ class PartitionedOutputNode : public PlanNode {
   }
 
   std::string_view name() const override {
-    return "repartitioning";
+    return "PartitionedOutput";
   }
 
  private:
-  const std::vector<std::shared_ptr<const PlanNode>> sources_;
-  const std::vector<std::shared_ptr<const FieldAccessTypedExpr>> keys_;
+  void addDetails(std::stringstream& stream) const override;
+
+  const std::vector<PlanNodePtr> sources_;
+  const std::vector<TypedExprPtr> keys_;
   const int numPartitions_;
   const bool broadcast_;
   const bool replicateNullsAndAny_;
@@ -799,6 +932,24 @@ class PartitionedOutputNode : public PlanNode {
 };
 
 enum class JoinType { kInner, kLeft, kRight, kFull, kSemi, kAnti };
+
+inline const char* joinTypeName(JoinType joinType) {
+  switch (joinType) {
+    case JoinType::kInner:
+      return "INNER";
+    case JoinType::kLeft:
+      return "LEFT";
+    case JoinType::kRight:
+      return "RIGHT";
+    case JoinType::kFull:
+      return "FULL";
+    case JoinType::kSemi:
+      return "SEMI";
+    case JoinType::kAnti:
+      return "ANTI";
+  }
+  VELOX_UNREACHABLE();
+}
 
 inline bool isInnerJoin(JoinType joinType) {
   return joinType == JoinType::kInner;
@@ -831,14 +982,14 @@ class AbstractJoinNode : public PlanNode {
   AbstractJoinNode(
       const PlanNodeId& id,
       JoinType joinType,
-      const std::vector<std::shared_ptr<const FieldAccessTypedExpr>>& leftKeys,
-      const std::vector<std::shared_ptr<const FieldAccessTypedExpr>>& rightKeys,
-      std::shared_ptr<const ITypedExpr> filter,
-      std::shared_ptr<const PlanNode> left,
-      std::shared_ptr<const PlanNode> right,
+      const std::vector<FieldAccessTypedExprPtr>& leftKeys,
+      const std::vector<FieldAccessTypedExprPtr>& rightKeys,
+      TypedExprPtr filter,
+      PlanNodePtr left,
+      PlanNodePtr right,
       const RowTypePtr outputType);
 
-  const std::vector<std::shared_ptr<const PlanNode>>& sources() const override {
+  const std::vector<PlanNodePtr>& sources() const override {
     return sources_;
   }
 
@@ -874,30 +1025,30 @@ class AbstractJoinNode : public PlanNode {
     return joinType_ == JoinType::kAnti;
   }
 
-  const std::vector<std::shared_ptr<const FieldAccessTypedExpr>>& leftKeys()
-      const {
+  const std::vector<FieldAccessTypedExprPtr>& leftKeys() const {
     return leftKeys_;
   }
 
-  const std::vector<std::shared_ptr<const FieldAccessTypedExpr>>& rightKeys()
-      const {
+  const std::vector<FieldAccessTypedExprPtr>& rightKeys() const {
     return rightKeys_;
   }
 
-  const std::shared_ptr<const ITypedExpr>& filter() const {
+  const TypedExprPtr& filter() const {
     return filter_;
   }
 
  private:
+  void addDetails(std::stringstream& stream) const override;
+
   const JoinType joinType_;
-  const std::vector<std::shared_ptr<const FieldAccessTypedExpr>> leftKeys_;
-  const std::vector<std::shared_ptr<const FieldAccessTypedExpr>> rightKeys_;
+  const std::vector<FieldAccessTypedExprPtr> leftKeys_;
+  const std::vector<FieldAccessTypedExprPtr> rightKeys_;
   // Optional join filter, nullptr if absent. This is applied to
   // join hits and if this is false, the hit turns into a miss, which
   // has a special meaning for outer joins. For inner joins, this is
   // equivalent to a Filter above the join.
-  const std::shared_ptr<const ITypedExpr> filter_;
-  const std::vector<std::shared_ptr<const PlanNode>> sources_;
+  const TypedExprPtr filter_;
+  const std::vector<PlanNodePtr> sources_;
   const RowTypePtr outputType_;
 };
 
@@ -909,11 +1060,11 @@ class HashJoinNode : public AbstractJoinNode {
   HashJoinNode(
       const PlanNodeId& id,
       JoinType joinType,
-      const std::vector<std::shared_ptr<const FieldAccessTypedExpr>>& leftKeys,
-      const std::vector<std::shared_ptr<const FieldAccessTypedExpr>>& rightKeys,
-      std::shared_ptr<const ITypedExpr> filter,
-      std::shared_ptr<const PlanNode> left,
-      std::shared_ptr<const PlanNode> right,
+      const std::vector<FieldAccessTypedExprPtr>& leftKeys,
+      const std::vector<FieldAccessTypedExprPtr>& rightKeys,
+      TypedExprPtr filter,
+      PlanNodePtr left,
+      PlanNodePtr right,
       const RowTypePtr outputType)
       : AbstractJoinNode(
             id,
@@ -926,7 +1077,7 @@ class HashJoinNode : public AbstractJoinNode {
             outputType) {}
 
   std::string_view name() const override {
-    return "hash join";
+    return "HashJoin";
   }
 };
 
@@ -940,11 +1091,11 @@ class MergeJoinNode : public AbstractJoinNode {
   MergeJoinNode(
       const PlanNodeId& id,
       JoinType joinType,
-      const std::vector<std::shared_ptr<const FieldAccessTypedExpr>>& leftKeys,
-      const std::vector<std::shared_ptr<const FieldAccessTypedExpr>>& rightKeys,
-      std::shared_ptr<const ITypedExpr> filter,
-      std::shared_ptr<const PlanNode> left,
-      std::shared_ptr<const PlanNode> right,
+      const std::vector<FieldAccessTypedExprPtr>& leftKeys,
+      const std::vector<FieldAccessTypedExprPtr>& rightKeys,
+      TypedExprPtr filter,
+      PlanNodePtr left,
+      PlanNodePtr right,
       const RowTypePtr outputType)
       : AbstractJoinNode(
             id,
@@ -957,7 +1108,7 @@ class MergeJoinNode : public AbstractJoinNode {
             outputType) {}
 
   std::string_view name() const override {
-    return "merge join";
+    return "MergeJoin";
   }
 };
 
@@ -966,11 +1117,11 @@ class CrossJoinNode : public PlanNode {
  public:
   CrossJoinNode(
       const PlanNodeId& id,
-      std::shared_ptr<const PlanNode> left,
-      std::shared_ptr<const PlanNode> right,
+      PlanNodePtr left,
+      PlanNodePtr right,
       RowTypePtr outputType);
 
-  const std::vector<std::shared_ptr<const PlanNode>>& sources() const override {
+  const std::vector<PlanNodePtr>& sources() const override {
     return sources_;
   }
 
@@ -979,11 +1130,13 @@ class CrossJoinNode : public PlanNode {
   }
 
   std::string_view name() const override {
-    return "cross join";
+    return "CrossJoin";
   }
 
  private:
-  const std::vector<std::shared_ptr<const PlanNode>> sources_;
+  void addDetails(std::stringstream& stream) const override;
+
+  const std::vector<PlanNodePtr> sources_;
   const RowTypePtr outputType_;
 };
 
@@ -992,11 +1145,10 @@ class OrderByNode : public PlanNode {
  public:
   OrderByNode(
       const PlanNodeId& id,
-      const std::vector<std::shared_ptr<const FieldAccessTypedExpr>>&
-          sortingKeys,
+      const std::vector<FieldAccessTypedExprPtr>& sortingKeys,
       const std::vector<SortOrder>& sortingOrders,
       bool isPartial,
-      const std::shared_ptr<const PlanNode>& source)
+      const PlanNodePtr& source)
       : PlanNode(id),
         sortingKeys_(sortingKeys),
         sortingOrders_(sortingOrders),
@@ -1009,8 +1161,7 @@ class OrderByNode : public PlanNode {
         "Number of sorting keys and sorting orders in OrderBy must be the same");
   }
 
-  const std::vector<std::shared_ptr<const FieldAccessTypedExpr>>& sortingKeys()
-      const {
+  const std::vector<FieldAccessTypedExprPtr>& sortingKeys() const {
     return sortingKeys_;
   }
 
@@ -1022,7 +1173,7 @@ class OrderByNode : public PlanNode {
     return sources_[0]->outputType();
   }
 
-  const std::vector<std::shared_ptr<const PlanNode>>& sources() const override {
+  const std::vector<PlanNodePtr>& sources() const override {
     return sources_;
   }
 
@@ -1034,34 +1185,27 @@ class OrderByNode : public PlanNode {
   }
 
   std::string_view name() const override {
-    return "orderby";
+    return "OrderBy";
   }
 
  private:
-  void addDetails(std::stringstream& stream) const override {
-    stream << "sort keys: ";
-    for (auto i = 0; i < sortingKeys_.size(); ++i) {
-      stream << "(" << sortingKeys_[i]->toString() << " "
-             << sortingOrders_[i].toString() << "), ";
-    }
-  }
+  void addDetails(std::stringstream& stream) const override;
 
-  const std::vector<std::shared_ptr<const FieldAccessTypedExpr>> sortingKeys_;
+  const std::vector<FieldAccessTypedExprPtr> sortingKeys_;
   const std::vector<SortOrder> sortingOrders_;
   const bool isPartial_;
-  const std::vector<std::shared_ptr<const PlanNode>> sources_;
+  const std::vector<PlanNodePtr> sources_;
 };
 
 class TopNNode : public PlanNode {
  public:
   TopNNode(
       const PlanNodeId& id,
-      const std::vector<std::shared_ptr<const FieldAccessTypedExpr>>&
-          sortingKeys,
+      const std::vector<FieldAccessTypedExprPtr>& sortingKeys,
       const std::vector<SortOrder>& sortingOrders,
       int32_t count,
       bool isPartial,
-      const std::shared_ptr<const PlanNode>& source)
+      const PlanNodePtr& source)
       : PlanNode(id),
         sortingKeys_(sortingKeys),
         sortingOrders_(sortingOrders),
@@ -1077,8 +1221,7 @@ class TopNNode : public PlanNode {
         "TopN must specify greater than zero number of rows to keep");
   }
 
-  const std::vector<std::shared_ptr<const FieldAccessTypedExpr>>& sortingKeys()
-      const {
+  const std::vector<FieldAccessTypedExprPtr>& sortingKeys() const {
     return sortingKeys_;
   }
 
@@ -1090,7 +1233,7 @@ class TopNNode : public PlanNode {
     return sources_[0]->outputType();
   }
 
-  const std::vector<std::shared_ptr<const PlanNode>>& sources() const override {
+  const std::vector<PlanNodePtr>& sources() const override {
     return sources_;
   }
 
@@ -1103,15 +1246,17 @@ class TopNNode : public PlanNode {
   }
 
   std::string_view name() const override {
-    return "topN";
+    return "TopN";
   }
 
  private:
-  const std::vector<std::shared_ptr<const FieldAccessTypedExpr>> sortingKeys_;
+  void addDetails(std::stringstream& stream) const override;
+
+  const std::vector<FieldAccessTypedExprPtr> sortingKeys_;
   const std::vector<SortOrder> sortingOrders_;
   const int32_t count_;
   const bool isPartial_;
-  const std::vector<std::shared_ptr<const PlanNode>> sources_;
+  const std::vector<PlanNodePtr> sources_;
 };
 
 class LimitNode : public PlanNode {
@@ -1124,7 +1269,7 @@ class LimitNode : public PlanNode {
       int32_t offset,
       int32_t count,
       bool isPartial,
-      const std::shared_ptr<const PlanNode>& source)
+      const PlanNodePtr& source)
       : PlanNode(id),
         offset_(offset),
         count_(count),
@@ -1139,7 +1284,7 @@ class LimitNode : public PlanNode {
     return sources_[0]->outputType();
   }
 
-  const std::vector<std::shared_ptr<const PlanNode>>& sources() const override {
+  const std::vector<PlanNodePtr>& sources() const override {
     return sources_;
   }
 
@@ -1156,14 +1301,16 @@ class LimitNode : public PlanNode {
   }
 
   std::string_view name() const override {
-    return "limit";
+    return "Limit";
   }
 
  private:
+  void addDetails(std::stringstream& stream) const override;
+
   const int32_t offset_;
   const int32_t count_;
   const bool isPartial_;
-  const std::vector<std::shared_ptr<const PlanNode>> sources_;
+  const std::vector<PlanNodePtr> sources_;
 };
 
 /// Expands arrays and maps into separate columns. Arrays are expanded into a
@@ -1184,12 +1331,11 @@ class UnnestNode : public PlanNode {
   /// present, ordinality column is not produced.
   UnnestNode(
       const PlanNodeId& id,
-      std::vector<std::shared_ptr<const FieldAccessTypedExpr>>
-          replicateVariables,
-      std::vector<std::shared_ptr<const FieldAccessTypedExpr>> unnestVariables,
+      std::vector<FieldAccessTypedExprPtr> replicateVariables,
+      std::vector<FieldAccessTypedExprPtr> unnestVariables,
       const std::vector<std::string>& unnestNames,
       const std::optional<std::string>& ordinalityName,
-      const std::shared_ptr<const PlanNode>& source);
+      const PlanNodePtr& source);
 
   /// The order of columns in the output is: replicated columns (in the order
   /// specified), unnested columns (in the order specified, for maps: key comes
@@ -1198,17 +1344,15 @@ class UnnestNode : public PlanNode {
     return outputType_;
   }
 
-  const std::vector<std::shared_ptr<const PlanNode>>& sources() const override {
+  const std::vector<PlanNodePtr>& sources() const override {
     return sources_;
   }
 
-  const std::vector<std::shared_ptr<const FieldAccessTypedExpr>>&
-  replicateVariables() const {
+  const std::vector<FieldAccessTypedExprPtr>& replicateVariables() const {
     return replicateVariables_;
   }
 
-  const std::vector<std::shared_ptr<const FieldAccessTypedExpr>>&
-  unnestVariables() const {
+  const std::vector<FieldAccessTypedExprPtr>& unnestVariables() const {
     return unnestVariables_;
   }
 
@@ -1217,16 +1361,16 @@ class UnnestNode : public PlanNode {
   }
 
   std::string_view name() const override {
-    return "unnest";
+    return "Unnest";
   }
 
  private:
-  const std::vector<std::shared_ptr<const FieldAccessTypedExpr>>
-      replicateVariables_;
-  const std::vector<std::shared_ptr<const FieldAccessTypedExpr>>
-      unnestVariables_;
+  void addDetails(std::stringstream& stream) const override;
+
+  const std::vector<FieldAccessTypedExprPtr> replicateVariables_;
+  const std::vector<FieldAccessTypedExprPtr> unnestVariables_;
   const bool withOrdinality_;
-  const std::vector<std::shared_ptr<const PlanNode>> sources_;
+  const std::vector<PlanNodePtr> sources_;
   RowTypePtr outputType_;
 };
 
@@ -1237,25 +1381,25 @@ class UnnestNode : public PlanNode {
 /// This plan node is used in query plans that use non-correlated sub-queries.
 class EnforceSingleRowNode : public PlanNode {
  public:
-  EnforceSingleRowNode(
-      const PlanNodeId& id,
-      std::shared_ptr<const PlanNode> source)
+  EnforceSingleRowNode(const PlanNodeId& id, PlanNodePtr source)
       : PlanNode(id), sources_{std::move(source)} {}
 
   const RowTypePtr& outputType() const override {
     return sources_[0]->outputType();
   }
 
-  const std::vector<std::shared_ptr<const PlanNode>>& sources() const override {
+  const std::vector<PlanNodePtr>& sources() const override {
     return sources_;
   }
 
   std::string_view name() const override {
-    return "enforce single row";
+    return "EnforceSingleRow";
   }
 
  private:
-  const std::vector<std::shared_ptr<const PlanNode>> sources_;
+  void addDetails(std::stringstream& stream) const override;
+
+  const std::vector<PlanNodePtr> sources_;
 };
 
 /// Adds a new column named `idName` at the end of the input columns
@@ -1274,18 +1418,18 @@ class AssignUniqueIdNode : public PlanNode {
       const PlanNodeId& id,
       const std::string& idName,
       const int32_t taskUniqueId,
-      std::shared_ptr<const PlanNode> source);
+      PlanNodePtr source);
 
   const RowTypePtr& outputType() const override {
     return outputType_;
   }
 
-  const std::vector<std::shared_ptr<const PlanNode>>& sources() const override {
+  const std::vector<PlanNodePtr>& sources() const override {
     return sources_;
   }
 
   std::string_view name() const override {
-    return "assign unique id";
+    return "AssignUniqueId";
   }
 
   int32_t taskUniqueId() const {
@@ -1297,8 +1441,10 @@ class AssignUniqueIdNode : public PlanNode {
   };
 
  private:
+  void addDetails(std::stringstream& stream) const override;
+
   const int32_t taskUniqueId_;
-  const std::vector<std::shared_ptr<const PlanNode>> sources_;
+  const std::vector<PlanNodePtr> sources_;
   RowTypePtr outputType_;
   std::shared_ptr<std::atomic_int64_t> uniqueIdCounter_;
 };

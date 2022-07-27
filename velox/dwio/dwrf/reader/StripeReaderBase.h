@@ -16,8 +16,10 @@
 
 #pragma once
 
+#include "velox/dwio/common/BufferedInput.h"
 #include "velox/dwio/common/Options.h"
 #include "velox/dwio/dwrf/reader/ReaderBase.h"
+#include "velox/dwio/dwrf/reader/StripeReaderBase.h"
 
 namespace facebook::velox::dwrf {
 
@@ -50,12 +52,16 @@ class StripeReaderBase {
     return *footer_;
   }
 
-  BufferedInput& getStripeInput() const {
+  dwio::common::BufferedInput& getStripeInput() const {
     return stripeInput_ ? *stripeInput_ : reader_->getBufferedInput();
   }
 
   ReaderBase& getReader() const {
     return *reader_;
+  }
+
+  std::shared_ptr<ReaderBase> readerBaseShared() {
+    return reader_;
   }
 
   const encryption::DecryptionHandler& getDecryptionHandler() const {
@@ -64,7 +70,7 @@ class StripeReaderBase {
 
  private:
   std::shared_ptr<ReaderBase> reader_;
-  std::unique_ptr<BufferedInput> stripeInput_;
+  std::unique_ptr<dwio::common::BufferedInput> stripeInput_;
   proto::StripeFooter* footer_ = nullptr;
   std::unique_ptr<encryption::DecryptionHandler> handler_;
   std::optional<uint32_t> lastStripeIndex_;

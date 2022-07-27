@@ -18,10 +18,12 @@ add_library(
   Hash.cpp
   In.cpp
   LeastGreatest.cpp
+  Map.cpp
   RegexFunctions.cpp
   Register.cpp
   RegisterArithmetic.cpp
   RegisterCompare.cpp
+  Size.cpp
   SplitFunctions.cpp
   String.cpp
   Subscript.cpp)

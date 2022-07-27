@@ -28,21 +28,24 @@ option(
   VELOX_BUILD_MINIMAL
   "Build a minimal set of components only. This will override other build options."
   OFF)
-option(VELOX_BUILD_BENCHMARKS "Build top level benchmarks." OFF)
 
 option(VELOX_ENABLE_DUCKDB "Build duckDB to enable differential testing." ON)
 option(VELOX_ENABLE_EXEC "Build exec." ON)
 option(VELOX_ENABLE_AGGREGATES "Build aggregates." ON)
 option(VELOX_ENABLE_HIVE_CONNECTOR "Build Hive connector." ON)
+option(VELOX_ENABLE_TPCH_CONNECTOR "Build TPC-H connector." ON)
 option(VELOX_ENABLE_PRESTO_FUNCTIONS "Build Presto SQL functions." ON)
 option(VELOX_ENABLE_SPARK_FUNCTIONS "Build Spark SQL functions." ON)
 option(VELOX_ENABLE_EXPRESSION "Build expression." ON)
 option(VELOX_ENABLE_PARSE "Build parser used for unit tests." ON)
 option(VELOX_ENABLE_EXAMPLES
        "Build examples. This will enable VELOX_ENABLE_EXPRESSION automatically."
-       ON)
+       OFF)
+option(VELOX_ENABLE_SUBSTRAIT "Buid Substrait-to-Velox converter." OFF)
 option(VELOX_ENABLE_BENCHMARKS "Build velox top level benchmarks." OFF)
+option(VELOX_ENABLE_BENCHMARKS_BASIC "Build velox basic benchmarks." OFF)
 option(VELOX_ENABLE_S3 "Build S3 Connector" OFF)
+option(VELOX_ENABLE_HDFS "Build Hdfs Connector" OFF)
 option(VELOX_ENABLE_PARQUET "Enable Parquet support" OFF)
 option(VELOX_BUILD_TEST_UTILS "Enable Velox test utilities" OFF)
 
@@ -50,16 +53,18 @@ if(${VELOX_BUILD_MINIMAL})
   # Enable and disable components for velox base build
   set(VELOX_BUILD_TESTING OFF)
   set(VELOX_ENABLE_PRESTO_FUNCTIONS ON)
-  set(VELOX_ENABLE_BENCHMARKS OFF)
   set(VELOX_ENABLE_DUCKDB OFF)
   set(VELOX_ENABLE_EXPRESSION ON)
   set(VELOX_ENABLE_PARSE OFF)
   set(VELOX_ENABLE_EXEC OFF)
   set(VELOX_ENABLE_AGGREGATES OFF)
   set(VELOX_ENABLE_HIVE_CONNECTOR OFF)
+  set(VELOX_ENABLE_TPCH_CONNECTOR OFF)
   set(VELOX_ENABLE_SPARK_FUNCTIONS OFF)
   set(VELOX_ENABLE_EXAMPLES OFF)
   set(VELOX_ENABLE_S3 OFF)
+  set(VELOX_ENABLE_SUBSTRAIT OFF)
+  set(VELOX_CODEGEN_SUPPORT OFF)
 endif()
 
 if(${VELOX_BUILD_TESTING})
@@ -71,18 +76,28 @@ if(${VELOX_BUILD_TESTING})
   set(VELOX_ENABLE_EXEC ON)
   set(VELOX_ENABLE_AGGREGATES ON)
   set(VELOX_ENABLE_HIVE_CONNECTOR ON)
+  set(VELOX_ENABLE_TPCH_CONNECTOR ON)
   set(VELOX_ENABLE_SPARK_FUNCTIONS ON)
   set(VELOX_ENABLE_TEST_UTILS OFF)
+  set(VELOX_ENABLE_EXAMPLES ON)
 endif()
 
 if(${VELOX_ENABLE_EXAMPLES})
   set(VELOX_ENABLE_EXPRESSION ON)
+  set(VELOX_ENABLE_TEST_UTILS ON)
 endif()
 
-if(${VELOX_BUILD_BENCHMARKS})
-  set(VELOX_ENABLE_BENCHMARKS ON)
+if(${VELOX_ENABLE_BENCHMARKS} OR ${VELOX_ENABLE_BENCHMARKS_BASIC})
   set(VELOX_ENABLE_DUCKDB ON)
   set(VELOX_ENABLE_PARSE ON)
+endif()
+
+if(${VELOX_BUILD_BENCHMARKS_LARGE})
+  set(VELOX_ENABLE_PARQUET ON)
+  set(VELOX_ENABLE_PRESTO_FUNCTIONS ON)
+  set(VELOX_ENABLE_PARSE ON)
+  set(VELOX_ENABLE_AGGREGATES ON)
+  set(VELOX_ENABLE_EXEC ON)
   set(VELOX_BUILD_TEST_UTILS ON)
 endif()
 
@@ -95,14 +110,22 @@ if(VELOX_ENABLE_S3)
   add_definitions(-DVELOX_ENABLE_S3)
 endif()
 
+if(VELOX_ENABLE_HDFS)
+  find_library(
+    LIBHDFS3
+    NAMES libhdfs3.so libhdfs3.dylib
+    HINTS "${CMAKE_SOURCE_DIR}/hawq/depends/libhdfs3/_build/src/" REQUIRED)
+  add_definitions(-DVELOX_ENABLE_HDFS3)
+endif()
+
 if(VELOX_ENABLE_PARQUET)
   add_definitions(-DVELOX_ENABLE_PARQUET)
 endif()
 
-# If CODEGEN support isn't explicitly set, we guestimate the value based on the
-# compiler
-if((NOT DEFINED VELOX_CODEGEN_SUPPORT) AND (CMAKE_CXX_COMPILER_ID MATCHES
-                                            "Clang"))
+# Turn on Codegen only for Clang and non Mac systems.
+if((NOT DEFINED VELOX_CODEGEN_SUPPORT)
+   AND (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+   AND NOT (${CMAKE_SYSTEM_NAME} MATCHES "Darwin"))
   message(STATUS "Enabling Codegen")
   set(VELOX_CODEGEN_SUPPORT True)
 else()
@@ -127,14 +150,31 @@ if(UNIX AND NOT APPLE)
   add_link_options("-Wl,-export-dynamic")
 endif()
 
+if(${CMAKE_SYSTEM_PROCESSOR} MATCHES "arm64" AND ${CMAKE_SYSTEM_NAME} MATCHES
+                                                 "Darwin")
+  set(ON_APPLE_M1 True)
+endif()
+
 # Required so velox code can be used in a dynamic library
 set(POSITION_INDEPENDENT_CODE True)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
-set(CMAKE_CXX_FLAGS
-    "${CMAKE_CXX_FLAGS} -mavx2 -mfma -mavx -mf16c -mbmi2 -march=native -D USE_VELOX_COMMON_BASE"
-)
+
+execute_process(
+  COMMAND
+    bash -c
+    "( source ${CMAKE_CURRENT_SOURCE_DIR}/scripts/setup-helper-functions.sh && echo -n $(get_cxx_flags $ENV{CPU_TARGET}))"
+  OUTPUT_VARIABLE SCRIPT_CXX_FLAGS
+  RESULT_VARIABLE COMMAND_STATUS)
+
+if(COMMAND_STATUS EQUAL "1")
+  message(FATAL_ERROR "Unable to determine compiler flags!")
+endif()
+message("Setting CMAKE_CXX_FLAGS=${SCRIPT_CXX_FLAGS}")
+
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${SCRIPT_CXX_FLAGS}")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -D USE_VELOX_COMMON_BASE")
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -D HAS_UNCAUGHT_EXCEPTIONS")
 
@@ -207,13 +247,8 @@ include_directories(SYSTEM ${Boost_INCLUDE_DIRS})
 # Range-v3 will be enable when the codegen code actually lands keeping it here
 # for reference. find_package(range-v3)
 
-find_package(GTest REQUIRED)
 find_package(gflags COMPONENTS shared)
-
-find_library(GMock gmock)
-
 find_package(glog REQUIRED)
-include_directories(SYSTEM ${GTEST_INCLUDE_DIRS})
 
 find_package(fmt REQUIRED)
 
@@ -221,15 +256,22 @@ find_library(EVENT event)
 
 find_library(DOUBLE_CONVERSION double-conversion)
 
-find_library(LZ4 lz4)
-find_library(LZO lzo2)
+if(NOT ${VELOX_BUILD_MINIMAL})
+  find_library(LZ4 lz4)
+  find_library(LZO lzo2)
+  find_library(ZSTD zstd)
+  find_package(ZLIB)
+  find_library(SNAPPY snappy)
+endif()
+
 find_library(RE2 re2 REQUIRED)
-find_library(ZSTD zstd)
-find_package(ZLIB)
-find_library(SNAPPY snappy)
 
 if(CMAKE_SYSTEM_NAME MATCHES "Darwin")
-  set(CMAKE_PREFIX_PATH "/usr/local/opt/icu4c" ${CMAKE_PREFIX_PATH})
+  if(ON_APPLE_M1)
+    set(CMAKE_PREFIX_PATH "/opt/homebrew/opt/icu4c" ${CMAKE_PREFIX_PATH})
+  else()
+    set(CMAKE_PREFIX_PATH "/usr/local/opt/icu4c" ${CMAKE_PREFIX_PATH})
+  endif()
   find_package(ICU REQUIRED)
   include_directories(${ICU_INCLUDE_DIRS})
   link_directories("${ICU_INCLUDE_DIRS}/../lib")
@@ -243,14 +285,18 @@ set(FOLLY_WITH_DEPENDENCIES
 set(FOLLY ${FOLLY_LIBRARIES})
 set(FOLLY_BENCHMARK Folly::follybenchmark)
 
-find_package(BZip2 MODULE)
-if(BZIP2_FOUND)
-  list(APPEND FOLLY_WITH_DEPENDENCIES ${BZIP2_LIBRARIES})
+if(NOT ${VELOX_BUILD_MINIMAL})
+  find_package(BZip2 MODULE)
+  if(BZIP2_FOUND)
+    list(APPEND FOLLY_WITH_DEPENDENCIES ${BZIP2_LIBRARIES})
+  endif()
 endif()
 
 include_directories(SYSTEM ${FOLLY_INCLUDE_DIRS})
 
-find_package(Protobuf 3.0.0 REQUIRED)
+if(NOT ${VELOX_BUILD_MINIMAL})
+  find_package(Protobuf 3.0.0 REQUIRED)
+endif()
 
 # GCC needs to link a library to enable std::filesystem.
 if("${CMAKE_CXX_COMPILER_ID}" MATCHES "GNU")
@@ -272,9 +318,49 @@ if(VELOX_BUILD_TESTING AND NOT VELOX_ENABLE_DUCKDB)
   )
 endif()
 
+# Benchmarks and tests at some places are coupled which is not great. See
+# velox/vector/CMakeLists.txt. TODO: Decouple.
+set(VELOX_DISABLE_GOOGLETEST OFF)
+if(NOT VELOX_BUILD_TEST_UTILS
+   AND NOT VELOX_BUILD_TESTING
+   AND NOT VELOX_ENABLE_BENCHMARKS_BASIC)
+  set(VELOX_DISABLE_GOOGLETEST ON)
+  add_definitions(-DVELOX_DISABLE_GOOGLETEST)
+endif()
+
+# On macOS, search Homebrew for keg-only versions of Bison and Flex. Xcode does
+# not provide new enough versions for us to use.
+if(CMAKE_HOST_SYSTEM_NAME MATCHES "Darwin")
+  execute_process(
+    COMMAND brew --prefix bison
+    RESULT_VARIABLE BREW_BISON
+    OUTPUT_VARIABLE BREW_BISON_PREFIX
+    OUTPUT_STRIP_TRAILING_WHITESPACE)
+  if(BREW_BISON EQUAL 0 AND EXISTS "${BREW_BISON_PREFIX}")
+    message(
+      STATUS "Found Bison keg installed by Homebrew at ${BREW_BISON_PREFIX}")
+    set(BISON_EXECUTABLE "${BREW_BISON_PREFIX}/bin/bison")
+  endif()
+
+  execute_process(
+    COMMAND brew --prefix flex
+    RESULT_VARIABLE BREW_FLEX
+    OUTPUT_VARIABLE BREW_FLEX_PREFIX
+    OUTPUT_STRIP_TRAILING_WHITESPACE)
+  if(BREW_FLEX EQUAL 0 AND EXISTS "${BREW_FLEX_PREFIX}")
+    message(
+      STATUS "Found Flex keg installed by Homebrew at ${BREW_FLEX_PREFIX}")
+    set(FLEX_EXECUTABLE "${BREW_FLEX_PREFIX}/bin/flex")
+    set(FLEX_INCLUDE_DIR "${BREW_FLEX_PREFIX}/include")
+  endif()
+endif()
+find_package(BISON 3.0.4 REQUIRED)
+find_package(FLEX 2.5.13 REQUIRED)
+
 include_directories(SYSTEM velox)
 include_directories(SYSTEM velox/external)
 include_directories(SYSTEM velox/external/duckdb)
+include_directories(SYSTEM velox/external/duckdb/tpch/dbgen/include)
 
 include(CTest) # include after project() but before add_subdirectory()
 
@@ -284,4 +370,5 @@ include_directories(.)
 # generates an installable makefile.
 install(FILES velox/type/Type.h DESTINATION "include/velox")
 
+add_subdirectory(third_party)
 add_subdirectory(velox)

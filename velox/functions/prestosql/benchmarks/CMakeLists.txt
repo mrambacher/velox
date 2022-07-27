@@ -13,13 +13,8 @@
 # limitations under the License.
 
 set(BENCHMARK_DEPENDENCIES_NO_FUNC
-    velox_functions_test_lib
-    velox_exec
-    velox_exec_test_util
-    ${GTEST_BOTH_LIBRARIES}
-    ${gflags_LIBRARIES}
-    ${FOLLY_WITH_DEPENDENCIES}
-    ${FOLLY_BENCHMARK})
+    velox_functions_test_lib velox_exec velox_exec_test_util
+    ${gflags_LIBRARIES} ${FOLLY_WITH_DEPENDENCIES} ${FOLLY_BENCHMARK})
 
 set(BENCHMARK_DEPENDENCIES
     velox_functions_prestosql velox_functions_lib velox_vector_fuzzer
@@ -81,28 +76,54 @@ add_executable(velox_functions_benchmarks_compare CompareBenchmark.cpp)
 target_link_libraries(velox_functions_benchmarks_compare
                       ${BENCHMARK_DEPENDENCIES})
 
-add_executable(velox_benchmark_array_proxy_with_nulls ArrayProxyBenchmark.cpp)
-target_compile_definitions(velox_benchmark_array_proxy_with_nulls
+add_executable(velox_benchmark_array_writer_with_nulls ArrayWriterBenchmark.cpp)
+target_compile_definitions(velox_benchmark_array_writer_with_nulls
                            PUBLIC WITH_NULLS=true)
-target_link_libraries(velox_benchmark_array_proxy_with_nulls
+target_link_libraries(velox_benchmark_array_writer_with_nulls
                       ${BENCHMARK_DEPENDENCIES_NO_FUNC})
 
-add_executable(velox_benchmark_array_proxy_no_nulls ArrayProxyBenchmark.cpp)
-target_link_libraries(velox_benchmark_array_proxy_no_nulls
+add_executable(velox_benchmark_array_writer_no_nulls ArrayWriterBenchmark.cpp)
+target_link_libraries(velox_benchmark_array_writer_no_nulls
                       ${BENCHMARK_DEPENDENCIES_NO_FUNC})
-target_compile_definitions(velox_benchmark_array_proxy_no_nulls
+target_compile_definitions(velox_benchmark_array_writer_no_nulls
                            PUBLIC WITH_NULLS=false)
 
-add_executable(velox_benchmark_nested_array_proxy_no_nulls
-               NestedArrayProxyBenchmark.cpp)
-target_link_libraries(velox_benchmark_nested_array_proxy_no_nulls
+add_executable(velox_benchmark_nested_array_writer_no_nulls
+               NestedArrayWriterBenchmark.cpp)
+target_link_libraries(velox_benchmark_nested_array_writer_no_nulls
                       ${BENCHMARK_DEPENDENCIES_NO_FUNC})
-target_compile_definitions(velox_benchmark_nested_array_proxy_no_nulls
+target_compile_definitions(velox_benchmark_nested_array_writer_no_nulls
                            PUBLIC WITH_NULLS=false)
 
-add_executable(velox_benchmark_nested_array_proxy_with_nulls
-               NestedArrayProxyBenchmark.cpp)
-target_compile_definitions(velox_benchmark_nested_array_proxy_with_nulls
+add_executable(velox_benchmark_nested_array_writer_with_nulls
+               NestedArrayWriterBenchmark.cpp)
+target_compile_definitions(velox_benchmark_nested_array_writer_with_nulls
                            PUBLIC WITH_NULLS=true)
-target_link_libraries(velox_benchmark_nested_array_proxy_with_nulls
+target_link_libraries(velox_benchmark_nested_array_writer_with_nulls
                       ${BENCHMARK_DEPENDENCIES_NO_FUNC})
+
+add_executable(velox_benchmark_map_writer_with_nulls MapWriterBenchmarks.cpp)
+target_compile_definitions(velox_benchmark_map_writer_with_nulls
+                           PUBLIC WITH_NULLS=true)
+target_link_libraries(velox_benchmark_map_writer_with_nulls
+                      ${BENCHMARK_DEPENDENCIES_NO_FUNC})
+
+add_executable(velox_benchmark_map_writer_no_nulls MapWriterBenchmarks.cpp)
+target_link_libraries(velox_benchmark_map_writer_no_nulls
+                      ${BENCHMARK_DEPENDENCIES_NO_FUNC})
+target_compile_definitions(velox_benchmark_map_writer_no_nulls
+                           PUBLIC WITH_NULLS=false)
+
+add_executable(velox_functions_benchmarks_row_writer_no_nulls
+               RowWriterBenchmark.cpp)
+target_link_libraries(velox_functions_benchmarks_row_writer_no_nulls
+                      ${BENCHMARK_DEPENDENCIES_NO_FUNC})
+
+add_executable(velox_functions_benchmarks_string_writer_no_nulls
+               StringWriterBenchmark.cpp)
+target_link_libraries(velox_functions_benchmarks_string_writer_no_nulls
+                      ${BENCHMARK_DEPENDENCIES_NO_FUNC})
+
+add_executable(velox_functions_prestosql_benchmarks_zip ZipBenchmark.cpp)
+target_link_libraries(velox_functions_prestosql_benchmarks_zip
+                      ${BENCHMARK_DEPENDENCIES})

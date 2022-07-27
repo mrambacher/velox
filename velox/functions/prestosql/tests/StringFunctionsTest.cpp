@@ -24,6 +24,7 @@
 #include "velox/functions/lib/string/StringImpl.h"
 #include "velox/functions/prestosql/tests/FunctionBaseTest.h"
 #include "velox/parse/Expressions.h"
+#include "velox/type/Type.h"
 
 using namespace facebook::velox;
 using namespace facebook::velox::exec;
@@ -631,35 +632,6 @@ TEST_F(StringFunctionsTest, substrWithConditionalSingleBuffer) {
   }
 }
 
-/**
- * The test for user exception checking
- */
-TEST_F(StringFunctionsTest, substrArgumentExceptionCheck) {
-  vector_size_t size = 100;
-
-  std::vector<std::string> strings(size);
-  std::generate(strings.begin(), strings.end(), [i = -1]() mutable {
-    i++;
-    return std::to_string(i) + "_MYSTR_" + std::to_string(i * 100);
-  });
-
-  auto stringVector = makeStrings(size, strings);
-
-  auto row = makeRowVector({stringVector});
-
-  EXPECT_THROW(
-      evaluate<FlatVector<StringView>>("substr('my string here', 'A')", row),
-      std::invalid_argument);
-
-  EXPECT_THROW(
-      evaluate<FlatVector<StringView>>("substr('my string here', 1.0)", row),
-      std::invalid_argument);
-
-  EXPECT_THROW(
-      evaluate<FlatVector<StringView>>("substr('my string here')", row),
-      std::invalid_argument);
-}
-
 namespace {
 std::vector<std::tuple<std::string, std::string>> getUpperAsciiTestData() {
   return {
@@ -1057,28 +1029,58 @@ void StringFunctionsTest::testReplaceInPlace(
     const std::string& search,
     const std::string& replace,
     bool multiReferenced) {
-  auto stringVector = makeFlatVector<StringView>(tests.size());
+  auto makeInput = [&]() {
+    auto stringVector = makeFlatVector<StringView>(tests.size());
 
-  for (int i = 0; i < tests.size(); i++) {
-    stringVector->set(i, StringView(tests[i].first));
-  }
-
-  auto crossRefVector = makeFlatVector<StringView>(1);
-
-  if (multiReferenced) {
-    crossRefVector->acquireSharedStringBuffers(stringVector.get());
-  }
-
-  FlatVectorPtr<StringView> result = evaluate<FlatVector<StringView>>(
-      fmt::format("replace(c0, '{}', '{}')", search, replace),
-      makeRowVector({stringVector}));
-
-  for (int32_t i = 0; i < tests.size(); ++i) {
-    ASSERT_EQ(result->valueAt(i), StringView(tests[i].second));
-    if (!multiReferenced && !stringVector->valueAt(i).isInline() &&
-        search.size() <= replace.size()) {
-      ASSERT_EQ(result->valueAt(i), stringVector->valueAt(i));
+    for (int i = 0; i < tests.size(); i++) {
+      stringVector->set(i, StringView(tests[i].first));
     }
+    auto crossRefVector = makeFlatVector<StringView>(1);
+
+    if (multiReferenced) {
+      crossRefVector->acquireSharedStringBuffers(stringVector.get());
+    }
+    return stringVector;
+  };
+
+  auto testResults = [&](const FlatVector<StringView>* results) {
+    for (int32_t i = 0; i < tests.size(); ++i) {
+      ASSERT_EQ(results->valueAt(i), StringView(tests[i].second));
+    }
+  };
+
+  auto result = evaluate<FlatVector<StringView>>(
+      fmt::format("replace(c0, '{}', '{}')", search, replace),
+      makeRowVector({makeInput()}));
+  testResults(result.get());
+
+  // Test in place optimization. If in-place is expected, make sure it happened.
+  // If its not expected make sure it did not happen.
+  auto applyReplaceFunction = [&](std::vector<VectorPtr>& functionInputs,
+                                  VectorPtr& resultPtr) {
+    auto replaceFunction = exec::getVectorFunction("replace", {VARCHAR()}, {});
+    SelectivityVector rows(tests.size());
+    ExprSet exprSet({}, &execCtx_);
+    RowVectorPtr inputRows = makeRowVector({});
+    exec::EvalCtx evalCtx(&execCtx_, &exprSet, inputRows.get());
+    replaceFunction->apply(
+        rows, functionInputs, VARCHAR(), &evalCtx, &resultPtr);
+  };
+
+  std::vector<VectorPtr> functionInputs = {
+      makeInput(),
+      makeConstant(search.c_str(), tests.size()),
+      makeConstant(replace.c_str(), tests.size())};
+
+  VectorPtr resultPtr;
+  applyReplaceFunction(functionInputs, resultPtr);
+  testResults(resultPtr->asFlatVector<StringView>());
+
+  if (!multiReferenced && search >= replace) {
+    // Expected in-place.
+    ASSERT_TRUE(resultPtr == functionInputs[0]);
+  } else {
+    ASSERT_FALSE(resultPtr == functionInputs[0]);
   }
 }
 
@@ -1144,6 +1146,7 @@ TEST_F(StringFunctionsTest, replace) {
 
   testReplaceInPlace(testsInplace, "a", "b", true);
   testReplaceInPlace(testsInplace, "a", "b", false);
+  testReplaceInPlace({{"a", "bb"}, {"aa", "bbbb"}}, "a", "bb", false);
 
   // Test constant vectors
   auto rows = makeRowVector(makeRowType({BIGINT()}), 10);
@@ -1151,6 +1154,30 @@ TEST_F(StringFunctionsTest, replace) {
       evaluate<SimpleVector<StringView>>("replace('high', 'ig', 'f')", rows);
   for (int i = 0; i < 10; ++i) {
     EXPECT_EQ(result->valueAt(i), StringView("hfh"));
+  }
+}
+
+TEST_F(StringFunctionsTest, replaceWithReusableInputButNoInplace) {
+  auto c0 = ({
+    auto values = makeFlatVector<std::string>({"foo"});
+    auto indices = allocateIndices(100, execCtx_.pool());
+    wrapInDictionary(indices, 100, values);
+  });
+  auto c1 =
+      makeFlatVector<int64_t>(100, [](vector_size_t) { return 2033475965; });
+  auto c2 = makeFlatVector<int64_t>(
+      100,
+      [](vector_size_t) { return 2851588633; },
+      [](auto row) { return row >= 50; });
+  auto result = evaluateSimplified<FlatVector<StringView>>(
+      "substr(replace('bar', rtrim(c0)), c1, c2)", makeRowVector({c0, c1, c2}));
+  ASSERT_EQ(result->size(), 100);
+  for (int i = 0; i < 50; ++i) {
+    EXPECT_FALSE(result->isNullAt(i));
+    EXPECT_EQ(result->valueAt(i), "");
+  }
+  for (int i = 50; i < 100; ++i) {
+    EXPECT_TRUE(result->isNullAt(i));
   }
 }
 
@@ -1282,11 +1309,11 @@ TEST_F(StringFunctionsTest, reverse) {
   EXPECT_EQ("koobecaF", reverse("Facebook"));
   EXPECT_EQ("ΨΧΦΥΤΣΣΡΠΟΞΝΜΛΚΙΘΗΖΕΔΓΒΑ", reverse("ΑΒΓΔΕΖΗΘΙΚΛΜΝΞΟΠΡΣΣΤΥΦΧΨ"));
   EXPECT_EQ(
-      u8" \u2028 \u671B\u5E0C \u7231 \u5FF5\u4FE1",
-      reverse(u8"\u4FE1\u5FF5 \u7231 \u5E0C\u671B \u2028 "));
+      " \u2028 \u671B\u5E0C \u7231 \u5FF5\u4FE1",
+      reverse("\u4FE1\u5FF5 \u7231 \u5E0C\u671B \u2028 "));
   EXPECT_EQ(
-      u8"\u671B\u5E0C\u2014\u7231\u2014\u5FF5\u4FE1",
-      reverse(u8"\u4FE1\u5FF5\u2014\u7231\u2014\u5E0C\u671B"));
+      "\u671B\u5E0C\u2014\u7231\u2014\u5FF5\u4FE1",
+      reverse("\u4FE1\u5FF5\u2014\u7231\u2014\u5E0C\u671B"));
   EXPECT_EQ(expectedInvalidStr, reverse(invalidStr));
 }
 
@@ -1443,9 +1470,6 @@ TEST_F(StringFunctionsTest, vectorAccessCheck) {
       std::vector<std::optional<StringView>>{
           S("hello"), std::nullopt, S("world")},
       VARCHAR());
-
-  exec::EvalCtx evalCtx(
-      &execCtx_, nullptr, makeRowVector(ROW({}, {}), 0).get());
 
   auto vectorWithNulls = flatVectorWithNulls->as<SimpleVector<StringView>>();
   SelectivityVector rows(vectorWithNulls->size());
@@ -1667,20 +1691,20 @@ TEST_F(StringFunctionsTest, trim) {
   EXPECT_EQ("a", trim("  a  "));
 
   EXPECT_EQ(
-      u8"\u4FE1\u5FF5 \u7231 \u5E0C\u671B",
-      trim(u8"\u4FE1\u5FF5 \u7231 \u5E0C\u671B \u2028 "));
+      "\u4FE1\u5FF5 \u7231 \u5E0C\u671B",
+      trim("\u4FE1\u5FF5 \u7231 \u5E0C\u671B \u2028 "));
   EXPECT_EQ(
-      u8"\u4FE1\u5FF5 \u7231 \u5E0C\u671B",
-      trim(u8"\u4FE1\u5FF5 \u7231 \u5E0C\u671B  "));
+      "\u4FE1\u5FF5 \u7231 \u5E0C\u671B",
+      trim("\u4FE1\u5FF5 \u7231 \u5E0C\u671B  "));
   EXPECT_EQ(
-      u8"\u4FE1\u5FF5 \u7231 \u5E0C\u671B",
-      trim(u8" \u4FE1\u5FF5 \u7231 \u5E0C\u671B "));
+      "\u4FE1\u5FF5 \u7231 \u5E0C\u671B",
+      trim(" \u4FE1\u5FF5 \u7231 \u5E0C\u671B "));
   EXPECT_EQ(
-      u8"\u4FE1\u5FF5 \u7231 \u5E0C\u671B",
-      trim(u8"  \u4FE1\u5FF5 \u7231 \u5E0C\u671B"));
+      "\u4FE1\u5FF5 \u7231 \u5E0C\u671B",
+      trim("  \u4FE1\u5FF5 \u7231 \u5E0C\u671B"));
   EXPECT_EQ(
-      u8"\u4FE1\u5FF5 \u7231 \u5E0C\u671B",
-      trim(u8" \u2028 \u4FE1\u5FF5 \u7231 \u5E0C\u671B"));
+      "\u4FE1\u5FF5 \u7231 \u5E0C\u671B",
+      trim(" \u2028 \u4FE1\u5FF5 \u7231 \u5E0C\u671B"));
 
   EXPECT_EQ(expectedComplexStr, trim(complexStr));
   EXPECT_EQ(
@@ -1707,20 +1731,20 @@ TEST_F(StringFunctionsTest, ltrim) {
   EXPECT_EQ("move fast", ltrim("\r\t move fast"));
   EXPECT_EQ("hello", ltrim("\n\t\r hello"));
 
-  EXPECT_EQ(u8"\u4F60\u597D", ltrim(u8" \u4F60\u597D"));
-  EXPECT_EQ(u8"\u4F60\u597D ", ltrim(u8" \u4F60\u597D "));
+  EXPECT_EQ("\u4F60\u597D", ltrim(" \u4F60\u597D"));
+  EXPECT_EQ("\u4F60\u597D ", ltrim(" \u4F60\u597D "));
   EXPECT_EQ(
-      u8"\u4FE1\u5FF5 \u7231 \u5E0C\u671B  ",
-      ltrim(u8"\u4FE1\u5FF5 \u7231 \u5E0C\u671B  "));
+      "\u4FE1\u5FF5 \u7231 \u5E0C\u671B  ",
+      ltrim("\u4FE1\u5FF5 \u7231 \u5E0C\u671B  "));
   EXPECT_EQ(
-      u8"\u4FE1\u5FF5 \u7231 \u5E0C\u671B ",
-      ltrim(u8" \u4FE1\u5FF5 \u7231 \u5E0C\u671B "));
+      "\u4FE1\u5FF5 \u7231 \u5E0C\u671B ",
+      ltrim(" \u4FE1\u5FF5 \u7231 \u5E0C\u671B "));
   EXPECT_EQ(
-      u8"\u4FE1\u5FF5 \u7231 \u5E0C\u671B",
-      ltrim(u8"  \u4FE1\u5FF5 \u7231 \u5E0C\u671B"));
+      "\u4FE1\u5FF5 \u7231 \u5E0C\u671B",
+      ltrim("  \u4FE1\u5FF5 \u7231 \u5E0C\u671B"));
   EXPECT_EQ(
-      u8"\u4FE1\u5FF5 \u7231 \u5E0C\u671B",
-      ltrim(u8" \u2028 \u4FE1\u5FF5 \u7231 \u5E0C\u671B"));
+      "\u4FE1\u5FF5 \u7231 \u5E0C\u671B",
+      ltrim(" \u2028 \u4FE1\u5FF5 \u7231 \u5E0C\u671B"));
 
   EXPECT_EQ(expectedComplexStr, ltrim(complexStr));
   EXPECT_EQ("Ψ\xFF\xFFΣΓΔA", ltrim("  \u2028 \r \t \n   Ψ\xFF\xFFΣΓΔA"));
@@ -1746,20 +1770,20 @@ TEST_F(StringFunctionsTest, rtrim) {
   EXPECT_EQ("move fast", rtrim("move fast\r\t "));
   EXPECT_EQ("hello", rtrim("hello\n\t\r "));
 
-  EXPECT_EQ(u8" \u4F60\u597D", rtrim(u8" \u4F60\u597D"));
-  EXPECT_EQ(u8" \u4F60\u597D", rtrim(u8" \u4F60\u597D "));
+  EXPECT_EQ(" \u4F60\u597D", rtrim(" \u4F60\u597D"));
+  EXPECT_EQ(" \u4F60\u597D", rtrim(" \u4F60\u597D "));
   EXPECT_EQ(
-      u8"\u4FE1\u5FF5 \u7231 \u5E0C\u671B",
-      rtrim(u8"\u4FE1\u5FF5 \u7231 \u5E0C\u671B  "));
+      "\u4FE1\u5FF5 \u7231 \u5E0C\u671B",
+      rtrim("\u4FE1\u5FF5 \u7231 \u5E0C\u671B  "));
   EXPECT_EQ(
-      u8" \u4FE1\u5FF5 \u7231 \u5E0C\u671B",
-      rtrim(u8" \u4FE1\u5FF5 \u7231 \u5E0C\u671B "));
+      " \u4FE1\u5FF5 \u7231 \u5E0C\u671B",
+      rtrim(" \u4FE1\u5FF5 \u7231 \u5E0C\u671B "));
   EXPECT_EQ(
-      u8"\u4FE1\u5FF5 \u7231 \u5E0C\u671B",
-      rtrim(u8"\u4FE1\u5FF5 \u7231 \u5E0C\u671B  "));
+      "\u4FE1\u5FF5 \u7231 \u5E0C\u671B",
+      rtrim("\u4FE1\u5FF5 \u7231 \u5E0C\u671B  "));
   EXPECT_EQ(
-      u8"\u4FE1\u5FF5 \u7231 \u5E0C\u671B",
-      rtrim(u8"\u4FE1\u5FF5 \u7231 \u5E0C\u671B \u2028 "));
+      "\u4FE1\u5FF5 \u7231 \u5E0C\u671B",
+      rtrim("\u4FE1\u5FF5 \u7231 \u5E0C\u671B \u2028 "));
 
   EXPECT_EQ(expectedComplexStr, rtrim(complexStr));
   EXPECT_EQ("     Ψ\xFF\xFFΣΓΔA", rtrim("     Ψ\xFF\xFFΣΓΔA \u2028 \r \t \n"));

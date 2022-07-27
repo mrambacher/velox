@@ -20,7 +20,9 @@ add_executable(
   HashTest.cpp
   InTest.cpp
   LeastGreatestTest.cpp
+  MapTest.cpp
   RegexFunctionsTest.cpp
+  SizeTest.cpp
   SortArrayTest.cpp
   SplitFunctionsTest.cpp
   StringTest.cpp
@@ -34,5 +36,7 @@ target_link_libraries(
   velox_functions_test_lib
   velox_exec_test_util
   ${FMT}
-  ${GTEST_BOTH_LIBRARIES}
+  gtest
+  gtest_main
+  gmock
   ${gflags_LIBRARIES})

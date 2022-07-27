@@ -16,7 +16,8 @@
 BUILD_BASE_DIR=_build
 BUILD_DIR=release
 BUILD_TYPE=Release
-BENCHMARKS_DIR=$(BUILD_BASE_DIR)/$(BUILD_DIR)/velox/benchmarks
+BENCHMARKS_BASIC_DIR=$(BUILD_BASE_DIR)/$(BUILD_DIR)/velox/benchmarks/basic/
+BENCHMARKS_DUMP_DIR=dumps
 TREAT_WARNINGS_AS_ERRORS ?= 1
 ENABLE_WALL ?= 1
 
@@ -60,6 +61,7 @@ endif
 endif
 
 NUM_THREADS ?= $(shell getconf _NPROCESSORS_CONF 2>/dev/null || echo 1)
+CPU_TARGET ?= "avx"
 
 all: release			#: Build the release version
 
@@ -91,13 +93,16 @@ min_debug:				#: Minimal build with debugging symbols
 	$(MAKE) cmake BUILD_DIR=debug BUILD_TYPE=debug EXTRA_CMAKE_FLAGS=-DVELOX_BUILD_MINIMAL=ON
 	$(MAKE) build BUILD_DIR=debug
 
-benchmarks-build:
-	$(MAKE) release EXTRA_CMAKE_FLAGS="-DVELOX_BUILD_BENCHMARKS=ON"
+benchmarks-basic-build:
+	$(MAKE) release EXTRA_CMAKE_FLAGS="-DVELOX_BUILD_MINIMAL=ON -DVELOX_ENABLE_BENCHMARKS_BASIC=ON"
 
-benchmarks-dump:
-	$(MAKE) benchmarks-build
-	mkdir -p $(BENCHMARKS_DIR)/dumps
-	find $(BENCHMARKS_DIR) -type f -executable -exec {} --bm_min_usec 100000 \;
+benchmarks-basic-run:
+	$(MAKE) benchmarks-basic-build
+	scripts/benchmark-runner.py run \
+		--path $(BENCHMARKS_BASIC_DIR) ${EXTRA_BENCHMARK_FLAGS}
+
+benchmarks-basic-dump:
+	$(MAKE) benchmarks-basic-run EXTRA_BENCHMARK_FLAGS="--dump-path ${BENCHMARKS_DUMP_DIR}"
 
 unittest: debug			#: Build with debugging and run unit tests
 	cd $(BUILD_BASE_DIR)/debug && ctest -j ${NUM_THREADS} -VV --output-on-failure
@@ -124,12 +129,15 @@ circleci-container:			#: Build the linux container for CircleCi
 check-container:
 	$(MAKE) linux-container CONTAINER_NAME=check
 
+velox-torcharrow-container:
+	$(MAKE) linux-container CONTAINER_NAME=velox-torcharrow
+
 linux-container:
 	rm -rf /tmp/docker && \
 	mkdir -p /tmp/docker && \
-	cp scripts/setup-$(CONTAINER_NAME).sh scripts/$(CONTAINER_NAME)-container.dockfile /tmp/docker && \
+	cp scripts/setup-helper-functions.sh scripts/setup-$(CONTAINER_NAME).sh scripts/$(CONTAINER_NAME)-container.dockfile /tmp/docker && \
 	cd /tmp/docker && \
-	docker build --tag "prestocpp/velox-$(CONTAINER_NAME):${USER}-$(shell date +%Y%m%d)" -f $(CONTAINER_NAME)-container.dockfile .
+	docker build --build-arg cpu_target=$(CPU_TARGET) --tag "prestocpp/velox-$(CPU_TARGET)-$(CONTAINER_NAME):${USER}-$(shell date +%Y%m%d)" -f $(CONTAINER_NAME)-container.dockfile .
 
 help:					#: Show the help messages
 	@cat $(firstword $(MAKEFILE_LIST)) | \

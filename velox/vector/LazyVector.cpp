@@ -16,6 +16,7 @@
 
 #include "velox/vector/LazyVector.h"
 #include <folly/ThreadLocal.h>
+#include "velox/common/base/RawVector.h"
 #include "velox/common/time/Timer.h"
 #include "velox/vector/DecodedVector.h"
 
@@ -33,7 +34,9 @@ static void writeIOWallTimeStat(size_t ioTimeStartMicros) {
   if (BaseRuntimeStatWriter* pWriter = sRunTimeStatWriters.get()) {
     pWriter->addRuntimeStat(
         "dataSourceLazyWallNanos",
-        (getCurrentTimeMicro() - ioTimeStartMicros) * 1'000);
+        RuntimeCounter(
+            (getCurrentTimeMicro() - ioTimeStartMicros) * 1'000,
+            RuntimeCounter::Unit::kNanos));
   }
 }
 
@@ -41,6 +44,15 @@ void VectorLoader::load(RowSet rows, ValueHook* hook, VectorPtr* result) {
   const auto ioTimeStartMicros = getCurrentTimeMicro();
   loadInternal(rows, hook, result);
   writeIOWallTimeStat(ioTimeStartMicros);
+
+  if (hook) {
+    // Record number of rows loaded directly into ValueHook bypassing
+    // materialization into vector. This counter can be used to understand
+    // whether aggregation pushdown is happening or not.
+    if (auto* pWriter = sRunTimeStatWriters.get()) {
+      pWriter->addRuntimeStat("loadedToValueHook", RuntimeCounter(rows.size()));
+    }
+  }
 }
 
 void VectorLoader::load(
@@ -71,6 +83,101 @@ void VectorLoader::loadInternal(
   int index = 0;
   rows.applyToSelected([&](vector_size_t row) { positions[index++] = row; });
   load(positions, hook, result);
+}
+
+//   static
+void LazyVector::ensureLoadedRows(
+    VectorPtr& vector,
+    const SelectivityVector& rows) {
+  if (isLazyNotLoaded(*vector)) {
+    DecodedVector decoded;
+    SelectivityVector baseRows;
+    ensureLoadedRows(vector, rows, decoded, baseRows);
+  } else {
+    // Even if LazyVectors have been loaded, via some other path, this
+    // is needed for initializing wrappers.
+    vector->loadedVector();
+  }
+}
+
+// static
+void LazyVector::ensureLoadedRows(
+    VectorPtr& vector,
+    const SelectivityVector& rows,
+    DecodedVector& decoded,
+    SelectivityVector& baseRows) {
+  decoded.decode(*vector, rows, false);
+  if (decoded.base()->encoding() != VectorEncoding::Simple::LAZY) {
+    return;
+  }
+  auto lazyVector = decoded.base()->asUnchecked<LazyVector>();
+  if (lazyVector->isLoaded()) {
+    vector->loadedVector();
+    return;
+  }
+  raw_vector<vector_size_t> rowNumbers;
+  RowSet rowSet;
+  if (decoded.isConstantMapping()) {
+    rowNumbers.push_back(decoded.index(rows.begin()));
+    rowSet = RowSet(rowNumbers);
+  } else if (decoded.isIdentityMapping()) {
+    if (rows.isAllSelected()) {
+      auto iota = velox::iota(rows.end(), rowNumbers);
+      rowSet = RowSet(iota, rows.end());
+    } else {
+      rowNumbers.resize(rows.end());
+      rowNumbers.resize(simd::indicesOfSetBits(
+          rows.asRange().bits(), 0, rows.end(), rowNumbers.data()));
+      rowSet = RowSet(rowNumbers);
+    }
+  } else {
+    baseRows.resize(0);
+    baseRows.resize(lazyVector->size(), false);
+    rows.applyToSelected([&](auto row) {
+      if (!decoded.isNullAt(row)) {
+        baseRows.setValid(decoded.index(row), true);
+      }
+    });
+    baseRows.updateBounds();
+
+    rowNumbers.resize(baseRows.end());
+    rowNumbers.resize(simd::indicesOfSetBits(
+        baseRows.asRange().bits(), 0, baseRows.end(), rowNumbers.data()));
+
+    rowSet = RowSet(rowNumbers);
+
+    lazyVector->load(rowSet, nullptr);
+
+    // The loaded base vector may have fewer rows than the original. Make sure
+    // there are no indices referring to rows past the end of the base vector.
+
+    BufferPtr indices = allocateIndices(vector->size(), vector->pool());
+    auto rawIndices = indices->asMutable<vector_size_t>();
+    auto decodedIndices = decoded.indices();
+    rows.applyToSelected(
+        [&](auto row) { rawIndices[row] = decodedIndices[row]; });
+
+    BufferPtr nulls = nullptr;
+    if (decoded.nulls()) {
+      nulls = AlignedBuffer::allocate<bool>(vector->size(), vector->pool());
+      std::memcpy(
+          nulls->asMutable<uint64_t>(),
+          decoded.nulls(),
+          bits::nbytes(vector->size()));
+    }
+
+    vector = BaseVector::wrapInDictionary(
+        std::move(nulls),
+        std::move(indices),
+        vector->size(),
+        lazyVector->loadedVectorShared());
+    return;
+  }
+  lazyVector->load(rowSet, nullptr);
+  // An explicit call to loadedVector() is necessary to allow for proper
+  // initialization of dictionaries, sequences, etc. on top of lazy vector
+  // after it has been loaded, even if loaded via some other path.
+  vector->loadedVector();
 }
 
 } // namespace facebook::velox

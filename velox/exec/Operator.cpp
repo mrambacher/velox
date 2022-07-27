@@ -19,11 +19,67 @@
 #include "velox/exec/Task.h"
 
 #include "velox/common/process/ProcessBase.h"
+#include "velox/expression/Expr.h"
 
 namespace facebook::velox::exec {
+namespace {
+// Basic implementation of the connector::ExpressionEvaluator interface.
+class SimpleExpressionEvaluator : public connector::ExpressionEvaluator {
+ public:
+  explicit SimpleExpressionEvaluator(core::ExecCtx* execCtx)
+      : execCtx_(execCtx) {}
+
+  std::unique_ptr<exec::ExprSet> compile(
+      const std::shared_ptr<const core::ITypedExpr>& expression)
+      const override {
+    auto expressions = {expression};
+    return std::make_unique<exec::ExprSet>(std::move(expressions), execCtx_);
+  }
+
+  void evaluate(
+      exec::ExprSet* exprSet,
+      const SelectivityVector& rows,
+      RowVectorPtr& input,
+      VectorPtr* result) const override {
+    exec::EvalCtx context(execCtx_, exprSet, input.get());
+
+    std::vector<VectorPtr> results = {*result};
+    exprSet->eval(0, 1, true, rows, &context, &results);
+
+    *result = results[0];
+  }
+
+ private:
+  core::ExecCtx* execCtx_;
+};
+} // namespace
 
 OperatorCtx::OperatorCtx(DriverCtx* driverCtx)
     : driverCtx_(driverCtx), pool_(driverCtx_->addOperatorPool()) {}
+
+core::ExecCtx* OperatorCtx::execCtx() const {
+  if (!execCtx_) {
+    execCtx_ = std::make_unique<core::ExecCtx>(
+        pool_, driverCtx_->task->queryCtx().get());
+  }
+  return execCtx_.get();
+}
+
+std::shared_ptr<connector::ConnectorQueryCtx>
+OperatorCtx::createConnectorQueryCtx(
+    const std::string& connectorId,
+    const std::string& planNodeId) const {
+  if (!expressionEvaluator_) {
+    expressionEvaluator_ =
+        std::make_unique<SimpleExpressionEvaluator>(execCtx());
+  }
+  return std::make_unique<connector::ConnectorQueryCtx>(
+      pool_,
+      driverCtx_->task->queryCtx()->getConnectorConfig(connectorId),
+      expressionEvaluator_.get(),
+      driverCtx_->task->queryCtx()->mappedMemory(),
+      fmt::format("{}.{}", driverCtx_->task->taskId(), planNodeId));
+}
 
 std::vector<std::unique_ptr<Operator::PlanNodeTranslator>>&
 Operator::translators() {
@@ -35,11 +91,35 @@ Operator::translators() {
 std::unique_ptr<Operator> Operator::fromPlanNode(
     DriverCtx* ctx,
     int32_t id,
-    const std::shared_ptr<const core::PlanNode>& planNode) {
+    const core::PlanNodePtr& planNode) {
   for (auto& translator : translators()) {
-    auto op = translator->translate(ctx, id, planNode);
+    auto op = translator->toOperator(ctx, id, planNode);
     if (op) {
       return op;
+    }
+  }
+  return nullptr;
+}
+
+// static
+std::unique_ptr<JoinBridge> Operator::joinBridgeFromPlanNode(
+    const core::PlanNodePtr& planNode) {
+  for (auto& translator : translators()) {
+    auto joinBridge = translator->toJoinBridge(planNode);
+    if (joinBridge) {
+      return joinBridge;
+    }
+  }
+  return nullptr;
+}
+
+// static
+OperatorSupplier Operator::operatorSupplierFromPlanNode(
+    const core::PlanNodePtr& planNode) {
+  for (auto& translator : translators()) {
+    auto supplier = translator->toOperatorSupplier(planNode);
+    if (supplier) {
+      return supplier;
     }
   }
   return nullptr;
@@ -52,7 +132,7 @@ void Operator::registerOperator(
 }
 
 std::optional<uint32_t> Operator::maxDrivers(
-    const std::shared_ptr<const core::PlanNode>& planNode) {
+    const core::PlanNodePtr& planNode) {
   for (auto& translator : translators()) {
     auto current = translator->maxDrivers(planNode);
     if (current) {
@@ -72,38 +152,6 @@ memory::MappedMemory* OperatorCtx::mappedMemory() const {
 
 const std::string& OperatorCtx::taskId() const {
   return driverCtx_->task->taskId();
-}
-
-VectorPtr Operator::getResultVector(ChannelIndex index) {
-  // If there is a singly referenced results vector and it has a
-  // singly referenced flat child with singly referenced buffers, the
-  // child can be reused.
-  if (!output_ || !output_.unique()) {
-    return nullptr;
-  }
-
-  VectorPtr& vector = output_->childAt(index);
-  if (!vector) {
-    return nullptr;
-  }
-
-  if (BaseVector::isReusableFlatVector(vector)) {
-    vector->clear();
-    return std::move(vector);
-  }
-
-  return nullptr;
-}
-
-void Operator::getResultVectors(std::vector<VectorPtr>* result) {
-  if (resultProjections_.empty()) {
-    return;
-  }
-  result->resize(resultProjections_.back().inputChannel + 1);
-  for (auto& projection : resultProjections_) {
-    (*result)[projection.inputChannel] =
-        getResultVector(projection.outputChannel);
-  }
 }
 
 static bool isSequence(
@@ -128,19 +176,7 @@ RowVectorPtr Operator::fillOutput(vector_size_t size, BufferPtr mapping) {
     wrapResults = false;
   }
 
-  if (output_.unique()) {
-    output_->resize(size);
-  } else {
-    std::vector<VectorPtr> localColumns(outputType_->size());
-    output_ = std::make_shared<RowVector>(
-        operatorCtx_->pool(),
-        outputType_,
-        BufferPtr(nullptr),
-        size,
-        std::move(localColumns),
-        0 /*nullCount*/);
-  }
-  auto& columns = output_->children();
+  std::vector<VectorPtr> columns(outputType_->size());
   if (!identityProjections_.empty()) {
     auto input = input_->children();
     for (auto& projection : identityProjections_) {
@@ -151,31 +187,16 @@ RowVectorPtr Operator::fillOutput(vector_size_t size, BufferPtr mapping) {
   }
   for (auto& projection : resultProjections_) {
     columns[projection.outputChannel] = wrapResults
-        ? wrapChild(size, mapping, std::move(results_[projection.inputChannel]))
-        : std::move(results_[projection.inputChannel]);
+        ? wrapChild(size, mapping, results_[projection.inputChannel])
+        : results_[projection.inputChannel];
   }
-  return output_;
-}
 
-void Operator::inputProcessed() {
-  input_ = nullptr;
-  if (!output_.unique()) {
-    output_ = nullptr;
-    return;
-  }
-  auto& columns = output_->children();
-  for (auto& projection : identityProjections_) {
-    columns[projection.outputChannel] = nullptr;
-  }
-}
-
-void Operator::clearIdentityProjectedOutput() {
-  if (!output_ || !output_.unique()) {
-    return;
-  }
-  for (auto& projection : identityProjections_) {
-    output_->childAt(projection.outputChannel) = nullptr;
-  }
+  return std::make_shared<RowVector>(
+      operatorCtx_->pool(),
+      outputType_,
+      BufferPtr(nullptr),
+      size,
+      std::move(columns));
 }
 
 void Operator::recordBlockingTime(uint64_t start) {
@@ -186,7 +207,7 @@ void Operator::recordBlockingTime(uint64_t start) {
   stats_.blockedWallNanos += (now - start) * 1000;
 }
 
-std::string Operator::toString() {
+std::string Operator::toString() const {
   std::stringstream out;
   if (auto task = operatorCtx_->task()) {
     auto driverCtx = operatorCtx_->driverCtx();
@@ -201,18 +222,17 @@ std::string Operator::toString() {
 
 std::vector<ChannelIndex> toChannels(
     const RowTypePtr& rowType,
-    const std::vector<std::shared_ptr<const core::FieldAccessTypedExpr>>&
-        fields) {
+    const std::vector<std::shared_ptr<const core::ITypedExpr>>& exprs) {
   std::vector<ChannelIndex> channels;
-  channels.reserve(fields.size());
-  for (const auto& field : fields) {
-    auto channel = exprToChannel(field.get(), rowType);
+  channels.reserve(exprs.size());
+  for (const auto& expr : exprs) {
+    auto channel = exprToChannel(expr.get(), rowType);
     channels.push_back(channel);
   }
   return channels;
 }
 
-ChannelIndex exprToChannel(const core::ITypedExpr* expr, TypePtr type) {
+ChannelIndex exprToChannel(const core::ITypedExpr* expr, const TypePtr& type) {
   if (auto field = dynamic_cast<const core::FieldAccessTypedExpr*>(expr)) {
     return type->as<TypeKind::ROW>().getChildIdx(field->name());
   }
@@ -224,19 +244,23 @@ ChannelIndex exprToChannel(const core::ITypedExpr* expr, TypePtr type) {
 }
 
 std::vector<ChannelIndex> calculateOutputChannels(
-    const RowTypePtr& inputType,
-    const RowTypePtr& outputType) {
-  // Note that outputType may have more columns than inputType as some columns
-  // can be duplicated.
-
-  bool identicalProjection = inputType->size() == outputType->size();
-  const auto& outputNames = outputType->names();
+    const RowTypePtr& sourceOutputType,
+    const RowTypePtr& targetInputType,
+    const RowTypePtr& targetOutputType) {
+  // Note that targetInputType may have more columns than sourceOutputType as
+  // some columns can be duplicated.
+  bool identicalProjection =
+      sourceOutputType->size() == targetInputType->size();
+  const auto& outputNames = targetInputType->names();
 
   std::vector<ChannelIndex> outputChannels;
   outputChannels.resize(outputNames.size());
   for (auto i = 0; i < outputNames.size(); i++) {
-    outputChannels[i] = inputType->getChildIdx(outputNames[i]);
+    outputChannels[i] = sourceOutputType->getChildIdx(outputNames[i]);
     if (outputChannels[i] != i) {
+      identicalProjection = false;
+    }
+    if (outputNames[i] != targetOutputType->nameOf(i)) {
       identicalProjection = false;
     }
   }
@@ -254,10 +278,12 @@ void OperatorStats::add(const OperatorStats& other) {
   addInputTiming.add(other.addInputTiming);
   inputBytes += other.inputBytes;
   inputPositions += other.inputPositions;
+  inputVectors += other.inputVectors;
 
   getOutputTiming.add(other.getOutputTiming);
   outputBytes += other.outputBytes;
   outputPositions += other.outputPositions;
+  outputVectors += other.outputVectors;
 
   physicalWrittenBytes += other.physicalWrittenBytes;
 
@@ -267,9 +293,17 @@ void OperatorStats::add(const OperatorStats& other) {
 
   memoryStats.add(other.memoryStats);
 
-  for (const auto& stat : other.runtimeStats) {
-    runtimeStats[stat.first].merge(stat.second);
+  for (const auto& [name, stats] : other.runtimeStats) {
+    if (UNLIKELY(runtimeStats.count(name) == 0)) {
+      runtimeStats.insert(std::make_pair(name, stats));
+    } else {
+      runtimeStats.at(name).merge(stats);
+    }
   }
+
+  numDrivers += other.numDrivers;
+  spilledBytes += other.spilledBytes;
+  spilledRows += other.spilledRows;
 }
 
 void OperatorStats::clear() {

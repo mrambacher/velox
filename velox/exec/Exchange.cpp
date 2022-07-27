@@ -18,32 +18,16 @@
 
 namespace facebook::velox::exec {
 
-SerializedPage::SerializedPage(
-    std::istream* stream,
-    uint64_t size,
-    memory::MappedMemory* memory)
-    : allocation_(memory) {
-  if (!memory->allocate(
-          bits::roundUp(size, memory::MappedMemory::kPageSize) /
-              memory::MappedMemory::kPageSize,
-          kSerializedPageOwner,
-          allocation_)) {
-    VELOX_FAIL("Could not allocate memory for exchange input");
+SerializedPage::SerializedPage(std::unique_ptr<folly::IOBuf> iobuf)
+    : iobuf_(std::move(iobuf)), iobufBytes_(chainBytes(*iobuf_.get())) {
+  VELOX_CHECK(iobuf_);
+  for (auto& buf : *iobuf_) {
+    int32_t bufSize = buf.size();
+    ranges_.push_back(ByteRange{
+        const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(buf.data())),
+        bufSize,
+        0});
   }
-  auto toRead = size;
-  for (int i = 0; i < allocation_.numRuns(); ++i) {
-    auto run = allocation_.runAt(i);
-    auto runSize = run.numPages() * memory::MappedMemory::kPageSize;
-    auto bytes = std::min<int32_t>(runSize, toRead);
-    ranges_.push_back(ByteRange{run.data(), bytes, 0});
-    stream->read(reinterpret_cast<char*>(run.data()), bytes);
-    toRead -= bytes;
-    if (!toRead) {
-      break;
-    }
-  }
-
-  VELOX_CHECK_EQ(toRead, 0);
 }
 
 void SerializedPage::prepareStreamForDeserialize(ByteStream* input) {
@@ -79,7 +63,7 @@ class LocalExchangeSource : public ExchangeSource {
       : ExchangeSource(taskId, destination, queue) {}
 
   bool shouldRequestLocked() override {
-    if (atEnd_ && queue_->empty()) {
+    if (atEnd_) {
       return false;
     }
     bool pending = requestPending_;
@@ -101,8 +85,7 @@ class LocalExchangeSource : public ExchangeSource {
         // Since this lambda may outlive 'this', we need to capture a
         // shared_ptr to the current object (self).
         [self, requestedSequence, buffers, this](
-            std::vector<std::shared_ptr<VectorStreamGroup>>& data,
-            int64_t sequence) {
+            std::vector<std::unique_ptr<folly::IOBuf>> data, int64_t sequence) {
           if (requestedSequence > sequence) {
             VLOG(2) << "Receives earlier sequence than requested: task "
                     << taskId_ << ", destination " << destination_
@@ -115,14 +98,16 @@ class LocalExchangeSource : public ExchangeSource {
           }
           std::vector<std::unique_ptr<SerializedPage>> pages;
           bool atEnd = false;
-          for (auto& group : data) {
-            if (!group) {
+          for (auto& inputPage : data) {
+            if (!inputPage) {
               atEnd = true;
               // Keep looping, there could be extra end markers.
               continue;
             }
-            pages.push_back(SerializedPage::fromVectorStreamGroup(group.get()));
-            group = nullptr;
+            inputPage->unshare();
+            pages.push_back(
+                std::make_unique<SerializedPage>(std::move(inputPage)));
+            inputPage = nullptr;
           }
           int64_t ackSequence;
           {
@@ -195,14 +180,19 @@ std::unique_ptr<SerializedPage> ExchangeClient::next(
     bool* atEnd,
     ContinueFuture* future) {
   std::vector<std::shared_ptr<ExchangeSource>> toRequest;
+  std::unique_ptr<SerializedPage> page;
   {
     std::lock_guard<std::mutex> l(queue_->mutex());
     *atEnd = false;
-    auto page = queue_->dequeue(atEnd, future);
-    if (*atEnd || page) {
+    page = queue_->dequeue(atEnd, future);
+    if (*atEnd) {
       return page;
     }
-    // There is no data to return, send out more requests.
+    if (page && queue_->totalBytes() > queue_->minBytes()) {
+      return page;
+    }
+    // There is space for more data, send requests to sources with no pending
+    // request.
     for (auto& source : sources_) {
       if (source->shouldRequestLocked()) {
         toRequest.push_back(source);
@@ -214,7 +204,7 @@ std::unique_ptr<SerializedPage> ExchangeClient::next(
   for (auto& source : toRequest) {
     source->request();
   }
-  return nullptr;
+  return page;
 }
 
 ExchangeClient::~ExchangeClient() {
@@ -250,12 +240,12 @@ bool Exchange::getSplits(ContinueFuture* future) {
             split.connectorSplit);
         VELOX_CHECK(remoteSplit, "Wrong type of split");
         exchangeClient_->addRemoteTaskId(remoteSplit->taskId);
-        ++numSplits_;
+        ++stats_.numSplits;
       } else {
         exchangeClient_->noMoreRemoteTasks();
         noMoreSplits_ = true;
         if (atEnd_) {
-          operatorCtx_->task()->multipleSplitsFinished(numSplits_);
+          operatorCtx_->task()->multipleSplitsFinished(stats_.numSplits);
         }
         return false;
       }
@@ -281,7 +271,7 @@ BlockingReason Exchange::isBlocked(ContinueFuture* future) {
   currentPage_ = exchangeClient_->next(&atEnd_, &dataFuture);
   if (currentPage_ || atEnd_) {
     if (atEnd_ && noMoreSplits_) {
-      operatorCtx_->task()->multipleSplitsFinished(numSplits_);
+      operatorCtx_->task()->multipleSplitsFinished(stats_.numSplits);
     }
     return BlockingReason::kNotBlocked;
   }
@@ -300,8 +290,8 @@ BlockingReason Exchange::isBlocked(ContinueFuture* future) {
     // Block until data becomes available.
     *future = std::move(dataFuture);
   }
-  return numSplits_ == 0 ? BlockingReason::kWaitForSplit
-                         : BlockingReason::kWaitForExchange;
+  return stats_.numSplits == 0 ? BlockingReason::kWaitForSplit
+                               : BlockingReason::kWaitForExchange;
 }
 
 bool Exchange::isFinished() {
@@ -315,7 +305,7 @@ RowVectorPtr Exchange::getOutput() {
 
   if (!inputStream_) {
     inputStream_ = std::make_unique<ByteStream>();
-    stats_.rawInputBytes += currentPage_->byteSize();
+    stats_.rawInputBytes += currentPage_->size();
     currentPage_->prepareStreamForDeserialize(inputStream_.get());
   }
 

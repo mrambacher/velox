@@ -92,7 +92,6 @@ class BiasVector : public SimpleVector<T> {
   //    bias");
 
  public:
-  static const std::string BIAS_VALUE;
   static constexpr bool can_simd =
       (std::is_same<T, int64_t>::value || std::is_same<T, int32_t>::value ||
        std::is_same<T, int16_t>::value);
@@ -103,8 +102,8 @@ class BiasVector : public SimpleVector<T> {
       size_t length,
       TypeKind valueType,
       BufferPtr values,
-      const folly::F14FastMap<std::string, std::string>& metaData =
-          cdvi::EMPTY_METADATA,
+      T bias,
+      const SimpleVectorStats<T>& stats = {},
       std::optional<int32_t> distinctCount = std::nullopt,
       std::optional<vector_size_t> nullCount = std::nullopt,
       std::optional<bool> sorted = std::nullopt,
@@ -112,10 +111,6 @@ class BiasVector : public SimpleVector<T> {
       std::optional<ByteCount> storageByteCount = std::nullopt);
 
   ~BiasVector() override {}
-
-  inline VectorEncoding::Simple encoding() const override {
-    return VectorEncoding::Simple::BIASED;
-  }
 
   const T valueAtFast(vector_size_t idx) const;
 
@@ -125,13 +120,13 @@ class BiasVector : public SimpleVector<T> {
   }
 
   /**
-   * Loads a 256bit vector of data at the virtual byteOffset given
+   * Loads a SIMD vector of data at the virtual byteOffset given
    * Note this method is implemented on each vector type, but is intentionally
    * not virtual for performance reasons
    *
    * @param byteOffset - the byte offset to laod from
    */
-  __m256i loadSIMDValueBufferAt(size_t index) const;
+  xsimd::batch<T> loadSIMDValueBufferAt(size_t index) const;
 
   std::unique_ptr<SimpleVector<uint64_t>> hashAll() const override;
 
@@ -160,104 +155,29 @@ class BiasVector : public SimpleVector<T> {
     return true;
   }
 
-  bool mayAddNulls() const override {
+  bool isNullsWritable() const override {
     return true;
   }
 
  private:
-  template <int32_t StorageSizeInBytes>
-  inline const __m256i loadSIMDInternal(size_t byteOffset) const {
-    // Note Intel simd instructions below load values in reverse index order
-    auto startIndex = byteOffset / sizeof(T);
-    if constexpr (std::is_same<T, int64_t>::value) {
-      DCHECK(
-          StorageSizeInBytes == 4 || StorageSizeInBytes == 2 ||
-          StorageSizeInBytes == 1)
-          << "Invalid Bias storage width";
-      if constexpr (StorageSizeInBytes == 4) {
-        return _mm256_set_epi64x(
-            int32Ptr_[startIndex + 3],
-            int32Ptr_[startIndex + 2],
-            int32Ptr_[startIndex + 1],
-            int32Ptr_[startIndex]);
-      } else if constexpr (StorageSizeInBytes == 2) {
-        return _mm256_set_epi64x(
-            int16Ptr_[startIndex + 3],
-            int16Ptr_[startIndex + 2],
-            int16Ptr_[startIndex + 1],
-            int16Ptr_[startIndex]);
-      } else if constexpr (StorageSizeInBytes == 1) {
-        return _mm256_set_epi64x(
-            int8Ptr_[startIndex + 3],
-            int8Ptr_[startIndex + 2],
-            int8Ptr_[startIndex + 1],
-            int8Ptr_[startIndex]);
-      }
-    } else if constexpr (std::is_same<T, int32_t>::value) {
-      DCHECK(StorageSizeInBytes == 2 || StorageSizeInBytes == 1)
-          << "Invalid Bias storage width";
-      if constexpr (StorageSizeInBytes == 2) {
-        return _mm256_set_epi32(
-            int16Ptr_[startIndex + 7],
-            int16Ptr_[startIndex + 6],
-            int16Ptr_[startIndex + 5],
-            int16Ptr_[startIndex + 4],
-            int16Ptr_[startIndex + 3],
-            int16Ptr_[startIndex + 2],
-            int16Ptr_[startIndex + 1],
-            int16Ptr_[startIndex]);
-      } else if constexpr (StorageSizeInBytes == 1) {
-        return _mm256_set_epi32(
-            int8Ptr_[startIndex + 7],
-            int8Ptr_[startIndex + 6],
-            int8Ptr_[startIndex + 5],
-            int8Ptr_[startIndex + 4],
-            int8Ptr_[startIndex + 3],
-            int8Ptr_[startIndex + 2],
-            int8Ptr_[startIndex + 1],
-            int8Ptr_[startIndex]);
-      }
-    } else if constexpr (std::is_same<T, int16_t>::value) {
-      DCHECK(StorageSizeInBytes == 1) << "Invalid Bias storage width";
-      return _mm256_set_epi16(
-          int8Ptr_[startIndex + 15],
-          int8Ptr_[startIndex + 14],
-          int8Ptr_[startIndex + 13],
-          int8Ptr_[startIndex + 12],
-          int8Ptr_[startIndex + 11],
-          int8Ptr_[startIndex + 10],
-          int8Ptr_[startIndex + 9],
-          int8Ptr_[startIndex + 8],
-          int8Ptr_[startIndex + 7],
-          int8Ptr_[startIndex + 6],
-          int8Ptr_[startIndex + 5],
-          int8Ptr_[startIndex + 4],
-          int8Ptr_[startIndex + 3],
-          int8Ptr_[startIndex + 2],
-          int8Ptr_[startIndex + 1],
-          int8Ptr_[startIndex]);
-    }
-
-    throw std::runtime_error("Unsupported type");
+  template <typename U>
+  inline xsimd::batch<T> loadSIMDInternal(size_t byteOffset) const {
+    auto mem = reinterpret_cast<const U*>(
+        rawValues_ + byteOffset / sizeof(T) * sizeof(U));
+    return xsimd::batch<T>::load_unaligned(mem);
   }
 
   TypeKind valueType_;
   BufferPtr values_;
   const uint8_t* rawValues_;
-  const int8_t* int8Ptr_ = nullptr;
-  const int16_t* int16Ptr_ = nullptr;
-  const int32_t* int32Ptr_ = nullptr;
 
   // Note: there is no 64 bit internal array as the largest number type we
   // support is 64 bit and all biasing requires a smaller internal type.
   T bias_;
 
   // Used to debias several values at a time.
-  __m256i biasBuffer_;
+  std::conditional_t<can_simd, xsimd::batch<T>, char> biasBuffer_;
 };
-
-template <typename T>
-const std::string BiasVector<T>::BIAS_VALUE = "CDV1";
 
 template <typename T>
 using BiasVectorPtr = std::shared_ptr<BiasVector<T>>;

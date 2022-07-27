@@ -42,6 +42,35 @@ constexpr uint64_t BUFFER_SIZE = 1024;
 // case, we still need to make batch point to a valid address
 std::array<char, 1> EMPTY_DICT;
 
+namespace detail {
+
+void fillTimestamps(
+    Timestamp* timestamps,
+    const uint64_t* nullsPtr,
+    const int64_t* secondsPtr,
+    const uint64_t* nanosPtr,
+    vector_size_t numValues) {
+  for (vector_size_t i = 0; i < numValues; i++) {
+    if (!nullsPtr || !bits::isBitNull(nullsPtr, i)) {
+      auto nanos = nanosPtr[i];
+      uint64_t zeros = nanos & 0x7;
+      nanos >>= 3;
+      if (zeros != 0) {
+        for (uint64_t j = 0; j <= zeros; ++j) {
+          nanos *= 10;
+        }
+      }
+      auto seconds = secondsPtr[i] + EPOCH_OFFSET;
+      if (seconds < 0 && nanos != 0) {
+        seconds -= 1;
+      }
+      timestamps[i] = Timestamp(seconds, nanos);
+    }
+  }
+}
+
+} // namespace detail
+
 inline RleVersion convertRleVersion(proto::ColumnEncoding_Kind kind) {
   switch (static_cast<int64_t>(kind)) {
     case proto::ColumnEncoding_Kind_DIRECT:
@@ -57,7 +86,7 @@ inline RleVersion convertRleVersion(proto::ColumnEncoding_Kind kind) {
 
 template <typename T>
 FlatVector<T>* resetIfWrongFlatVectorType(VectorPtr& result) {
-  return resetIfWrongVectorType<FlatVector<T>>(result);
+  return detail::resetIfWrongVectorType<FlatVector<T>>(result);
 }
 
 BufferPtr ColumnReader::readNulls(
@@ -84,7 +113,7 @@ void ColumnReader::readNulls(
   auto numBytes = bits::nbytes(numValues);
   if (result && *result) {
     nulls = (*result)->mutableNulls(numValues + (simd::kPadding * 8));
-    resetIfNotWritable(*result, nulls);
+    detail::resetIfNotWritable(*result, nulls);
   }
   if (!nulls || nulls->capacity() < numBytes + simd::kPadding) {
     nulls =
@@ -109,7 +138,7 @@ ColumnReader::ColumnReader(
       memoryPool_(stripe.getMemoryPool()),
       flatMapContext_(std::move(flatMapContext)) {
   EncodingKey encodingKey{nodeType_->id, flatMapContext_.sequence};
-  std::unique_ptr<SeekableInputStream> stream =
+  std::unique_ptr<dwio::common::SeekableInputStream> stream =
       stripe.getStream(encodingKey.forKind(proto::Stream_Kind_PRESENT), false);
   if (stream) {
     notNullDecoder_ = createBooleanRleDecoder(std::move(stream), encodingKey);
@@ -171,7 +200,7 @@ class ByteRleColumnReader : public ColumnReader {
       std::shared_ptr<const dwio::common::TypeWithId> nodeType,
       StripeStreams& stripe,
       std::function<std::unique_ptr<ByteRleDecoder>(
-          std::unique_ptr<SeekableInputStream>,
+          std::unique_ptr<dwio::common::SeekableInputStream>,
           const EncodingKey&)> creator,
       FlatMapContext flatMapContext)
       : ColumnReader(std::move(nodeType), stripe, std::move(flatMapContext)) {
@@ -225,7 +254,7 @@ void ByteRleColumnReader<DataType, RequestedType>::next(
   uint64_t nullCount = nullsPtr ? bits::countNulls(nullsPtr, 0, numValues) : 0;
 
   if (flatVector) {
-    resetIfNotWritable(result, values);
+    detail::resetIfNotWritable(result, values);
   }
   if (!values) {
     values = AlignedBuffer::allocate<RequestedType>(numValues, &memoryPool_);
@@ -359,7 +388,7 @@ void IntegerDirectColumnReader<ReqT>::next(
   uint64_t nullCount = nullsPtr ? bits::countNulls(nullsPtr, 0, numValues) : 0;
 
   if (flatVector) {
-    resetIfNotWritable(result, values);
+    detail::resetIfNotWritable(result, values);
   }
   if (!values) {
     values = AlignedBuffer::allocate<ReqT>(numValues, &memoryPool_);
@@ -499,7 +528,7 @@ void IntegerDictionaryColumnReader<ReqT>::next(
   uint64_t nullCount = nullsPtr ? bits::countNulls(nullsPtr, 0, numValues) : 0;
 
   if (flatVector) {
-    resetIfNotWritable(result, values);
+    detail::resetIfNotWritable(result, values);
   }
   if (!values) {
     values = AlignedBuffer::allocate<ReqT>(numValues, &memoryPool_);
@@ -517,7 +546,7 @@ void IntegerDictionaryColumnReader<ReqT>::next(
   // is an offset or a literal value.
   const char* inDict = nullptr;
   if (inDictionaryReader) {
-    ensureCapacity<bool>(inDictionary, numValues, &memoryPool_);
+    detail::ensureCapacity<bool>(inDictionary, numValues, &memoryPool_);
     inDictionaryReader->next(
         inDictionary->asMutable<char>(), numValues, nullsPtr);
     inDict = inDictionary->as<char>();
@@ -606,7 +635,7 @@ void TimestampColumnReader::next(
   uint64_t nullCount = nullsPtr ? bits::countNulls(nullsPtr, 0, numValues) : 0;
 
   if (flatVector) {
-    resetIfNotWritable(result, values);
+    detail::resetIfNotWritable(result, values);
   }
   if (!values) {
     values = AlignedBuffer::allocate<Timestamp>(numValues, &memoryPool_);
@@ -620,36 +649,15 @@ void TimestampColumnReader::next(
         &memoryPool_, nulls, nullCount, numValues, values);
   }
 
-  ensureCapacity<int64_t>(secondsBuffer_, numValues, &memoryPool_);
-  ensureCapacity<int64_t>(nanosBuffer_, numValues, &memoryPool_);
+  detail::ensureCapacity<int64_t>(secondsBuffer_, numValues, &memoryPool_);
+  detail::ensureCapacity<uint64_t>(nanosBuffer_, numValues, &memoryPool_);
   auto secondsData = secondsBuffer_->asMutable<int64_t>();
-  auto nanosData = nanosBuffer_->asMutable<int64_t>();
+  auto nanosData = nanosBuffer_->asMutable<uint64_t>();
   seconds->next(secondsData, numValues, nullsPtr);
-  nano->next(nanosData, numValues, nullsPtr);
-
-  // Construct the values
-  for (uint64_t i = 0; i < numValues; i++) {
-    if (!nulls || !bits::isBitNull(nullsPtr, i)) {
-      uint64_t zeros = nanosData[i] & 0x7;
-      nanosData[i] >>= 3;
-      if (zeros != 0) {
-        for (uint64_t j = 0; j <= zeros; ++j) {
-          nanosData[i] *= 10;
-        }
-      }
-      secondsData[i] += EPOCH_OFFSET;
-      if (secondsData[i] < 0 && nanosData[i] != 0) {
-        secondsData[i] -= 1;
-      }
-    }
-  }
-
+  nano->next(reinterpret_cast<int64_t*>(nanosData), numValues, nullsPtr);
   auto* valuesPtr = values->asMutable<Timestamp>();
-  for (uint64_t i = 0; i < numValues; i++) {
-    if (!nulls || !bits::isBitNull(nullsPtr, i)) {
-      valuesPtr[i] = Timestamp(secondsData[i], nanosData[i]);
-    }
-  }
+  detail::fillTimestamps(
+      valuesPtr, nullsPtr, secondsData, nanosData, numValues);
 }
 
 template <class T>
@@ -680,7 +688,7 @@ class FloatingPointColumnReader : public ColumnReader {
       override;
 
  private:
-  std::unique_ptr<SeekableInputStream> inputStream;
+  std::unique_ptr<dwio::common::SeekableInputStream> inputStream;
   const char* bufferPointer;
   const char* bufferEnd;
 
@@ -764,7 +772,7 @@ void FloatingPointColumnReader<DataT, ReqT>::next(
   uint64_t nullCount = nullsPtr ? bits::countNulls(nullsPtr, 0, numValues) : 0;
 
   if (flatVector) {
-    resetIfNotWritable(result, values);
+    detail::resetIfNotWritable(result, values);
   }
   if (!values) {
     values = AlignedBuffer::allocate<ReqT>(numValues, &memoryPool_);
@@ -830,7 +838,7 @@ class StringDictionaryColumnReader : public ColumnReader {
   BufferPtr indices_;
   std::unique_ptr<IntDecoder</*isSigned*/ false>> dictIndex;
   std::unique_ptr<ByteRleDecoder> inDictionaryReader;
-  std::unique_ptr<SeekableInputStream> strideDictStream;
+  std::unique_ptr<dwio::common::SeekableInputStream> strideDictStream;
   std::unique_ptr<IntDecoder</*isSigned*/ false>> strideDictLengthDecoder;
 
   FlatVectorPtr<StringView> combinedDictionaryValues_;
@@ -842,19 +850,19 @@ class StringDictionaryColumnReader : public ColumnReader {
   size_t positionOffset;
   size_t strideDictSizeOffset;
 
-  std::unique_ptr<SeekableInputStream> indexStream_;
+  std::unique_ptr<dwio::common::SeekableInputStream> indexStream_;
   std::unique_ptr<proto::RowIndex> rowIndex_;
   const StrideIndexProvider& provider;
 
   // lazy load the dictionary
   std::unique_ptr<IntDecoder</*isSigned*/ false>> lengthDecoder;
-  std::unique_ptr<SeekableInputStream> blobStream;
+  std::unique_ptr<dwio::common::SeekableInputStream> blobStream;
   const bool returnFlatVector_;
   bool initialized_{false};
 
   BufferPtr loadDictionary(
       uint64_t count,
-      SeekableInputStream& data,
+      dwio::common::SeekableInputStream& data,
       IntDecoder</*isSigned*/ false>& lengthDecoder,
       BufferPtr& offsets);
 
@@ -927,8 +935,9 @@ StringDictionaryColumnReader::StringDictionaryColumnReader(
       encodingKey.forKind(proto::Stream_Kind_DICTIONARY_DATA), false);
 
   // handle in dictionary stream
-  std::unique_ptr<SeekableInputStream> inDictStream = stripe.getStream(
-      encodingKey.forKind(proto::Stream_Kind_IN_DICTIONARY), false);
+  std::unique_ptr<dwio::common::SeekableInputStream> inDictStream =
+      stripe.getStream(
+          encodingKey.forKind(proto::Stream_Kind_IN_DICTIONARY), false);
   if (inDictStream) {
     inDictionaryReader =
         createBooleanRleDecoder(std::move(inDictStream), encodingKey);
@@ -965,7 +974,7 @@ uint64_t StringDictionaryColumnReader::skip(uint64_t numValues) {
 
 BufferPtr StringDictionaryColumnReader::loadDictionary(
     uint64_t count,
-    SeekableInputStream& data,
+    dwio::common::SeekableInputStream& data,
     IntDecoder</*isSigned*/ false>& lengthDecoder,
     BufferPtr& offsets) {
   // read lengths from length reader
@@ -999,11 +1008,11 @@ void StringDictionaryColumnReader::loadStrideDictionary() {
     // seek stride dictionary related streams
     std::vector<uint64_t> pos(
         positions.begin() + positionOffset, positions.end());
-    PositionProvider pp(pos);
-    strideDictStream->seekToRowGroup(pp);
+    dwio::common::PositionProvider pp(pos);
+    strideDictStream->seekToPosition(pp);
     strideDictLengthDecoder->seekToRowGroup(pp);
 
-    ensureCapacity<int64_t>(
+    detail::ensureCapacity<int64_t>(
         strideDictOffset, strideDictCount + 1, &memoryPool_);
     strideDict = loadDictionary(
         strideDictCount,
@@ -1096,7 +1105,7 @@ void StringDictionaryColumnReader::readDictionaryVector(
     VectorPtr& result,
     const uint64_t* incomingNulls) {
   auto dictVector =
-      resetIfWrongVectorType<DictionaryVector<StringView>>(result);
+      detail::resetIfWrongVectorType<DictionaryVector<StringView>>(result);
   BufferPtr indices;
   if (dictVector) {
     indices = dictVector->mutableIndices(numValues);
@@ -1107,7 +1116,7 @@ void StringDictionaryColumnReader::readDictionaryVector(
   uint64_t nullCount = nullsPtr ? bits::countNulls(nullsPtr, 0, numValues) : 0;
 
   if (result) {
-    resetIfNotWritable(result, indices);
+    detail::resetIfNotWritable(result, indices);
   }
   if (!indices) {
     indices = AlignedBuffer::allocate<vector_size_t>(numValues, &memoryPool_);
@@ -1122,7 +1131,7 @@ void StringDictionaryColumnReader::readDictionaryVector(
   // load inDictionary
   const char* inDictPtr = nullptr;
   if (inDictionaryReader) {
-    ensureCapacity<bool>(inDict, numValues, &memoryPool_);
+    detail::ensureCapacity<bool>(inDict, numValues, &memoryPool_);
     inDictionaryReader->next(inDict->asMutable<char>(), numValues, nullsPtr);
     inDictPtr = inDict->as<char>();
   }
@@ -1239,7 +1248,7 @@ void StringDictionaryColumnReader::readFlatVector(
   uint64_t nullCount = nullsPtr ? bits::countNulls(nullsPtr, 0, numValues) : 0;
 
   if (result) {
-    resetIfNotWritable(result, data);
+    detail::resetIfNotWritable(result, data);
   }
   if (!data) {
     data = AlignedBuffer::allocate<StringView>(numValues, &memoryPool_);
@@ -1248,7 +1257,7 @@ void StringDictionaryColumnReader::readFlatVector(
   // load inDictionary
   const char* inDictPtr = nullptr;
   if (inDictionaryReader) {
-    ensureCapacity<bool>(inDict, numValues, &memoryPool_);
+    detail::ensureCapacity<bool>(inDict, numValues, &memoryPool_);
     inDictionaryReader->next(inDict->asMutable<char>(), numValues, nullsPtr);
     inDictPtr = inDict->as<char>();
   }
@@ -1329,7 +1338,8 @@ void StringDictionaryColumnReader::ensureInitialized() {
     return;
   }
 
-  ensureCapacity<int64_t>(dictionaryOffset, dictionaryCount + 1, &memoryPool_);
+  detail::ensureCapacity<int64_t>(
+      dictionaryOffset, dictionaryCount + 1, &memoryPool_);
   dictionaryBlob = loadDictionary(
       dictionaryCount, *blobStream, *lengthDecoder, dictionaryOffset);
   dictionaryValues_.reset();
@@ -1340,14 +1350,13 @@ void StringDictionaryColumnReader::ensureInitialized() {
     // load stride dictionary offsets
     rowIndex_ = ProtoUtils::readProto<proto::RowIndex>(std::move(indexStream_));
     auto indexStartOffset = flatMapContext_.inMapDecoder
-        ? flatMapContext_.inMapDecoder->loadIndices(*rowIndex_, 0)
+        ? flatMapContext_.inMapDecoder->loadIndices(0)
         : 0;
     positionOffset = notNullDecoder_
-        ? notNullDecoder_->loadIndices(*rowIndex_, indexStartOffset)
+        ? notNullDecoder_->loadIndices(indexStartOffset)
         : indexStartOffset;
-    auto offset = strideDictStream->loadIndices(*rowIndex_, positionOffset);
-    strideDictSizeOffset =
-        strideDictLengthDecoder->loadIndices(*rowIndex_, offset);
+    size_t offset = strideDictStream->positionSize() + positionOffset;
+    strideDictSizeOffset = strideDictLengthDecoder->loadIndices(offset);
   }
   initialized_ = true;
 }
@@ -1355,7 +1364,7 @@ void StringDictionaryColumnReader::ensureInitialized() {
 class StringDirectColumnReader : public ColumnReader {
  private:
   std::unique_ptr<IntDecoder</*isSigned*/ false>> length;
-  std::unique_ptr<SeekableInputStream> blobStream;
+  std::unique_ptr<dwio::common::SeekableInputStream> blobStream;
 
   /**
    * Compute the total length of the values.
@@ -1452,7 +1461,7 @@ void StringDirectColumnReader::next(
   uint64_t nullCount = nullsPtr ? bits::countNulls(nullsPtr, 0, numValues) : 0;
 
   if (flatVector) {
-    resetIfNotWritable(result, values);
+    detail::resetIfNotWritable(result, values);
   }
   if (!values) {
     values = AlignedBuffer::allocate<StringView>(numValues, &memoryPool_);
@@ -1583,7 +1592,7 @@ void StructColumnReader::next(
     uint64_t numValues,
     VectorPtr& result,
     const uint64_t* incomingNulls) {
-  auto rowVector = resetIfWrongVectorType<RowVector>(result);
+  auto rowVector = detail::resetIfWrongVectorType<RowVector>(result);
   std::vector<VectorPtr> childrenVectors;
   if (rowVector) {
     // Track children vectors in a local variable because readNulls may reset
@@ -1719,7 +1728,7 @@ void ListColumnReader::next(
     uint64_t numValues,
     VectorPtr& result,
     const uint64_t* incomingNulls) {
-  auto resultArray = resetIfWrongVectorType<ArrayVector>(result);
+  auto resultArray = detail::resetIfWrongVectorType<ArrayVector>(result);
   VectorPtr elements;
   BufferPtr offsets;
   BufferPtr lengths;
@@ -1734,7 +1743,7 @@ void ListColumnReader::next(
   uint64_t nullCount = nullsPtr ? bits::countNulls(nullsPtr, 0, numValues) : 0;
 
   if (resultArray) {
-    resetIfNotWritable(result, offsets, lengths);
+    detail::resetIfNotWritable(result, offsets, lengths);
   }
 
   if (!offsets) {
@@ -1879,7 +1888,7 @@ void MapColumnReader::next(
     uint64_t numValues,
     VectorPtr& result,
     const uint64_t* incomingNulls) {
-  auto resultMap = resetIfWrongVectorType<MapVector>(result);
+  auto resultMap = detail::resetIfWrongVectorType<MapVector>(result);
   VectorPtr keys;
   VectorPtr values;
   BufferPtr offsets;
@@ -1896,7 +1905,7 @@ void MapColumnReader::next(
   uint64_t nullCount = nullsPtr ? bits::countNulls(nullsPtr, 0, numValues) : 0;
 
   if (resultMap) {
-    resetIfNotWritable(result, offsets, lengths);
+    detail::resetIfNotWritable(result, offsets, lengths);
   }
 
   if (!offsets) {
@@ -1972,8 +1981,9 @@ struct RleDecoderFactory {};
 
 template <>
 struct RleDecoderFactory<bool> {
-  static std::function<std::unique_ptr<
-      ByteRleDecoder>(std::unique_ptr<SeekableInputStream>, const EncodingKey&)>
+  static std::function<std::unique_ptr<ByteRleDecoder>(
+      std::unique_ptr<dwio::common::SeekableInputStream>,
+      const EncodingKey&)>
   get() {
     return createBooleanRleDecoder;
   }
@@ -1981,8 +1991,9 @@ struct RleDecoderFactory<bool> {
 
 template <>
 struct RleDecoderFactory<int8_t> {
-  static std::function<std::unique_ptr<
-      ByteRleDecoder>(std::unique_ptr<SeekableInputStream>, const EncodingKey&)>
+  static std::function<std::unique_ptr<ByteRleDecoder>(
+      std::unique_ptr<dwio::common::SeekableInputStream>,
+      const EncodingKey&)>
   get() {
     return createByteRleDecoder;
   }

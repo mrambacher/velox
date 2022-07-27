@@ -24,15 +24,14 @@
 #include <string>
 
 #include <fmt/format.h>
-#include <gflags/gflags.h>
 #include <glog/logging.h>
-#include <gtest/gtest_prod.h>
 
 #include "folly/CPortability.h"
 #include "folly/Likely.h"
 #include "folly/Random.h"
 #include "folly/SharedMutex.h"
 #include "folly/experimental/FunctionScheduler.h"
+#include "velox/common/base/GTestMacros.h"
 #include "velox/common/memory/MemoryUsage.h"
 #include "velox/common/memory/MemoryUsageTracker.h"
 
@@ -43,6 +42,23 @@ namespace velox {
 namespace memory {
 constexpr uint16_t kNoAlignment = alignof(max_align_t);
 constexpr uint16_t kDefaultAlignment = 64;
+
+#define VELOX_MEM_MANAGER_CAP_EXCEEDED(cap)                         \
+  _VELOX_THROW(                                                     \
+      ::facebook::velox::VeloxRuntimeError,                         \
+      ::facebook::velox::error_source::kErrorSourceRuntime.c_str(), \
+      ::facebook::velox::error_code::kMemCapExceeded.c_str(),       \
+      /* isRetriable */ true,                                       \
+      "Exceeded memory manager cap of {} MB",                       \
+      (cap) / 1024 / 1024);
+
+#define VELOX_MEM_MANUAL_CAP()                                      \
+  _VELOX_THROW(                                                     \
+      ::facebook::velox::VeloxRuntimeError,                         \
+      ::facebook::velox::error_source::kErrorSourceRuntime.c_str(), \
+      ::facebook::velox::error_code::kMemCapExceeded.c_str(),       \
+      /* isRetriable */ true,                                       \
+      "Memory allocation manually capped");
 
 class ScopedMemoryPool;
 
@@ -389,7 +405,7 @@ class MemoryPoolImpl : public MemoryPoolBase {
   int64_t getSubtreeMaxBytes() const;
 
  private:
-  FRIEND_TEST(MemoryPoolTest, Ctor);
+  VELOX_FRIEND_TEST(MemoryPoolTest, Ctor);
 
   template <uint16_t A>
   struct ALIGNER {};
@@ -532,12 +548,12 @@ class MemoryManager final : public IMemoryManager {
   Allocator& getAllocator();
 
  private:
-  FRIEND_TEST(MemoryPoolImplTest, CapSubtree);
-  FRIEND_TEST(MemoryPoolImplTest, CapAllocation);
-  FRIEND_TEST(MemoryPoolImplTest, UncapMemory);
-  FRIEND_TEST(MemoryPoolImplTest, MemoryManagerGlobalCap);
-  FRIEND_TEST(MultiThreadingUncappingTest, Flat);
-  FRIEND_TEST(MultiThreadingUncappingTest, SimpleTree);
+  VELOX_FRIEND_TEST(MemoryPoolImplTest, CapSubtree);
+  VELOX_FRIEND_TEST(MemoryPoolImplTest, CapAllocation);
+  VELOX_FRIEND_TEST(MemoryPoolImplTest, UncapMemory);
+  VELOX_FRIEND_TEST(MemoryPoolImplTest, MemoryManagerGlobalCap);
+  VELOX_FRIEND_TEST(MultiThreadingUncappingTest, Flat);
+  VELOX_FRIEND_TEST(MultiThreadingUncappingTest, SimpleTree);
 
   std::shared_ptr<Allocator> allocator_;
   const int64_t memoryQuota_;
@@ -563,7 +579,7 @@ MemoryPoolImpl<Allocator, ALIGNMENT>::MemoryPoolImpl(
 template <typename Allocator, uint16_t ALIGNMENT>
 void* MemoryPoolImpl<Allocator, ALIGNMENT>::allocate(int64_t size) {
   if (this->isMemoryCapped()) {
-    VELOX_MEM_CAP_EXCEEDED(cap_);
+    VELOX_MEM_MANUAL_CAP();
   }
   auto alignedSize = sizeAlign<ALIGNMENT>(ALIGNER<ALIGNMENT>{}, size);
   reserve(alignedSize);
@@ -577,7 +593,7 @@ void* MemoryPoolImpl<Allocator, ALIGNMENT>::allocateZeroFilled(
   VELOX_USER_CHECK_EQ(sizeEach, 1);
   auto alignedSize = sizeAlign<ALIGNMENT>(ALIGNER<ALIGNMENT>{}, numMembers);
   if (this->isMemoryCapped()) {
-    VELOX_MEM_CAP_EXCEEDED(cap_);
+    VELOX_MEM_MANUAL_CAP();
   }
   reserve(alignedSize * sizeEach);
   return allocator_.allocZeroFilled(alignedSize, sizeEach);
@@ -751,13 +767,20 @@ void MemoryPoolImpl<Allocator, ALIGNMENT>::reserve(int64_t size) {
   localMemoryUsage_.incrementCurrentBytes(size);
 
   bool success = memoryManager_.reserve(size);
+  bool manualCap = isMemoryCapped();
   int64_t aggregateBytes = getAggregateBytes();
-  if (UNLIKELY(!success || isMemoryCapped() || aggregateBytes > cap_)) {
+  if (UNLIKELY(!success || manualCap || aggregateBytes > cap_)) {
     // NOTE: If we can make the reserve and release a single transaction we
     // would have more accurate aggregates in intermediate states. However, this
     // is low-pri because we can only have inflated aggregates, and be on the
     // more conservative side.
     release(size);
+    if (!success) {
+      VELOX_MEM_MANAGER_CAP_EXCEEDED(memoryManager_.getMemoryQuota());
+    }
+    if (manualCap) {
+      VELOX_MEM_MANUAL_CAP();
+    }
     VELOX_MEM_CAP_EXCEEDED(cap_);
   }
 }
@@ -871,6 +894,19 @@ class Allocator {
 
   void deallocate(T* p, size_t n) {
     pool.free(p, n * sizeof(T));
+  }
+
+  template <typename T1>
+  bool operator==(const Allocator<T1>& rhs) const {
+    if constexpr (std::is_same<T, T1>::value) {
+      return &this->pool == &rhs.pool;
+    }
+    return false;
+  }
+
+  template <typename T1>
+  bool operator!=(const Allocator<T1>& rhs) const {
+    return !(*this == rhs);
   }
 };
 } // namespace memory

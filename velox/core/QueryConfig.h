@@ -50,7 +50,13 @@ class QueryConfig {
 
   // Whether to use the simplified expression evaluation path. False by default.
   static constexpr const char* kExprEvalSimplified =
-      "driver.expr_eval.simplified";
+      "expression.eval_simplified";
+
+  // Whether to track CPU usage for individual expressions (supported by call
+  // and cast expressions). False by default. Can be expensive when processing
+  // small batches, e.g. < 10K rows.
+  static constexpr const char* kExprTrackCpuUsage =
+      "expression.track_cpu_usage";
 
   // Flags used to configure the CAST operator:
 
@@ -87,11 +93,19 @@ class QueryConfig {
 
   static constexpr const char* kCreateEmptyFiles = "driver.create_empty_files";
 
+  static constexpr const char* kSpillPath = "spiller-spill-path";
+
+  static constexpr const char* kTestingSpillPct = "testing.spill-pct";
+
   uint64_t maxPartialAggregationMemoryUsage() const {
     static constexpr uint64_t kDefault = 1L << 24;
     return get<uint64_t>(kMaxPartialAggregationMemory, kDefault);
   }
 
+  // Returns the target size for a Task's buffered output. The
+  // producer Drivers are blocked when the buffered size exceeds
+  // this. The Drivers are resumed when the buffered size goes below
+  // PartitionedOutputBufferManager::kContinuePct % of this.
   uint64_t maxPartitionedOutputBufferSize() const {
     static constexpr uint64_t kDefault = 32UL << 20;
     return get<uint64_t>(kMaxPartitionedOutputBufferSize, kDefault);
@@ -160,12 +174,38 @@ class QueryConfig {
     return get<bool>(kExprEvalSimplified, false);
   }
 
- private:
+  /// Returns a path for writing spill files. If empty, spilling is
+  /// disabled. The path should be interpretable by
+  /// filesystems::getFileSystem and may refer to any writable
+  /// location. Actual file names are composed by appending '/' and a
+  /// filename composed of Task id and serial numbers. The files are
+  /// automatically deleted when no longer needed. Files may be left
+  /// behind after crashes but are identifiable based on the Task id in
+  /// the name.
+  std::optional<std::string> spillPath() const {
+    return get<std::string>(kSpillPath);
+  }
+
+  // Returns a percentage of aggregation or join input batches that
+  // will be forced to spill for testing. 0 means no extra spilling.
+  int32_t testingSpillPct() const {
+    return get<int32_t>(kTestingSpillPct, 0);
+  }
+
+  bool exprTrackCpuUsage() const {
+    return get<bool>(kExprTrackCpuUsage, false);
+  }
+
   template <typename T>
   T get(const std::string& key, const T& defaultValue) const {
     return config_->get<T>(key, defaultValue);
   }
+  template <typename T>
+  std::optional<T> get(const std::string& key) const {
+    return std::optional<T>(config_->get<T>(key));
+  }
 
+ private:
   BaseConfigManager* config_;
 };
 } // namespace facebook::velox::core

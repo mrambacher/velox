@@ -29,6 +29,7 @@
 #include "velox/functions/sparksql/RegexFunctions.h"
 #include "velox/functions/sparksql/RegisterArithmetic.h"
 #include "velox/functions/sparksql/RegisterCompare.h"
+#include "velox/functions/sparksql/Size.h"
 #include "velox/functions/sparksql/String.h"
 
 namespace facebook::velox::functions {
@@ -40,6 +41,9 @@ static void workAroundRegistrationMacro(const std::string& prefix) {
   VELOX_REGISTER_VECTOR_FUNCTION(udf_transform, prefix + "transform");
   VELOX_REGISTER_VECTOR_FUNCTION(udf_reduce, prefix + "aggregate");
   VELOX_REGISTER_VECTOR_FUNCTION(udf_array_filter, prefix + "filter");
+  // Spark and Presto map_filter function has the same definition:
+  //   function expression corresponds to body, arguments to signature
+  VELOX_REGISTER_VECTOR_FUNCTION(udf_map_filter, prefix + "map_filter");
   // Complex types.
   VELOX_REGISTER_VECTOR_FUNCTION(udf_array_constructor, prefix + "array");
   VELOX_REGISTER_VECTOR_FUNCTION(udf_array_contains, prefix + "array_contains");
@@ -55,7 +59,6 @@ static void workAroundRegistrationMacro(const std::string& prefix) {
   VELOX_REGISTER_VECTOR_FUNCTION(udf_replace, prefix + "replace");
   VELOX_REGISTER_VECTOR_FUNCTION(udf_upper, prefix + "upper");
   // Logical.
-  VELOX_REGISTER_VECTOR_FUNCTION(udf_coalesce, prefix + "coalesce");
   VELOX_REGISTER_VECTOR_FUNCTION(udf_is_null, prefix + "isnull");
   VELOX_REGISTER_VECTOR_FUNCTION(udf_is_not_null, prefix + "isnotnull");
   VELOX_REGISTER_VECTOR_FUNCTION(udf_not, prefix + "not");
@@ -65,6 +68,9 @@ namespace sparksql {
 
 void registerFunctions(const std::string& prefix) {
   registerFunction<RandFunction, double>({"rand"});
+
+  // Register size functions
+  registerSize(prefix + "size");
 
   registerFunction<JsonExtractScalarFunction, Varchar, Varchar, Varchar>(
       {prefix + "get_json_object"});
@@ -77,7 +83,6 @@ void registerFunctions(const std::string& prefix) {
       {prefix + "substring"});
   registerFunction<SubstrFunction, Varchar, Varchar, int32_t, int32_t>(
       {prefix + "substring"});
-
   exec::registerStatefulVectorFunction("instr", instrSignatures(), makeInstr);
   exec::registerStatefulVectorFunction(
       "length", lengthSignatures(), makeLength);
@@ -102,7 +107,10 @@ void registerFunctions(const std::string& prefix) {
       prefix + "hash", hashSignatures(), makeHash);
   exec::registerStatefulVectorFunction(
       prefix + "murmur3hash", hashSignatures(), makeHash);
-  exec::registerStatefulVectorFunction(prefix + "in", inSignatures(), makeIn);
+  VELOX_REGISTER_VECTOR_FUNCTION(udf_map, prefix + "map");
+
+  // Register 'in' functions.
+  registerIn(prefix);
 
   // Compare nullsafe functions
   exec::registerStatefulVectorFunction(

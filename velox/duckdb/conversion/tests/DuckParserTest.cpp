@@ -14,7 +14,8 @@
  * limitations under the License.
  */
 #include "velox/duckdb/conversion/DuckParser.h"
-#include <gtest/gtest.h>
+#include "velox/common/base/tests/GTestUtils.h"
+#include "velox/core/PlanNode.h"
 #include "velox/parse/Expressions.h"
 
 using namespace facebook::velox;
@@ -151,6 +152,8 @@ TEST(DuckParserTest, expressions) {
   EXPECT_EQ("gte(1,0)", parseExpr("1 >= 0")->toString());
   EXPECT_EQ("lt(1,0)", parseExpr("1 < 0")->toString());
   EXPECT_EQ("lte(1,0)", parseExpr("1 <= 0")->toString());
+  EXPECT_EQ(
+      "distinct_from(1,0)", parseExpr("1 IS DISTINCT FROM 0")->toString());
 
   // Arithmetic operators.
   EXPECT_EQ("plus(1,0)", parseExpr("1 + 0")->toString());
@@ -295,4 +298,39 @@ TEST(DuckParserTest, like) {
   EXPECT_EQ(
       "like(\"name\",\"%#_%\",\"#\")",
       parseExpr("name LIKE '%#_%' ESCAPE '#'")->toString());
+}
+
+TEST(DuckParserTest, notLike) {
+  EXPECT_EQ(
+      "not(like(\"name\",\"%b%\"))",
+      parseExpr("name NOT LIKE '%b%'")->toString());
+  EXPECT_EQ(
+      "not(like(\"name\",\"%#_%\",\"#\"))",
+      parseExpr("name NOT LIKE '%#_%' ESCAPE '#'")->toString());
+}
+
+TEST(DuckParserTest, orderBy) {
+  auto parse = [](const auto& expr) {
+    auto orderBy = parseOrderByExpr(expr);
+    return fmt::format(
+        "{} {}", orderBy.first->toString(), orderBy.second.toString());
+  };
+
+  EXPECT_EQ("\"c1\" ASC NULLS LAST", parse("c1"));
+  EXPECT_EQ("\"c1\" ASC NULLS LAST", parse("c1 ASC"));
+  EXPECT_EQ("\"c1\" DESC NULLS LAST", parse("c1 DESC"));
+
+  EXPECT_EQ("\"c1\" ASC NULLS FIRST", parse("c1 NULLS FIRST"));
+  EXPECT_EQ("\"c1\" ASC NULLS LAST", parse("c1 NULLS LAST"));
+
+  EXPECT_EQ("\"c1\" ASC NULLS FIRST", parse("c1 ASC NULLS FIRST"));
+  EXPECT_EQ("\"c1\" ASC NULLS LAST", parse("c1 ASC NULLS LAST"));
+  EXPECT_EQ("\"c1\" DESC NULLS FIRST", parse("c1 DESC NULLS FIRST"));
+  EXPECT_EQ("\"c1\" DESC NULLS LAST", parse("c1 DESC NULLS LAST"));
+}
+
+TEST(DuckParserTest, invalidExpression) {
+  VELOX_ASSERT_THROW(
+      parseExpr("func(a b)"),
+      "Cannot parse expression: func(a b). Parser Error: syntax error at or near \"b\"");
 }

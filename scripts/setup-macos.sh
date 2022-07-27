@@ -28,11 +28,16 @@
 set -e # Exit on error.
 set -x # Print commands that are executed.
 
-FB_OS_VERSION=v2021.05.10.00
+SCRIPTDIR=$(dirname "${BASH_SOURCE[0]}")
+source $SCRIPTDIR/setup-helper-functions.sh
+
+CPU_TARGET="${CPU_TARGET:-avx}"
+FB_OS_VERSION=v2022.03.14.00
 NPROC=$(getconf _NPROCESSORS_ONLN)
-COMPILER_FLAGS="-mavx2 -mfma -mavx -mf16c -masm=intel -mlzcnt"
+COMPILER_FLAGS=$(get_cxx_flags $CPU_TARGET)
+
 DEPENDENCY_DIR=${DEPENDENCY_DIR:-$(pwd)}
-MACOS_DEPS="ninja cmake ccache protobuf icu4c boost gflags glog libevent lz4 lzo snappy xz zstd openssl@1.1"
+MACOS_DEPS="ninja flex bison cmake ccache protobuf icu4c boost gflags glog libevent lz4 lzo snappy xz zstd openssl@1.1"
 
 function run_and_time {
   time "$@"
@@ -52,47 +57,6 @@ function prompt {
       fi
     done
   ) 2> /dev/null
-}
-
-# github_checkout $REPO $VERSION clones or re-uses an existing clone of the
-# specified repo, checking out the requested version.
-function github_checkout {
-  local REPO=$1
-  local VERSION=$2
-  local DIRNAME=$(basename "$1")
-
-  cd "${DEPENDENCY_DIR}"
-  if [ -z "${DIRNAME}" ]; then
-    echo "Failed to get repo name from $1"
-    exit 1
-  fi
-  if [ -d "${DIRNAME}" ] && prompt "${DIRNAME} already exists. Delete?"; then
-    rm -rf "${DIRNAME}"
-  fi
-  if [ ! -d "${DIRNAME}" ]; then
-    git clone -q "https://github.com/${REPO}.git"
-  fi
-  cd "${DIRNAME}"
-  git fetch -q
-  git checkout "${VERSION}"
-}
-
-function cmake_install {
-  local NAME=$(basename "$(pwd)")
-  local BINARY_DIR=_build
-  if [ -d "${BINARY_DIR}" ] && prompt "Do you want to rebuild ${NAME}?"; then
-    rm -rf "${BINARY_DIR}"
-  fi
-  mkdir -p "${BINARY_DIR}"
-  cmake -Wno-dev -B"${BINARY_DIR}" \
-    -GNinja \
-    -DCMAKE_CXX_STANDARD=17 \
-    "${INSTALL_PREFIX+-DCMAKE_PREFIX_PATH=}${INSTALL_PREFIX-}" \
-    "${INSTALL_PREFIX+-DCMAKE_INSTALL_PREFIX=}${INSTALL_PREFIX-}" \
-    -DCMAKE_CXX_FLAGS="${COMPILER_FLAGS}" \
-    -DBUILD_TESTING=OFF \
-    "$@"
-  ninja -C "${BINARY_DIR}" install
 }
 
 function update_brew {
@@ -119,13 +83,8 @@ function install_build_prerequisites {
   pip3 install --user cmake-format regex
 }
 
-function install_googletest {
-  github_checkout google/googletest release-1.10.0
-  cmake_install
-}
-
 function install_fmt {
-  github_checkout fmtlib/fmt 7.1.3
+  github_checkout fmtlib/fmt 8.0.0
   cmake_install -DFMT_TEST=OFF
 }
 
@@ -155,7 +114,6 @@ function install_velox_deps {
     run_and_time install_build_prerequisites
   fi
   run_and_time install_ranges_v3
-  run_and_time install_googletest
   run_and_time install_fmt
   run_and_time install_double_conversion
   run_and_time install_folly

@@ -21,15 +21,15 @@ from getdeps.buildopts import setup_build_options
 from getdeps.dyndeps import create_dyn_dep_munger
 from getdeps.errors import TransientFailure
 from getdeps.fetcher import (
-    SystemPackageFetcher,
     file_name_is_cmake_file,
     list_files_under_dir_newer_than_timestamp,
+    SystemPackageFetcher,
 )
 from getdeps.load import ManifestLoader
 from getdeps.manifest import ManifestParser
 from getdeps.platform import HostType
 from getdeps.runcmd import run_cmd
-from getdeps.subcmd import SubCmd, add_subcommands, cmd
+from getdeps.subcmd import add_subcommands, cmd, SubCmd
 
 
 try:
@@ -595,6 +595,8 @@ class BuildCmd(ProjectCmdBase):
                     else {}
                 )
 
+                extra_b2_args = args.extra_b2_args or []
+
                 if sources_changed or reconfigure or not os.path.exists(built_marker):
                     if os.path.exists(built_marker):
                         os.unlink(built_marker)
@@ -620,6 +622,7 @@ class BuildCmd(ProjectCmdBase):
                         loader,
                         final_install_prefix=loader.get_project_install_prefix(m),
                         extra_cmake_defines=extra_cmake_defines,
+                        extra_b2_args=extra_b2_args,
                     )
                     builder.build(install_dirs, reconfigure=reconfigure)
 
@@ -759,6 +762,15 @@ class BuildCmd(ProjectCmdBase):
                 "when compiling the current project and all its deps. "
                 'e.g: \'{"CMAKE_CXX_FLAGS": "--bla"}\''
             ),
+        )
+        parser.add_argument(
+            "--extra-b2-args",
+            help=(
+                "Repeatable argument that contains extra arguments to pass "
+                "to b2, which compiles boost. "
+                "e.g.: 'cxxflags=-fPIC' 'cflags=-fPIC'"
+            ),
+            action="append",
         )
         parser.add_argument(
             "--shared-libs",
@@ -961,7 +973,6 @@ jobs:
             out.write("  build:\n")
             out.write("    runs-on: %s\n" % runs_on)
             out.write("    steps:\n")
-            out.write("    - uses: actions/checkout@v2\n")
 
             if build_opts.is_windows():
                 # cmake relies on BOOST_ROOT but GH deliberately don't set it in order
@@ -982,15 +993,23 @@ jobs:
                 # that we want it to use them!
                 out.write("    - name: Fix Git config\n")
                 out.write("      run: git config --system core.longpaths true\n")
+                out.write("    - name: Disable autocrlf\n")
+                out.write("      run: git config --system core.autocrlf false\n")
+
+            out.write("    - uses: actions/checkout@v2\n")
 
             allow_sys_arg = ""
             if (
                 build_opts.allow_system_packages
                 and build_opts.host_type.get_package_manager()
             ):
-                allow_sys_arg = " --allow-system-packages"
-                out.write("    - name: Install system deps\n")
                 sudo_arg = "sudo "
+                allow_sys_arg = " --allow-system-packages"
+                if build_opts.host_type.get_package_manager() == "deb":
+                    out.write("    - name: Update system package info\n")
+                    out.write(f"      run: {sudo_arg}apt-get update\n")
+
+                out.write("    - name: Install system deps\n")
                 if build_opts.is_darwin():
                     # brew is installed as regular user
                     sudo_arg = ""

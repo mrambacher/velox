@@ -20,24 +20,6 @@
 
 namespace facebook::velox::dwrf {
 
-std::string compressionKindToString(CompressionKind kind) {
-  switch (static_cast<int32_t>(kind)) {
-    case CompressionKind_NONE:
-      return "none";
-    case CompressionKind_ZLIB:
-      return "zlib";
-    case CompressionKind_SNAPPY:
-      return "snappy";
-    case CompressionKind_LZO:
-      return "lzo";
-    case CompressionKind_ZSTD:
-      return "zstd";
-    case CompressionKind_LZ4:
-      return "lz4";
-  }
-  return folly::to<std::string>("unknown - ", kind);
-}
-
 std::string writerVersionToString(WriterVersion version) {
   switch (static_cast<int32_t>(version)) {
     case ORIGINAL:
@@ -96,8 +78,8 @@ std::string columnEncodingKindToString(ColumnEncodingKind kind) {
   return folly::to<std::string>("unknown - ", kind);
 }
 
-StreamIdentifier EncodingKey::forKind(const proto::Stream_Kind kind) const {
-  return StreamIdentifier(node, sequence, 0, kind);
+DwrfStreamIdentifier EncodingKey::forKind(const proto::Stream_Kind kind) const {
+  return DwrfStreamIdentifier(node, sequence, 0, kind);
 }
 
 } // namespace facebook::velox::dwrf

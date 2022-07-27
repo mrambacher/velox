@@ -14,6 +14,7 @@
 add_library(
   velox_exec
   Aggregate.cpp
+  AggregateFunctionRegistry.cpp
   AggregationMasks.cpp
   ContainerRowSerde.cpp
   CrossJoinBuild.cpp
@@ -22,11 +23,14 @@ add_library(
   EnforceSingleRow.cpp
   Exchange.cpp
   FilterProject.cpp
+  GroupId.cpp
   GroupingSet.cpp
   HashAggregation.cpp
   HashBuild.cpp
   HashPartitionFunction.cpp
   HashProbe.cpp
+  Spill.cpp
+  Spiller.cpp
   HashTable.cpp
   JoinBridge.cpp
   Limit.cpp
@@ -40,7 +44,9 @@ add_library(
   OrderBy.cpp
   PartitionedOutput.cpp
   PartitionedOutputBufferManager.cpp
+  PlanNodeStats.cpp
   RowContainer.cpp
+  Spiller.cpp
   StreamingAggregation.cpp
   TableScan.cpp
   TableWriter.cpp
@@ -53,6 +59,7 @@ add_library(
 
 target_link_libraries(
   velox_exec
+  velox_file
   velox_core
   velox_vector
   velox_connector

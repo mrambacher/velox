@@ -19,15 +19,18 @@
 #include <folly/Random.h>
 #include <folly/init/Init.h>
 
-#include "velox/expression/tests/VectorFuzzer.h"
-#include "velox/row/UnsafeRowDeserializer.h"
+#include "velox/row/UnsafeRowBatchDeserializer.h"
 #include "velox/row/UnsafeRowDynamicSerializer.h"
 #include "velox/type/Type.h"
 #include "velox/vector/BaseVector.h"
 #include "velox/vector/ComplexVector.h"
+#include "velox/vector/fuzzer/VectorFuzzer.h"
+#include "velox/vector/tests/VectorTestBase.h"
 
 namespace facebook::velox::row {
 namespace {
+
+using namespace facebook::velox::test;
 
 class UnsafeRowFuzzTests : public ::testing::Test {
  public:
@@ -36,38 +39,32 @@ class UnsafeRowFuzzTests : public ::testing::Test {
   }
 
   void clearBuffer() {
-    std::memset(buffer_, 0, 1024);
-  }
-
-  void assertEqualVectors(
-      const VectorPtr& expected,
-      const VectorPtr& actual,
-      const std::string& additionalContext = "") {
-    for (auto i = 0; i < expected->size(); i++) {
-      ASSERT_TRUE(expected->equalValueAt(actual.get(), i, i))
-          << "at " << i << ": " << expected->toString(i) << " vs. "
-          << actual->toString(i) << additionalContext;
-    }
+    std::memset(buffer_, 0, BUFFER_SIZE);
   }
 
   std::unique_ptr<memory::ScopedMemoryPool> pool_ =
       memory::getDefaultScopedMemoryPool();
-  BufferPtr bufferPtr_ = AlignedBuffer::allocate<char>(1024, pool_.get(), true);
+  BufferPtr bufferPtr_ =
+      AlignedBuffer::allocate<char>(BUFFER_SIZE, pool_.get(), true);
   char* buffer_ = bufferPtr_->asMutable<char>();
+  static constexpr uint64_t BUFFER_SIZE = 20 << 10; // 20k
 };
 
 TEST_F(UnsafeRowFuzzTests, simpleTypeRoundTripTest) {
-  auto rowType = ROW({
-      BOOLEAN(),
-      TINYINT(),
-      SMALLINT(),
-      INTEGER(),
-      BIGINT(),
-      REAL(),
-      DOUBLE(),
-      VARCHAR(),
-      TIMESTAMP(),
-  });
+  auto rowType = ROW(
+      {BOOLEAN(),
+       TINYINT(),
+       SMALLINT(),
+       INTEGER(),
+       BIGINT(),
+       REAL(),
+       DOUBLE(),
+       VARCHAR(),
+       TIMESTAMP(),
+       ROW({VARCHAR(), INTEGER()}),
+       ARRAY(INTEGER()),
+       ARRAY(INTEGER()),
+       MAP(VARCHAR(), ARRAY(INTEGER()))});
 
   VectorFuzzer::Options opts;
   opts.vectorSize = 1;
@@ -76,6 +73,7 @@ TEST_F(UnsafeRowFuzzTests, simpleTypeRoundTripTest) {
   opts.stringLength = 20;
   // Spark uses microseconds to store timestamp
   opts.useMicrosecondPrecisionTimestamp = true;
+  opts.containerLength = 65;
 
   auto seed = folly::Random::rand32();
   LOG(INFO) << "seed: " << seed;
@@ -91,7 +89,7 @@ TEST_F(UnsafeRowFuzzTests, simpleTypeRoundTripTest) {
 
     // Deserialize previous bytes back to row vector
     VectorPtr outputVector =
-        UnsafeRowDynamicVectorDeserializer::deserializeComplex(
+        UnsafeRowDynamicVectorBatchDeserializer::deserializeComplex(
             std::string_view(buffer_, rowSize.value()), rowType, pool_.get());
 
     assertEqualVectors(

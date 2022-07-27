@@ -18,7 +18,21 @@
 #include "velox/vector/FlatVector.h"
 #include "velox/vector/tests/VectorMaker.h"
 
+#include <gtest/gtest.h>
+
 namespace facebook::velox::test {
+
+/// Returns indices buffer with sequential values going from size - 1 to 0.
+BufferPtr makeIndicesInReverse(vector_size_t size, memory::MemoryPool* pool);
+
+// TODO: enable ASSERT_EQ for vectors.
+void assertEqualVectors(
+    const VectorPtr& expected,
+    const VectorPtr& actual,
+    const std::string& additionalContext = "");
+
+/// Verify that 'vector' is copyable, by copying all rows.
+void assertCopyableVector(const VectorPtr& vector);
 
 class VectorTestBase {
  protected:
@@ -304,13 +318,14 @@ class VectorTestBase {
   //   EXPECT_EQ(3, arrayVector->size());
   template <typename T>
   ArrayVectorPtr makeNullableArrayVector(
-      const std::vector<std::vector<std::optional<T>>>& data) {
+      const std::vector<std::vector<std::optional<T>>>& data,
+      const TypePtr& type = ARRAY(CppToType<T>::create())) {
     std::vector<std::optional<std::vector<std::optional<T>>>> convData;
     convData.reserve(data.size());
     for (auto& array : data) {
       convData.push_back(array);
     }
-    return vectorMaker_.arrayVectorNullable<T>(convData);
+    return vectorMaker_.arrayVectorNullable<T>(convData, type);
   }
 
   template <typename T>
@@ -324,8 +339,10 @@ class VectorTestBase {
       vector_size_t size,
       std::function<vector_size_t(vector_size_t /* row */)> sizeAt,
       std::function<T(vector_size_t /* idx */)> valueAt,
-      std::function<bool(vector_size_t /*row */)> isNullAt = nullptr) {
-    return vectorMaker_.arrayVector<T>(size, sizeAt, valueAt, isNullAt);
+      std::function<bool(vector_size_t /* row */)> isNullAt = nullptr,
+      std::function<bool(vector_size_t /* idx */)> valueIsNullAt = nullptr) {
+    return vectorMaker_.arrayVector<T>(
+        size, sizeAt, valueAt, isNullAt, valueIsNullAt);
   }
 
   template <typename T>
@@ -364,16 +381,20 @@ class VectorTestBase {
       std::function<TKey(vector_size_t /* idx */)> keyAt,
       std::function<TValue(vector_size_t /* idx */)> valueAt,
       std::function<bool(vector_size_t /*row */)> isNullAt = nullptr,
-      std::function<bool(vector_size_t /*row */)> valueIsNullAt = nullptr) {
+      std::function<bool(vector_size_t /*row */)> valueIsNullAt = nullptr,
+      const TypePtr& type =
+          MAP(CppToType<TKey>::create(), CppToType<TValue>::create())) {
     return vectorMaker_.mapVector<TKey, TValue>(
-        size, sizeAt, keyAt, valueAt, isNullAt, valueIsNullAt);
+        size, sizeAt, keyAt, valueAt, isNullAt, valueIsNullAt, type);
   }
 
   // Create map vector from nested std::vector representation.
   template <typename TKey, typename TValue>
   MapVectorPtr makeMapVector(
       const std::vector<std::vector<std::pair<TKey, std::optional<TValue>>>>&
-          maps) {
+          maps,
+      const TypePtr& type =
+          MAP(CppToType<TKey>::create(), CppToType<TValue>::create())) {
     std::vector<vector_size_t> lengths;
     std::vector<TKey> keys;
     std::vector<TValue> values;
@@ -395,7 +416,67 @@ class VectorTestBase {
         [&](vector_size_t idx) { return keys[idx]; },
         [&](vector_size_t idx) { return values[idx]; },
         nullptr,
+        [&](vector_size_t idx) { return nullValues[idx]; },
+        type);
+  }
+
+  // Create nullabe map vector from nested std::vector representation.
+  template <typename TKey, typename TValue>
+  MapVectorPtr makeNullableMapVector(
+      const std::vector<
+          std::optional<std::vector<std::pair<TKey, std::optional<TValue>>>>>&
+          maps) {
+    std::vector<vector_size_t> lengths;
+    std::vector<TKey> keys;
+    std::vector<TValue> values;
+    std::vector<bool> nullValues;
+    std::vector<bool> nullRow;
+
+    auto undefined = TValue();
+
+    for (const auto& map : maps) {
+      if (!map.has_value()) {
+        nullRow.push_back(true);
+        lengths.push_back(0);
+        continue;
+      }
+      nullRow.push_back(false);
+      lengths.push_back(map->size());
+      for (const auto& [key, value] : map.value()) {
+        keys.push_back(key);
+        values.push_back(value.value_or(undefined));
+        nullValues.push_back(!value.has_value());
+      }
+    }
+
+    return makeMapVector<TKey, TValue>(
+        maps.size(),
+        [&](vector_size_t row) { return lengths[row]; },
+        [&](vector_size_t idx) { return keys[idx]; },
+        [&](vector_size_t idx) { return values[idx]; },
+        [&](vector_size_t row) { return nullRow[row]; },
         [&](vector_size_t idx) { return nullValues[idx]; });
+  }
+
+  // Convenience function to create vector from vectors of keys and values.
+  // The size of the maps is computed from the difference of offsets.
+  // The sizes of the key and value vectors must be equal.
+  // An optional vector of nulls can be passed to specify null rows.
+  // The offset for a null value must match previous offset
+  // i.e size computed should be zero.
+  // Example:
+  //   auto mapVector = makeMapVector({0, 2 ,2}, keyVector, valueVector, {1});
+  //
+  //   creates a map vector with map at index 1 as null.
+  // You can make higher order MapVectors (i.e maps with maps as values etc),
+  // by repeatedly calling this function and passing in resultant MapVector
+  // and appropriate offsets.
+  MapVectorPtr makeMapVector(
+      const std::vector<vector_size_t>& offsets,
+      const VectorPtr& keyVector,
+      const VectorPtr& valueVector,
+      const std::vector<vector_size_t>& nulls = {}) {
+    return vectorMaker_.mapVector(offsets, keyVector, valueVector, nulls);
   }
 
   template <typename T>
@@ -411,7 +492,7 @@ class VectorTestBase {
         /*isNull=*/!value.has_value(),
         CppToType<T>::create(),
         value ? EvalType<T>(*value) : EvalType<T>(),
-        cdvi::EMPTY_METADATA,
+        SimpleVectorStats<EvalType<T>>{},
         sizeof(EvalType<T>));
   }
 
@@ -436,13 +517,12 @@ class VectorTestBase {
   BufferPtr makeEvenIndices(vector_size_t size);
 
   BufferPtr makeIndicesInReverse(vector_size_t size) {
-    BufferPtr indices = AlignedBuffer::allocate<vector_size_t>(size, pool());
-    auto rawIndices = indices->asMutable<vector_size_t>();
-    for (auto i = 0; i < size; ++i) {
-      rawIndices[i] = size - 1 - i;
-    }
-    return indices;
+    return ::facebook::velox::test::makeIndicesInReverse(size, pool());
   }
+
+  BufferPtr makeNulls(
+      vector_size_t size,
+      std::function<bool(vector_size_t /*row*/)> isNullAt);
 
   static VectorPtr
   wrapInDictionary(BufferPtr indices, vector_size_t size, VectorPtr vector);

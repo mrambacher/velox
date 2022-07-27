@@ -61,7 +61,7 @@ void FlatVector<bool>::copyValuesAndNulls(
   }
   uint64_t* rawValues = reinterpret_cast<uint64_t*>(rawValues_);
   if (source->encoding() == VectorEncoding::Simple::FLAT) {
-    auto flat = source->as<FlatVector<bool>>();
+    auto flat = source->asUnchecked<FlatVector<bool>>();
     auto* sourceValues = source->typeKind() != TypeKind::UNKNOWN
         ? flat->rawValues<uint64_t>()
         : nullptr;
@@ -99,7 +99,7 @@ void FlatVector<bool>::copyValuesAndNulls(
       }
     }
   } else if (source->isConstantEncoding()) {
-    auto constant = source->as<ConstantVector<bool>>();
+    auto constant = source->asUnchecked<ConstantVector<bool>>();
     if (constant->isNullAt(0)) {
       addNulls(nullptr, rows);
       return;
@@ -112,11 +112,9 @@ void FlatVector<bool>::copyValuesAndNulls(
       bits::andWithNegatedBits(
           rawValues, range.bits(), range.begin(), range.end());
     }
-    if (rawNulls) {
-      bits::orBits(rawNulls, rows.asRange().bits(), rows.begin(), rows.end());
-    }
+    rows.clearNulls(rawNulls);
   } else {
-    auto sourceVector = source->as<SimpleVector<bool>>();
+    auto sourceVector = source->asUnchecked<SimpleVector<bool>>();
     rows.applyToSelected([&](auto row) {
       int32_t sourceRow = toSourceRow ? toSourceRow[row] : row;
       if (!source->isNullAt(sourceRow)) {
@@ -152,7 +150,7 @@ void FlatVector<bool>::copyValuesAndNulls(
   if (source->encoding() == VectorEncoding::Simple::FLAT) {
     if (source->typeKind() != TypeKind::UNKNOWN) {
       auto* sourceValues =
-          source->as<FlatVector<bool>>()->rawValues<uint64_t>();
+          source->asUnchecked<FlatVector<bool>>()->rawValues<uint64_t>();
       bits::copyBits(sourceValues, sourceIndex, rawValues, targetIndex, count);
     }
     if (rawNulls) {
@@ -164,7 +162,7 @@ void FlatVector<bool>::copyValuesAndNulls(
       }
     }
   } else if (source->isConstantEncoding()) {
-    auto constant = source->as<ConstantVector<bool>>();
+    auto constant = source->asUnchecked<ConstantVector<bool>>();
     if (constant->isNullAt(0)) {
       bits::fillBits(rawNulls, targetIndex, targetIndex + count, bits::kNull);
       return;
@@ -199,16 +197,55 @@ void FlatVector<bool>::copyValuesAndNulls(
 
 template <>
 Buffer* FlatVector<StringView>::getBufferWithSpace(vector_size_t size) {
+  // Check if the last buffer is uniquely referenced and has enough space.
   Buffer* buffer =
       stringBuffers_.empty() ? nullptr : stringBuffers_.back().get();
-  if (buffer && buffer->size() + size <= buffer->capacity()) {
+  if (buffer && buffer->unique() &&
+      buffer->size() + size <= buffer->capacity()) {
     return buffer;
   }
+
+  // Allocate a new buffer.
   int32_t newSize = std::max(kInitialStringSize, size);
   BufferPtr newBuffer = AlignedBuffer::allocate<char>(newSize, pool());
   newBuffer->setSize(0);
   stringBuffers_.push_back(newBuffer);
   return stringBuffers_.back().get();
+}
+
+template <>
+void FlatVector<StringView>::prepareForReuse() {
+  BaseVector::prepareForReuse();
+
+  // Check values buffer. Keep the buffer if singly-referenced and mutable.
+  // Reset otherwise.
+  if (values_ && !(values_->unique() && values_->isMutable())) {
+    values_ = nullptr;
+    rawValues_ = nullptr;
+  }
+
+  // Check string buffers. Keep at most one singly-referenced buffer if it is
+  // not too large.
+  if (!stringBuffers_.empty()) {
+    auto& firstBuffer = stringBuffers_.front();
+    if (firstBuffer->unique() && firstBuffer->isMutable() &&
+        firstBuffer->capacity() <= kMaxStringSizeForReuse) {
+      firstBuffer->setSize(0);
+      stringBuffers_.resize(1);
+    } else {
+      stringBuffers_.clear();
+    }
+  }
+
+  // Clear the StringViews to avoid referencing freed memory.
+  if (rawValues_) {
+    for (auto i = 0; i < BaseVector::length_; ++i) {
+      rawValues_[i] = StringView();
+    }
+  }
+
+  // Clear ASCII-ness.
+  SimpleVector<StringView>::invalidateIsAscii();
 }
 
 template <>
@@ -230,7 +267,7 @@ void FlatVector<StringView>::set(vector_size_t idx, StringView value) {
 
 /// For types that requires buffer allocation this should be called only if
 /// value is inlined or if value is already allocated in a buffer within the
-/// vector. Used by StringProxy to allow UDFs to write directly into the
+/// vector. Used by StringWriter to allow UDFs to write directly into the
 /// buffers and avoid copying.
 template <>
 void FlatVector<StringView>::setNoCopy(
@@ -253,7 +290,7 @@ void FlatVector<T>::acquireSharedStringBuffers(const BaseVector* source) {
   }
   switch (leaf->encoding()) {
     case VectorEncoding::Simple::FLAT: {
-      auto* flat = leaf->as<FlatVector<StringView>>();
+      auto* flat = leaf->asUnchecked<FlatVector<StringView>>();
       for (auto& buffer : flat->stringBuffers_) {
         if (std::find(stringBuffers_.begin(), stringBuffers_.end(), buffer) ==
             stringBuffers_.end())
@@ -285,8 +322,27 @@ void FlatVector<StringView>::copy(
     const BaseVector* source,
     const SelectivityVector& rows,
     const vector_size_t* toSourceRow) {
+  if (!rows.hasSelections()) {
+    return;
+  }
+
+  // Source can be of Unknown type, in that case it should have null values.
+  if (source->typeKind() == TypeKind::UNKNOWN) {
+    if (source->isConstantEncoding()) {
+      DCHECK(source->isNullAt(0));
+      rows.applyToSelected([&](vector_size_t row) { setNull(row, true); });
+    } else {
+      rows.applyToSelected([&](vector_size_t row) {
+        auto sourceRow = toSourceRow ? toSourceRow[row] : row;
+        DCHECK(source->isNullAt(sourceRow));
+        setNull(row, true);
+      });
+    }
+    return;
+  }
+
   auto leaf = source->wrappedVector()->asUnchecked<SimpleVector<StringView>>();
-  VELOX_CHECK(leaf, "Assigning non-string to string");
+
   if (pool_ == leaf->pool()) {
     // We copy referencing the storage of 'source'.
     copyValuesAndNulls(source, rows, toSourceRow);
@@ -325,8 +381,7 @@ void FlatVector<StringView>::copy(
     vector_size_t targetIndex,
     vector_size_t sourceIndex,
     vector_size_t count) {
-  auto leaf = source->wrappedVector()->as<SimpleVector<StringView>>();
-  VELOX_CHECK(leaf, "Assigning non-string to string");
+  auto leaf = source->wrappedVector()->asUnchecked<SimpleVector<StringView>>();
   if (pool_ == leaf->pool()) {
     // We copy referencing the storage of 'source'.
     copyValuesAndNulls(source, targetIndex, sourceIndex, count);

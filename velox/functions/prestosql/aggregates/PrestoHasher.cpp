@@ -108,6 +108,15 @@ FOLLY_ALWAYS_INLINE void PrestoHasher::hash<TypeKind::DATE>(
 }
 
 template <>
+FOLLY_ALWAYS_INLINE void PrestoHasher::hash<TypeKind::INTERVAL_DAY_TIME>(
+    const SelectivityVector& rows,
+    BufferPtr& hashes) {
+  applyHashFunction(rows, *vector_.get(), hashes, [&](auto row) {
+    return hashInteger(vector_->valueAt<IntervalDayTime>(row).milliseconds());
+  });
+}
+
+template <>
 FOLLY_ALWAYS_INLINE void PrestoHasher::hash<TypeKind::REAL>(
     const SelectivityVector& rows,
     BufferPtr& hashes) {
@@ -251,7 +260,7 @@ void PrestoHasher::hash<TypeKind::ROW>(
     // Hash only timestamp value.
     children_[0]->hash(baseRow->childAt(0), elementRows, childHashes);
     rows.applyToSelected([&](auto row) {
-      if (!baseRow->isNullAt(row)) {
+      if (!baseRow->isNullAt(indices[row])) {
         rawHashes[row] = rowChildHashes[indices[row]];
       } else {
         rawHashes[row] = 0;

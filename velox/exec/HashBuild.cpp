@@ -23,21 +23,29 @@ namespace facebook::velox::exec {
 void HashJoinBridge::setHashTable(std::unique_ptr<BaseHashTable> table) {
   VELOX_CHECK(table, "setHashTable called with null table");
 
-  std::lock_guard<std::mutex> l(mutex_);
-  VELOX_CHECK(!table_, "setHashTable may be called only once");
-  // Ownership becomes shared.
-  table_.reset(table.release());
-  notifyConsumersLocked();
+  std::vector<ContinuePromise> promises;
+  {
+    std::lock_guard<std::mutex> l(mutex_);
+    VELOX_CHECK(!table_, "setHashTable may be called only once");
+    // Ownership becomes shared.
+    table_.reset(table.release());
+    promises = std::move(promises_);
+  }
+  notify(std::move(promises));
 }
 
 void HashJoinBridge::setAntiJoinHasNullKeys() {
-  std::lock_guard<std::mutex> l(mutex_);
-  VELOX_CHECK(
-      !table_,
-      "Only one of setAntiJoinHasNullKeys or setHashTable may be called");
+  std::vector<ContinuePromise> promises;
+  {
+    std::lock_guard<std::mutex> l(mutex_);
+    VELOX_CHECK(
+        !table_,
+        "Only one of setAntiJoinHasNullKeys or setHashTable may be called");
 
-  antiJoinHasNullKeys_ = true;
-  notifyConsumersLocked();
+    antiJoinHasNullKeys_ = true;
+    promises = std::move(promises_);
+  }
+  notify(std::move(promises));
 }
 
 std::optional<HashJoinBridge::HashBuildResult> HashJoinBridge::tableOrFuture(
@@ -90,7 +98,7 @@ HashBuild::HashBuild(
     }
   }
 
-  if (joinNode->isRightJoin()) {
+  if (joinNode->isRightJoin() || joinNode->isFullJoin()) {
     // Do not ignore null keys.
     table_ = HashTable<false>::createForJoin(
         std::move(keyHashers),
@@ -99,15 +107,15 @@ HashBuild::HashBuild(
         true, // hasProbedFlag
         mappedMemory_);
   } else {
-    // Semi and anti join only needs to know whether there is a match. Hence, no
-    // need to store entries with duplicate keys.
-    const bool allowDuplicates =
-        !joinNode->isSemiJoin() && !joinNode->isAntiJoin();
+    // Semi and anti join with no extra filter only needs to know whether there
+    // is a match. Hence, no need to store entries with duplicate keys.
+    const bool dropDuplicates = !joinNode->filter() &&
+        (joinNode->isSemiJoin() || joinNode->isAntiJoin());
 
     table_ = HashTable<true>::createForJoin(
         std::move(keyHashers),
         dependentTypes,
-        allowDuplicates,
+        !dropDuplicates, // allowDuplicates
         false, // hasProbedFlag
         mappedMemory_);
   }
@@ -117,7 +125,7 @@ HashBuild::HashBuild(
 void HashBuild::addInput(RowVectorPtr input) {
   activeRows_.resize(input->size());
   activeRows_.setAll();
-  if (!isRightJoin(joinType_)) {
+  if (!isRightJoin(joinType_) && !isFullJoin(joinType_)) {
     deselectRowsWithNulls(
         *input, keyChannels_, activeRows_, *operatorCtx_->execCtx());
   }
@@ -183,7 +191,7 @@ void HashBuild::noMoreInput() {
   }
 
   Operator::noMoreInput();
-  std::vector<VeloxPromise<bool>> promises;
+  std::vector<ContinuePromise> promises;
   std::vector<std::shared_ptr<Driver>> peers;
   // The last Driver to hit HashBuild::finish gathers the data from
   // all build Drivers and hands it over to the probe side. At this
@@ -241,12 +249,14 @@ void HashBuild::addRuntimeStats() {
   uint64_t asRange;
   uint64_t asDistinct;
   for (auto i = 0; i < hashers.size(); i++) {
-    hashers[i]->cardinality(asRange, asDistinct);
+    hashers[i]->cardinality(0, asRange, asDistinct);
     if (asRange != VectorHasher::kRangeTooLarge) {
-      stats_.addRuntimeStat(fmt::format("rangeKey{}", i), asRange);
+      stats_.addRuntimeStat(
+          fmt::format("rangeKey{}", i), RuntimeCounter(asRange));
     }
     if (asDistinct != VectorHasher::kRangeTooLarge) {
-      stats_.addRuntimeStat(fmt::format("distinctKey{}", i), asDistinct);
+      stats_.addRuntimeStat(
+          fmt::format("distinctKey{}", i), RuntimeCounter(asDistinct));
     }
   }
 }

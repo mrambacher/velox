@@ -16,7 +16,7 @@
 
 #pragma once
 
-#include "gtest/gtest_prod.h"
+#include "velox/common/base/GTestMacros.h"
 #include "velox/dwio/dwrf/writer/WriterContext.h"
 #include "velox/dwio/dwrf/writer/WriterSink.h"
 
@@ -57,6 +57,11 @@ class WriterBase {
     return *writerSink_;
   }
 
+  const WriterSink& getSink() const {
+    DWIO_ENSURE_NOT_NULL(writerSink_);
+    return *writerSink_;
+  }
+
   void addUserMetadata(const std::string& key, const std::string& value) {
     userMetadata_[key] = value;
   }
@@ -87,7 +92,7 @@ class WriterBase {
   }
 
   template <typename T>
-  void writeProto(const T& t, CompressionKind kind) {
+  void writeProto(const T& t, dwio::common::CompressionKind kind) {
     auto holder = context_->newDataBufferHolder();
     auto stream = context_->newStream(kind, *holder);
 
@@ -136,7 +141,7 @@ class WriterBase {
   }
 
   void validateStreamSize(
-      const StreamIdentifier& streamId,
+      const DwrfStreamIdentifier& streamId,
       uint64_t streamSize) {
     if (context_->isStreamSizeAboveThresholdCheckEnabled) {
       // Jolly doesn't support Streams bigger than 2GB.
@@ -158,7 +163,7 @@ class WriterBase {
   void writeUserMetadata(uint32_t writerVersion);
 
   friend class WriterTest;
-  FRIEND_TEST(WriterBaseTest, FlushWriterSinkUponClose);
+  VELOX_FRIEND_TEST(WriterBaseTest, FlushWriterSinkUponClose);
 };
 
 } // namespace facebook::velox::dwrf

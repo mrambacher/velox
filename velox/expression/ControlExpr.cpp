@@ -23,28 +23,30 @@ namespace facebook::velox::exec {
 
 void ConstantExpr::evalSpecialForm(
     const SelectivityVector& rows,
-    EvalCtx* context,
-    VectorPtr* result) {
+    EvalCtx& context,
+    VectorPtr& result) {
+  ExceptionContextSetter exceptionContext(
+      {[](auto* expr) { return static_cast<Expr*>(expr)->toString(); }, this});
+
   if (!sharedSubexprValues_) {
     sharedSubexprValues_ =
-        BaseVector::createConstant(value_, 1, context->execCtx()->pool());
+        BaseVector::createConstant(value_, 1, context.execCtx()->pool());
   }
 
   if (needToSetIsAscii_) {
     auto* vector =
         sharedSubexprValues_->asUnchecked<SimpleVector<StringView>>();
-    LocalSelectivityVector singleRow(context, 1);
-    singleRow.get()->setAll();
-    bool isAscii = vector->computeAndSetIsAscii(*singleRow.get());
+    LocalSelectivityVector singleRow(context);
+    bool isAscii = vector->computeAndSetIsAscii(*singleRow.get(1, true));
     vector->setAllIsAscii(isAscii);
     needToSetIsAscii_ = false;
   }
 
   if (sharedSubexprValues_.unique()) {
     sharedSubexprValues_->resize(rows.end());
-    context->moveOrCopyResult(sharedSubexprValues_, rows, result);
+    context.moveOrCopyResult(sharedSubexprValues_, rows, result);
   } else {
-    context->moveOrCopyResult(
+    context.moveOrCopyResult(
         BaseVector::wrapInConstant(rows.end(), 0, sharedSubexprValues_),
         rows,
         result);
@@ -53,42 +55,57 @@ void ConstantExpr::evalSpecialForm(
 
 void ConstantExpr::evalSpecialFormSimplified(
     const SelectivityVector& rows,
-    EvalCtx* context,
-    VectorPtr* result) {
+    EvalCtx& context,
+    VectorPtr& result) {
+  ExceptionContextSetter exceptionContext(
+      {[](auto* expr) { return static_cast<Expr*>(expr)->toString(); }, this});
+
   // Simplified path should never ask us to write to a vector that was already
   // pre-allocated.
-  VELOX_CHECK(*result == nullptr);
+  VELOX_CHECK(result == nullptr);
 
   if (sharedSubexprValues_ == nullptr) {
-    *result = BaseVector::createConstant(value_, rows.end(), context->pool());
+    result = BaseVector::createConstant(value_, rows.end(), context.pool());
   } else {
-    *result = BaseVector::wrapInConstant(rows.end(), 0, sharedSubexprValues_);
+    result = BaseVector::wrapInConstant(rows.end(), 0, sharedSubexprValues_);
+  }
+}
+
+std::string ConstantExpr::toString(bool /*recursive*/) const {
+  if (sharedSubexprValues_ == nullptr) {
+    return fmt::format("{}:{}", value_.toJson(), type()->toString());
+  } else {
+    return fmt::format(
+        "{}:{}", sharedSubexprValues_->toString(0), type()->toString());
   }
 }
 
 void FieldReference::evalSpecialForm(
     const SelectivityVector& rows,
-    EvalCtx* context,
-    VectorPtr* result) {
-  if (*result) {
-    BaseVector::ensureWritable(rows, type_, context->pool(), result);
+    EvalCtx& context,
+    VectorPtr& result) {
+  ExceptionContextSetter exceptionContext(
+      {[](auto* expr) { return static_cast<Expr*>(expr)->toString(); }, this});
+
+  if (result) {
+    BaseVector::ensureWritable(rows, type_, context.pool(), &result);
   }
   const RowVector* row;
   DecodedVector decoded;
   VectorPtr input;
   bool useDecode = false;
   if (inputs_.empty()) {
-    row = context->row();
+    row = context.row();
   } else {
-    inputs_[0]->eval(rows, context, &input);
+    inputs_[0]->eval(rows, context, input);
 
     if (auto rowTry = input->as<RowVector>()) {
       // Make sure output is not copied
       if (rowTry->isCodegenOutput()) {
         auto rowType = dynamic_cast<const RowType*>(rowTry->type().get());
         index_ = rowType->getChildIdx(field_);
-        *result = std::move(rowTry->childAt(index_));
-        VELOX_CHECK(result->unique());
+        result = std::move(rowTry->childAt(index_));
+        VELOX_CHECK(result.unique());
         return;
       }
     }
@@ -106,16 +123,16 @@ void FieldReference::evalSpecialForm(
   }
   // If we refer to a column of the context row, this may have been
   // peeled due to peeling off encoding, hence access it via
-  // 'context'.  Chekc if the child is unique before taking the second
+  // 'context'.  Check if the child is unique before taking the second
   // reference. Unique constant vectors can be resized in place, non-unique
   // must be copied to set the size.
-  bool isUniqueChild = inputs_.empty() ? context->getField(index_).unique()
+  bool isUniqueChild = inputs_.empty() ? context.getField(index_).unique()
                                        : row->childAt(index_).unique();
   VectorPtr child =
-      inputs_.empty() ? context->getField(index_) : row->childAt(index_);
-  if (result->get()) {
+      inputs_.empty() ? context.getField(index_) : row->childAt(index_);
+  if (result.get()) {
     auto indices = useDecode ? decoded.indices() : nullptr;
-    (*result)->copy(child.get(), rows, indices);
+    result->copy(child.get(), rows, indices);
   } else {
     if (child->encoding() == VectorEncoding::Simple::LAZY) {
       child = BaseVector::loadedVectorShared(child);
@@ -131,36 +148,41 @@ void FieldReference::evalSpecialForm(
         child = BaseVector::wrapInConstant(rows.size(), 0, child);
       }
     }
-    *result = useDecode ? std::move(decoded.wrap(child, *input.get(), rows))
-                        : std::move(child);
+    result = useDecode ? std::move(decoded.wrap(child, *input.get(), rows))
+                       : std::move(child);
   }
 }
 
 void FieldReference::evalSpecialFormSimplified(
     const SelectivityVector& rows,
-    EvalCtx* context,
-    VectorPtr* result) {
-  auto row = context->row();
-  *result = row->childAt(index(context));
-  BaseVector::flattenVector(result, rows.end());
+    EvalCtx& context,
+    VectorPtr& result) {
+  ExceptionContextSetter exceptionContext(
+      {[](auto* expr) { return static_cast<Expr*>(expr)->toString(); }, this});
+
+  auto row = context.row();
+  result = row->childAt(index(context));
+  BaseVector::flattenVector(&result, rows.end());
 }
 
 void SwitchExpr::evalSpecialForm(
     const SelectivityVector& rows,
-    EvalCtx* context,
-    VectorPtr* result) {
-  LocalSelectivityVector remainingRows(context, rows.end());
-  *remainingRows.get() = rows;
+    EvalCtx& context,
+    VectorPtr& result) {
+  ExceptionContextSetter exceptionContext(
+      {[](auto* expr) { return static_cast<Expr*>(expr)->toString(); }, this});
 
-  LocalSelectivityVector thenRows(context, rows.end());
+  LocalSelectivityVector remainingRows(context, rows);
+
+  LocalSelectivityVector thenRows(context);
 
   VectorPtr condition;
   const uint64_t* values;
 
   // SWITCH: fix finalSelection at "rows" unless already fixed
   VarSetter finalSelection(
-      context->mutableFinalSelection(), &rows, context->isFinalSelection());
-  VarSetter isFinalSelection(context->mutableIsFinalSelection(), false);
+      context.mutableFinalSelection(), &rows, context.isFinalSelection());
+  VarSetter isFinalSelection(context.mutableIsFinalSelection(), false);
 
   const bool isString = type()->kind() == TypeKind::VARCHAR;
 
@@ -170,7 +192,7 @@ void SwitchExpr::evalSpecialForm(
     }
 
     // evaluate the case condition
-    inputs_[2 * i]->eval(*remainingRows.get(), context, &condition);
+    inputs_[2 * i]->eval(*remainingRows.get(), context, condition);
 
     auto booleanMix = getFlatBool(
         condition.get(),
@@ -190,7 +212,7 @@ void SwitchExpr::evalSpecialForm(
         continue;
       default: {
         bits::andBits(
-            thenRows.get()->asMutableRange().bits(),
+            thenRows.get(rows.end(), false)->asMutableRange().bits(),
             remainingRows.get()->asRange().bits(),
             values,
             0,
@@ -198,9 +220,9 @@ void SwitchExpr::evalSpecialForm(
         thenRows.get()->updateBounds();
 
         if (thenRows.get()->hasSelections()) {
-          if (*result) {
+          if (result) {
             BaseVector::ensureWritable(
-                *thenRows.get(), (*result)->type(), context->pool(), result);
+                *thenRows.get(), result->type(), context.pool(), &result);
           }
 
           inputs_[2 * i + 1]->eval(*thenRows.get(), context, result);
@@ -212,9 +234,9 @@ void SwitchExpr::evalSpecialForm(
 
   // Evaluate the "else" clause.
   if (remainingRows.get()->hasSelections()) {
-    if (*result) {
+    if (result) {
       BaseVector::ensureWritable(
-          *remainingRows.get(), (*result)->type(), context->pool(), result);
+          *remainingRows.get(), result->type(), context.pool(), &result);
     }
 
     if (hasElseClause_) {
@@ -223,7 +245,7 @@ void SwitchExpr::evalSpecialForm(
     } else {
       // fill in nulls for remainingRows
       remainingRows.get()->applyToSelected(
-          [&](auto row) { (*result)->setNull(row, true); });
+          [&](auto row) { result->setNull(row, true); });
     }
   }
 }
@@ -272,19 +294,19 @@ namespace {
 uint64_t* rowsWithError(
     const SelectivityVector& rows,
     const SelectivityVector& activeRows,
-    EvalCtx* context,
-    EvalCtx::ErrorVectorPtr* previousErrors,
+    EvalCtx& context,
+    EvalCtx::ErrorVectorPtr& previousErrors,
     LocalSelectivityVector& errorRowsHolder) {
-  auto errors = context->errors();
+  auto errors = context.errors();
   if (!errors) {
     // No new errors. Put the old errors back.
-    context->swapErrors(previousErrors);
+    context.swapErrors(previousErrors);
     return nullptr;
   }
   uint64_t* errorMask = nullptr;
   SelectivityVector* errorRows = errorRowsHolder.get();
   if (!errorRows) {
-    errorRows = errorRowsHolder.get(rows.end());
+    errorRows = errorRowsHolder.get(rows.end(), false);
   }
   errorMask = errorRows->asMutableRange().bits();
   std::fill(errorMask, errorMask + bits::nwords(rows.end()), 0);
@@ -296,18 +318,18 @@ uint64_t* rowsWithError(
       errors->rawNulls(),
       rows.begin(),
       std::min(errors->size(), rows.end()));
-  if (*previousErrors) {
+  if (previousErrors) {
     // Add the new errors to the previous ones and free the new errors.
     bits::forEachSetBit(
         errors->rawNulls(), rows.begin(), errors->size(), [&](int32_t row) {
-          context->addError(
+          context.addError(
               row,
               *std::static_pointer_cast<std::exception_ptr>(
                   errors->valueAt(row)),
               previousErrors);
         });
-    context->swapErrors(previousErrors);
-    *previousErrors = nullptr;
+    context.swapErrors(previousErrors);
+    previousErrors = nullptr;
   }
   return errorMask;
 }
@@ -316,15 +338,14 @@ void finalizeErrors(
     const SelectivityVector& rows,
     const SelectivityVector& activeRows,
     bool throwOnError,
-    EvalCtx* context) {
-  auto errors = context->errors();
+    EvalCtx& context) {
+  auto errors = context.errors();
   if (!errors) {
     return;
   }
   // null flag of error |= initial active & ~final active.
   int32_t numWords = bits::nwords(errors->size());
-  auto errorNulls =
-      context->errors()->mutableNulls(errors->size())->asMutable<uint64_t>();
+  auto errorNulls = errors->mutableNulls(errors->size())->asMutable<uint64_t>();
   for (int32_t i = 0; i < numWords; ++i) {
     errorNulls[i] &= rows.asRange().bits()[i] & activeRows.asRange().bits()[i];
     if (throwOnError && errorNulls[i]) {
@@ -341,17 +362,20 @@ void finalizeErrors(
 
 void ConjunctExpr::evalSpecialForm(
     const SelectivityVector& rows,
-    EvalCtx* context,
-    VectorPtr* result) {
+    EvalCtx& context,
+    VectorPtr& result) {
+  ExceptionContextSetter exceptionContext(
+      {[](auto* expr) { return static_cast<Expr*>(expr)->toString(); }, this});
+
   // TODO Revisit error handling
-  bool throwOnError = *context->mutableThrowOnError();
-  VarSetter saveError(context->mutableThrowOnError(), false);
-  BaseVector::ensureWritable(rows, type(), context->pool(), result);
-  auto flatResult = (*result)->asFlatVector<bool>();
+  bool throwOnError = *context.mutableThrowOnError();
+  VarSetter saveError(context.mutableThrowOnError(), false);
+  BaseVector::ensureWritable(rows, type(), context.pool(), &result);
+  auto flatResult = result->asFlatVector<bool>();
   // clear nulls from the result for the active rows.
   if (flatResult->mayHaveNulls()) {
-    auto nulls = flatResult->mutableNulls(rows.end())->asMutable<uint64_t>();
-    bits::orBits(nulls, rows.asRange().bits(), rows.begin(), rows.end());
+    auto nulls = flatResult->mutableNulls(rows.end());
+    rows.clearNulls(nulls);
   }
   // Initialize result to all true for AND and all false for OR.
   auto values = flatResult->mutableValues(rows.end())->asMutable<uint64_t>();
@@ -364,35 +388,35 @@ void ConjunctExpr::evalSpecialForm(
 
   // OR: fix finalSelection at "rows" unless already fixed
   VarSetter finalSelectionOr(
-      context->mutableFinalSelection(),
+      context.mutableFinalSelection(),
       &rows,
-      !isAnd_ && context->isFinalSelection());
+      !isAnd_ && context.isFinalSelection());
   VarSetter isFinalSelectionOr(
-      context->mutableIsFinalSelection(), false, !isAnd_);
+      context.mutableIsFinalSelection(), false, !isAnd_);
 
   bool handleErrors = false;
   LocalSelectivityVector errorRows(context);
-  LocalSelectivityVector activeRowsHolder(context, rows.end());
+  LocalSelectivityVector activeRowsHolder(context, rows);
   auto activeRows = activeRowsHolder.get();
-  *activeRows = rows;
+  assert(activeRows); // lint
   int32_t numActive = activeRows->countSelected();
   for (int32_t i = 0; i < inputs_.size(); ++i) {
     VectorPtr inputResult;
     EvalCtx::ErrorVectorPtr errors;
     if (handleErrors) {
-      context->swapErrors(&errors);
+      context.swapErrors(errors);
     }
 
     // AND: reduce finalSelection to activeRows unless it has been fixed by IF
     // or OR above.
     VarSetter finalSelectionAnd(
-        context->mutableFinalSelection(),
+        context.mutableFinalSelection(),
         static_cast<const SelectivityVector*>(activeRows),
-        isAnd_ && context->isFinalSelection());
+        isAnd_ && context.isFinalSelection());
 
     SelectivityTimer timer(selectivity_[inputOrder_[i]], numActive);
-    inputs_[inputOrder_[i]]->eval(*activeRows, context, &inputResult);
-    if (context->errors()) {
+    inputs_[inputOrder_[i]]->eval(*activeRows, context, inputResult);
+    if (context.errors()) {
       handleErrors = true;
     }
     uint64_t* extraActive = nullptr;
@@ -400,7 +424,7 @@ void ConjunctExpr::evalSpecialForm(
       // Add rows with new errors to activeRows and merge these with
       // previous errors.
       extraActive =
-          rowsWithError(rows, *activeRows, context, &errors, errorRows);
+          rowsWithError(rows, *activeRows, context, errors, errorRows);
     }
     updateResult(inputResult.get(), context, flatResult, activeRows);
     if (extraActive) {
@@ -418,7 +442,7 @@ void ConjunctExpr::evalSpecialForm(
   // Clear errors for 'rows' that are not in 'activeRows'.
   finalizeErrors(rows, *activeRows, throwOnError, context);
   if (!reorderEnabledChecked_) {
-    reorderEnabled_ = context->execCtx()
+    reorderEnabled_ = context.execCtx()
                           ->queryCtx()
                           ->config()
                           .adaptiveFilterReorderingEnabled();
@@ -451,7 +475,7 @@ void ConjunctExpr::maybeReorderInputs() {
 
 void ConjunctExpr::updateResult(
     BaseVector* inputResult,
-    EvalCtx* context,
+    EvalCtx& context,
     FlatVector<bool>* result,
     SelectivityVector* activeRows) {
   // Set result and clear active rows for the positions that are decided.
@@ -473,11 +497,7 @@ void ConjunctExpr::updateResult(
       if (isAnd_) {
         // Clear the nulls and values for all active rows.
         if (result->mayHaveNulls()) {
-          bits::orBits(
-              result->mutableRawNulls(),
-              activeRows->asRange().bits(),
-              activeRows->begin(),
-              activeRows->end());
+          activeRows->clearNulls(result->mutableRawNulls());
         }
         bits::andWithNegatedBits(
             result->mutableRawValues<uint64_t>(),
@@ -548,7 +568,7 @@ BooleanMix refineBooleanMixNonNull(
 BooleanMix getFlatBool(
     BaseVector* vector,
     const SelectivityVector& activeRows,
-    EvalCtx* context,
+    EvalCtx& context,
     BufferPtr* tempValues,
     BufferPtr* tempNulls,
     bool mergeNullsToValues,
@@ -566,7 +586,7 @@ BooleanMix getFlatBool(
       if (nulls && mergeNullsToValues) {
         uint64_t* mergedValues;
         BaseVector::ensureBuffer<bool>(
-            size, context->pool(), tempValues, &mergedValues);
+            size, context.pool(), tempValues, &mergedValues);
 
         bits::andBits(
             mergedValues, values, nulls, activeRows.begin(), activeRows.end());
@@ -600,11 +620,11 @@ BooleanMix getFlatBool(
       uint64_t* valuesToSet = nullptr;
       if (vector->mayHaveNulls() && !mergeNullsToValues) {
         BaseVector::ensureBuffer<bool>(
-            size, context->pool(), tempNulls, &nullsToSet);
+            size, context.pool(), tempNulls, &nullsToSet);
         memset(nullsToSet, bits::kNotNullByte, bits::nbytes(size));
       }
       BaseVector::ensureBuffer<bool>(
-          size, context->pool(), tempValues, &valuesToSet);
+          size, context.pool(), tempValues, &valuesToSet);
       memset(valuesToSet, 0, bits::nbytes(size));
       DecodedVector decoded(*vector, activeRows);
       auto values = decoded.data<uint64_t>();
@@ -678,7 +698,11 @@ class ExprCallable : public Callable {
         rows.end(),
         std::move(allVectors));
     EvalCtx lambdaCtx(context->execCtx(), context->exprSet(), row.get());
-    body_->eval(rows, &lambdaCtx, result);
+    if (!context->isFinalSelection()) {
+      *lambdaCtx.mutableIsFinalSelection() = false;
+      *lambdaCtx.mutableFinalSelection() = context->finalSelection();
+    }
+    body_->eval(rows, lambdaCtx, *result);
   }
 
  private:
@@ -689,20 +713,48 @@ class ExprCallable : public Callable {
 
 } // namespace
 
+std::string LambdaExpr::toString(bool recursive) const {
+  if (!recursive) {
+    return name_;
+  }
+
+  std::string inputs;
+  for (int i = 0; i < signature_->size(); ++i) {
+    inputs.append(signature_->nameOf(i));
+    if (!inputs.empty()) {
+      inputs.append(", ");
+    }
+  }
+
+  for (const auto& field : capture_) {
+    inputs.append(field->field());
+    if (!inputs.empty()) {
+      inputs.append(", ");
+    }
+  }
+  inputs.pop_back();
+  inputs.pop_back();
+
+  return fmt::format("({}) -> {}", inputs, body_->toString());
+}
+
 void LambdaExpr::evalSpecialForm(
     const SelectivityVector& rows,
-    EvalCtx* context,
-    VectorPtr* result) {
+    EvalCtx& context,
+    VectorPtr& result) {
+  ExceptionContextSetter exceptionContext(
+      {[](auto* expr) { return static_cast<Expr*>(expr)->toString(); }, this});
+
   if (!typeWithCapture_) {
     makeTypeWithCapture(context);
   }
   std::vector<VectorPtr> values(typeWithCapture_->size());
   for (auto i = 0; i < captureChannels_.size(); ++i) {
     assert(!values.empty());
-    values[signature_->size() + i] = context->getField(captureChannels_[i]);
+    values[signature_->size() + i] = context.getField(captureChannels_[i]);
   }
   auto capture = std::make_shared<RowVector>(
-      context->pool(),
+      context.pool(),
       typeWithCapture_,
       BufferPtr(nullptr),
       rows.end(),
@@ -710,23 +762,23 @@ void LambdaExpr::evalSpecialForm(
       0);
   auto callable = std::make_shared<ExprCallable>(signature_, capture, body_);
   std::shared_ptr<FunctionVector> functions;
-  if (!*result) {
-    functions = std::make_shared<FunctionVector>(context->pool(), type_);
-    *result = functions;
+  if (!result) {
+    functions = std::make_shared<FunctionVector>(context.pool(), type_);
+    result = functions;
   } else {
-    VELOX_CHECK((*result)->encoding() == VectorEncoding::Simple::FUNCTION);
-    functions = std::static_pointer_cast<FunctionVector>(*result);
+    VELOX_CHECK(result->encoding() == VectorEncoding::Simple::FUNCTION);
+    functions = std::static_pointer_cast<FunctionVector>(result);
   }
   functions->addFunction(callable, rows);
 }
 
-void LambdaExpr::makeTypeWithCapture(EvalCtx* context) {
+void LambdaExpr::makeTypeWithCapture(EvalCtx& context) {
   // On first use, compose the type of parameters + capture and set
   // the indices of captures in the context row.
   if (capture_.empty()) {
     typeWithCapture_ = signature_;
   } else {
-    auto& contextType = context->row()->type()->as<TypeKind::ROW>();
+    auto& contextType = context.row()->type()->as<TypeKind::ROW>();
     auto parameterNames = signature_->names();
     auto parameterTypes = signature_->children();
     for (auto& reference : capture_) {
@@ -741,20 +793,110 @@ void LambdaExpr::makeTypeWithCapture(EvalCtx* context) {
   }
 }
 
+// Apply onError methods of registered listeners on every row that encounters
+// errors. The error vector must exist.
+void applyListenersOnError(
+    const SelectivityVector& rows,
+    const EvalCtx& context) {
+  auto errors = context.errors();
+  VELOX_CHECK_NOT_NULL(errors);
+
+  exec::LocalSelectivityVector errorRows(context.execCtx(), errors->size());
+  errorRows->clearAll();
+  rows.applyToSelected([&](auto row) {
+    if (row < errors->size() && !errors->isNullAt(row)) {
+      errorRows->setValid(row, true);
+    }
+  });
+  errorRows->updateBounds();
+
+  if (!errorRows->hasSelections()) {
+    return;
+  }
+
+  exprSetListeners().withRLock([&](auto& listeners) {
+    if (!listeners.empty()) {
+      for (auto& listener : listeners) {
+        listener->onError(*errorRows, *errors);
+      }
+    }
+  });
+}
+
 void TryExpr::evalSpecialForm(
     const SelectivityVector& rows,
-    EvalCtx* context,
-    VectorPtr* result) {
-  VarSetter throwOnError(context->mutableThrowOnError(), false);
+    EvalCtx& context,
+    VectorPtr& result) {
+  ExceptionContextSetter exceptionContext(
+      {[](auto* expr) { return static_cast<Expr*>(expr)->toString(); }, this});
+
+  VarSetter throwOnError(context.mutableThrowOnError(), false);
+  // It's possible with nested TRY expressions that some rows already threw
+  // exceptions in earlier expressions that haven't been handled yet. To avoid
+  // incorrectly handling them here, store those errors and temporarily reset
+  // the errors in context to nullptr, so we only handle errors coming from
+  // expressions that are children of this TRY expression.
+  // This also prevents this TRY expression from leaking exceptions to the
+  // parent TRY expression, so the parent won't incorrectly null out rows that
+  // threw exceptions which this expression already handled.
+  VarSetter<EvalCtx::ErrorVectorPtr> errorsSetter(context.errorsPtr(), nullptr);
   inputs_[0]->eval(rows, context, result);
 
-  auto errors = context->errors();
+  nullOutErrors(rows, context, result);
+}
+
+void TryExpr::evalSpecialFormSimplified(
+    const SelectivityVector& rows,
+    EvalCtx& context,
+    VectorPtr& result) {
+  VarSetter throwOnError(context.mutableThrowOnError(), false);
+  // It's possible with nested TRY expressions that some rows already threw
+  // exceptions in earlier expressions that haven't been handled yet. To avoid
+  // incorrectly handling them here, store those errors and temporarily reset
+  // the errors in context to nullptr, so we only handle errors coming from
+  // expressions that are children of this TRY expression.
+  // This also prevents this TRY expression from leaking exceptions to the
+  // parent TRY expression, so the parent won't incorrectly null out rows that
+  // threw exceptions which this expression already handled.
+  VarSetter<EvalCtx::ErrorVectorPtr> errorsSetter(context.errorsPtr(), nullptr);
+  inputs_[0]->evalSimplified(rows, context, result);
+
+  nullOutErrors(rows, context, result);
+}
+
+void TryExpr::nullOutErrors(
+    const SelectivityVector& rows,
+    EvalCtx& context,
+    VectorPtr& result) {
+  auto errors = context.errors();
   if (errors) {
-    rows.applyToSelected([&](auto row) {
-      if (row < errors->size() && !errors->isNullAt(row)) {
-        (*result)->setNull(row, true);
+    applyListenersOnError(rows, context);
+
+    if (result->encoding() == VectorEncoding::Simple::CONSTANT) {
+      // Since it's constant, if any row is NULL they're all NULL, so check row
+      // 0 arbitrarily.
+      if (result->isNullAt(0)) {
+        // The result is already a NULL constant, so this is a no-op.
+        return;
       }
-    });
+
+      // If the result is constant, the input should have been constant as
+      // well, so we should have consistently gotten exceptions.
+      // If this is not the case, an easy way to handle it would be to wrap
+      // the ConstantVector in a DictionaryVector and NULL out the rows that
+      // saw errors.
+      VELOX_DCHECK(
+          rows.testSelected([&](auto row) { return !errors->isNullAt(row); }));
+      // Set the result to be a NULL constant.
+      result = BaseVector::createNullConstant(
+          result->type(), result->size(), context.pool());
+    } else {
+      rows.applyToSelected([&](auto row) {
+        if (row < errors->size() && !errors->isNullAt(row)) {
+          result->setNull(row, true);
+        }
+      });
+    }
   }
 }
 

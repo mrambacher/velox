@@ -17,21 +17,25 @@
 
 namespace facebook::velox::core {
 
-namespace {
-const std::vector<std::shared_ptr<const PlanNode>> kEmptySources;
+const SortOrder kAscNullsFirst(true, true);
+const SortOrder kAscNullsLast(true, false);
+const SortOrder kDescNullsFirst(false, true);
+const SortOrder kDescNullsLast(false, false);
 
-std::shared_ptr<RowType> getAggregationOutputType(
-    const std::vector<std::shared_ptr<const FieldAccessTypedExpr>>&
-        groupingKeys,
+namespace {
+const std::vector<PlanNodePtr> kEmptySources;
+
+RowTypePtr getAggregationOutputType(
+    const std::vector<FieldAccessTypedExprPtr>& groupingKeys,
     const std::vector<std::string>& aggregateNames,
-    const std::vector<std::shared_ptr<const CallTypedExpr>>& aggregates) {
+    const std::vector<CallTypedExprPtr>& aggregates) {
   VELOX_CHECK_EQ(
       aggregateNames.size(),
       aggregates.size(),
       "Number of aggregate names must be equal to number of aggregates");
 
   std::vector<std::string> names;
-  std::vector<std::shared_ptr<const Type>> types;
+  std::vector<TypePtr> types;
 
   for (auto& key : groupingKeys) {
     auto field =
@@ -53,16 +57,13 @@ std::shared_ptr<RowType> getAggregationOutputType(
 AggregationNode::AggregationNode(
     const PlanNodeId& id,
     Step step,
-    const std::vector<std::shared_ptr<const FieldAccessTypedExpr>>&
-        groupingKeys,
-    const std::vector<std::shared_ptr<const FieldAccessTypedExpr>>&
-        preGroupedKeys,
+    const std::vector<FieldAccessTypedExprPtr>& groupingKeys,
+    const std::vector<FieldAccessTypedExprPtr>& preGroupedKeys,
     const std::vector<std::string>& aggregateNames,
-    const std::vector<std::shared_ptr<const CallTypedExpr>>& aggregates,
-    const std::vector<std::shared_ptr<const FieldAccessTypedExpr>>&
-        aggregateMasks,
+    const std::vector<CallTypedExprPtr>& aggregates,
+    const std::vector<FieldAccessTypedExprPtr>& aggregateMasks,
     bool ignoreNullKeys,
-    std::shared_ptr<const PlanNode> source)
+    PlanNodePtr source)
     : PlanNode(id),
       step_(step),
       groupingKeys_(groupingKeys),
@@ -99,28 +100,171 @@ AggregationNode::AggregationNode(
   }
 }
 
-const std::vector<std::shared_ptr<const PlanNode>>& ValuesNode::sources()
-    const {
+namespace {
+void addFields(
+    std::stringstream& stream,
+    const std::vector<FieldAccessTypedExprPtr>& keys) {
+  for (auto i = 0; i < keys.size(); ++i) {
+    if (i > 0) {
+      stream << ", ";
+    }
+    stream << keys[i]->name();
+  }
+}
+
+void addKeys(std::stringstream& stream, const std::vector<TypedExprPtr>& keys) {
+  for (auto i = 0; i < keys.size(); ++i) {
+    const auto& expr = keys[i];
+    if (i > 0) {
+      stream << ", ";
+    }
+    if (auto field =
+            std::dynamic_pointer_cast<const core::FieldAccessTypedExpr>(expr)) {
+      stream << field->name();
+    } else if (
+        auto constant =
+            std::dynamic_pointer_cast<const core::ConstantTypedExpr>(expr)) {
+      stream << constant->toString();
+    } else {
+      stream << expr->toString();
+    }
+  }
+}
+} // namespace
+
+void AggregationNode::addDetails(std::stringstream& stream) const {
+  stream << stepName(step_) << " ";
+
+  if (!groupingKeys_.empty()) {
+    stream << "[";
+    addFields(stream, groupingKeys_);
+    stream << "] ";
+  }
+
+  for (auto i = 0; i < aggregateNames_.size(); ++i) {
+    if (i > 0) {
+      stream << ", ";
+    }
+    stream << aggregateNames_[i] << " := " << aggregates_[i]->toString();
+  }
+}
+
+namespace {
+RowTypePtr getGroupIdOutputType(
+    const std::map<std::string, FieldAccessTypedExprPtr>&
+        outputGroupingKeyNames,
+    const std::vector<FieldAccessTypedExprPtr>& aggregationInputs,
+    const std::string& groupIdName) {
+  // Grouping keys come first, followed by aggregation inputs and groupId
+  // column.
+
+  auto numOutputs =
+      outputGroupingKeyNames.size() + aggregationInputs.size() + 1;
+
+  std::vector<std::string> names;
+  std::vector<TypePtr> types;
+
+  names.reserve(numOutputs);
+  types.reserve(numOutputs);
+
+  for (const auto& [name, groupingKey] : outputGroupingKeyNames) {
+    names.push_back(name);
+    types.push_back(groupingKey->type());
+  }
+
+  for (const auto& input : aggregationInputs) {
+    names.push_back(input->name());
+    types.push_back(input->type());
+  }
+
+  names.push_back(groupIdName);
+  types.push_back(BIGINT());
+
+  return ROW(std::move(names), std::move(types));
+}
+} // namespace
+
+GroupIdNode::GroupIdNode(
+    PlanNodeId id,
+    std::vector<std::vector<FieldAccessTypedExprPtr>> groupingSets,
+    std::map<std::string, FieldAccessTypedExprPtr> outputGroupingKeyNames,
+    std::vector<FieldAccessTypedExprPtr> aggregationInputs,
+    std::string groupIdName,
+    PlanNodePtr source)
+    : PlanNode(std::move(id)),
+      sources_{source},
+      outputType_(getGroupIdOutputType(
+          outputGroupingKeyNames,
+          aggregationInputs,
+          groupIdName)),
+      groupingSets_(std::move(groupingSets)),
+      outputGroupingKeyNames_(std::move(outputGroupingKeyNames)),
+      aggregationInputs_(std::move(aggregationInputs)),
+      groupIdName_(std::move(groupIdName)) {
+  VELOX_CHECK_GE(
+      groupingSets_.size(),
+      2,
+      "GroupIdNode requires two or more grouping sets.");
+}
+
+void GroupIdNode::addDetails(std::stringstream& stream) const {
+  for (auto i = 0; i < groupingSets_.size(); ++i) {
+    if (i > 0) {
+      stream << ", ";
+    }
+    stream << "[";
+    addFields(stream, groupingSets_[i]);
+    stream << "]";
+  }
+}
+
+const std::vector<PlanNodePtr>& ValuesNode::sources() const {
   return kEmptySources;
 }
 
-const std::vector<std::shared_ptr<const PlanNode>>& TableScanNode::sources()
-    const {
+void ValuesNode::addDetails(std::stringstream& stream) const {
+  vector_size_t totalCount = 0;
+  for (const auto& vector : values_) {
+    totalCount += vector->size();
+  }
+  stream << totalCount << " rows in " << values_.size() << " vectors";
+}
+
+void ProjectNode::addDetails(std::stringstream& stream) const {
+  stream << "expressions: ";
+  for (auto i = 0; i < projections_.size(); i++) {
+    auto& projection = projections_[i];
+    if (i > 0) {
+      stream << ", ";
+    }
+    stream << "(" << names_[i] << ":" << projection->type()->toString() << ", "
+           << projection->toString() << ")";
+  }
+}
+
+const std::vector<PlanNodePtr>& TableScanNode::sources() const {
   return kEmptySources;
 }
 
-const std::vector<std::shared_ptr<const PlanNode>>& ExchangeNode::sources()
-    const {
+void TableScanNode::addDetails(std::stringstream& stream) const {
+  stream << tableHandle_->toString();
+}
+
+const std::vector<PlanNodePtr>& ExchangeNode::sources() const {
   return kEmptySources;
+}
+
+void ExchangeNode::addDetails(std::stringstream& /* stream */) const {
+  // Nothing to add.
 }
 
 UnnestNode::UnnestNode(
     const PlanNodeId& id,
-    std::vector<std::shared_ptr<const FieldAccessTypedExpr>> replicateVariables,
-    std::vector<std::shared_ptr<const FieldAccessTypedExpr>> unnestVariables,
+    std::vector<FieldAccessTypedExprPtr> replicateVariables,
+    std::vector<FieldAccessTypedExprPtr> unnestVariables,
     const std::vector<std::string>& unnestNames,
     const std::optional<std::string>& ordinalityName,
-    const std::shared_ptr<const PlanNode>& source)
+    const PlanNodePtr& source)
     : PlanNode(id),
       replicateVariables_{std::move(replicateVariables)},
       unnestVariables_{std::move(unnestVariables)},
@@ -163,14 +307,18 @@ UnnestNode::UnnestNode(
   outputType_ = ROW(std::move(names), std::move(types));
 }
 
+void UnnestNode::addDetails(std::stringstream& stream) const {
+  addFields(stream, unnestVariables_);
+}
+
 AbstractJoinNode::AbstractJoinNode(
     const PlanNodeId& id,
     JoinType joinType,
-    const std::vector<std::shared_ptr<const FieldAccessTypedExpr>>& leftKeys,
-    const std::vector<std::shared_ptr<const FieldAccessTypedExpr>>& rightKeys,
-    std::shared_ptr<const ITypedExpr> filter,
-    std::shared_ptr<const PlanNode> left,
-    std::shared_ptr<const PlanNode> right,
+    const std::vector<FieldAccessTypedExprPtr>& leftKeys,
+    const std::vector<FieldAccessTypedExprPtr>& rightKeys,
+    TypedExprPtr filter,
+    PlanNodePtr left,
+    PlanNodePtr right,
     const RowTypePtr outputType)
     : PlanNode(id),
       joinType_(joinType),
@@ -227,20 +375,39 @@ AbstractJoinNode::AbstractJoinNode(
   }
 }
 
+void AbstractJoinNode::addDetails(std::stringstream& stream) const {
+  stream << joinTypeName(joinType_) << " ";
+
+  for (auto i = 0; i < leftKeys_.size(); ++i) {
+    if (i > 0) {
+      stream << " AND ";
+    }
+    stream << leftKeys_[i]->name() << "=" << rightKeys_[i]->name();
+  }
+
+  if (filter_) {
+    stream << ", filter: " << filter_->toString();
+  }
+}
+
 CrossJoinNode::CrossJoinNode(
     const PlanNodeId& id,
-    std::shared_ptr<const PlanNode> left,
-    std::shared_ptr<const PlanNode> right,
+    PlanNodePtr left,
+    PlanNodePtr right,
     RowTypePtr outputType)
     : PlanNode(id),
       sources_({std::move(left), std::move(right)}),
       outputType_(std::move(outputType)) {}
 
+void CrossJoinNode::addDetails(std::stringstream& /* stream */) const {
+  // Nothing to add.
+}
+
 AssignUniqueIdNode::AssignUniqueIdNode(
     const PlanNodeId& id,
     const std::string& idName,
     const int32_t taskUniqueId,
-    std::shared_ptr<const PlanNode> source)
+    PlanNodePtr source)
     : PlanNode(id), taskUniqueId_(taskUniqueId), sources_{std::move(source)} {
   std::vector<std::string> names(sources_[0]->outputType()->names());
   std::vector<TypePtr> types(sources_[0]->outputType()->children());
@@ -249,6 +416,151 @@ AssignUniqueIdNode::AssignUniqueIdNode(
   types.emplace_back(BIGINT());
   outputType_ = ROW(std::move(names), std::move(types));
   uniqueIdCounter_ = std::make_shared<std::atomic_int64_t>();
+}
+
+void AssignUniqueIdNode::addDetails(std::stringstream& /* stream */) const {
+  // Nothing to add.
+}
+
+namespace {
+void addSortingKeys(
+    std::stringstream& stream,
+    const std::vector<FieldAccessTypedExprPtr>& sortingKeys,
+    const std::vector<SortOrder>& sortingOrders) {
+  for (auto i = 0; i < sortingKeys.size(); ++i) {
+    if (i > 0) {
+      stream << ", ";
+    }
+    stream << sortingKeys[i]->name() << " " << sortingOrders[i].toString();
+  }
+}
+} // namespace
+
+void LocalMergeNode::addDetails(std::stringstream& stream) const {
+  addSortingKeys(stream, sortingKeys_, sortingOrders_);
+}
+
+void TableWriteNode::addDetails(std::stringstream& /* stream */) const {
+  // TODO Add connector details.
+}
+
+void MergeExchangeNode::addDetails(std::stringstream& stream) const {
+  addSortingKeys(stream, sortingKeys_, sortingOrders_);
+}
+
+void LocalPartitionNode::addDetails(std::stringstream& stream) const {
+  // Nothing to add.
+  switch (type_) {
+    case Type::kGather:
+      stream << "GATHER";
+      break;
+    case Type::kRepartition:
+      stream << "REPARTITION";
+      break;
+  }
+}
+
+void EnforceSingleRowNode::addDetails(std::stringstream& /* stream */) const {
+  // Nothing to add.
+}
+
+void PartitionedOutputNode::addDetails(std::stringstream& stream) const {
+  if (broadcast_) {
+    stream << "BROADCAST";
+  } else if (numPartitions_ == 1) {
+    stream << "SINGLE";
+  } else {
+    stream << "HASH(";
+    addKeys(stream, keys_);
+    stream << ") " << numPartitions_;
+  }
+
+  if (replicateNullsAndAny_) {
+    stream << " replicate nulls and any";
+  }
+}
+
+void TopNNode::addDetails(std::stringstream& stream) const {
+  if (isPartial_) {
+    stream << "PARTIAL ";
+  }
+  stream << count_ << " ";
+
+  addSortingKeys(stream, sortingKeys_, sortingOrders_);
+}
+
+void LimitNode::addDetails(std::stringstream& stream) const {
+  if (isPartial_) {
+    stream << "PARTIAL ";
+  }
+  stream << count_;
+  if (offset_) {
+    stream << " offset " << offset_;
+  }
+}
+
+void OrderByNode::addDetails(std::stringstream& stream) const {
+  if (isPartial_) {
+    stream << "PARTIAL ";
+  }
+  addSortingKeys(stream, sortingKeys_, sortingOrders_);
+}
+
+void PlanNode::toString(
+    std::stringstream& stream,
+    bool detailed,
+    bool recursive,
+    size_t indentationSize,
+    std::function<void(
+        const PlanNodeId& planNodeId,
+        const std::string& indentation,
+        std::stringstream& stream)> addContext) const {
+  const std::string indentation(indentationSize, ' ');
+
+  stream << indentation << "-- " << name();
+
+  if (detailed) {
+    stream << "[";
+    addDetails(stream);
+    stream << "]";
+    stream << " -> ";
+    outputType()->printChildren(stream, ", ");
+  }
+  stream << std::endl;
+
+  if (addContext) {
+    auto contextIndentation = indentation + "   ";
+    stream << contextIndentation;
+    addContext(id_, contextIndentation, stream);
+    stream << std::endl;
+  }
+
+  if (recursive) {
+    for (auto& source : sources()) {
+      source->toString(stream, detailed, true, indentationSize + 2, addContext);
+    }
+  }
+}
+
+namespace {
+void collectLeafPlanNodeIds(
+    const core::PlanNode& planNode,
+    std::unordered_set<core::PlanNodeId>& leafIds) {
+  if (planNode.sources().empty()) {
+    leafIds.insert(planNode.id());
+    return;
+  }
+
+  for (const auto& child : planNode.sources()) {
+    collectLeafPlanNodeIds(*child, leafIds);
+  }
+}
+} // namespace
+
+std::unordered_set<core::PlanNodeId> PlanNode::leafPlanNodeIds() const {
+  std::unordered_set<core::PlanNodeId> leafIds;
+  collectLeafPlanNodeIds(*this, leafIds);
+  return leafIds;
 }
 
 } // namespace facebook::velox::core

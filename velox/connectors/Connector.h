@@ -15,7 +15,7 @@
  */
 #pragma once
 
-#include "velox/common/caching/DataCache.h"
+#include "velox/common/base/RuntimeMetrics.h"
 #include "velox/common/caching/ScanTracker.h"
 #include "velox/core/Context.h"
 #include "velox/vector/ComplexVector.h"
@@ -59,7 +59,19 @@ class ColumnHandle {
 
 class ConnectorTableHandle {
  public:
+  explicit ConnectorTableHandle(std::string connectorId)
+      : connectorId_(std::move(connectorId)) {}
+
   virtual ~ConnectorTableHandle() = default;
+
+  virtual std::string toString() const = 0;
+
+  const std::string& connectorId() const {
+    return connectorId_;
+  }
+
+ private:
+  const std::string connectorId_;
 };
 
 /**
@@ -116,7 +128,7 @@ class DataSource {
   // Returns the number of input rows processed so far.
   virtual uint64_t getCompletedRows() = 0;
 
-  virtual std::unordered_map<std::string, int64_t> runtimeStats() = 0;
+  virtual std::unordered_map<std::string, RuntimeCounter> runtimeStats() = 0;
 
   // Returns a connector dependent row size if available. This can be
   // called after addSplit().  This estimates uncompressed data
@@ -218,6 +230,12 @@ class Connector {
     return properties_;
   }
 
+  // Returns true if this connector would accept a filter dynamically generated
+  // during query execution.
+  virtual bool canAddDynamicFilter() const {
+    return false;
+  }
+
   // TODO Generalize to specify TableHandle/Layout and ColumnHandles.
   // We should basically aim to match the interface defined at
   // https://github.com/prestodb/presto/blob/master/presto-main/src/main/
@@ -269,7 +287,6 @@ class ConnectorFactory {
   virtual std::shared_ptr<Connector> newConnector(
       const std::string& id,
       std::shared_ptr<const Config> properties,
-      std::unique_ptr<DataCache> dataCache = nullptr,
       folly::Executor* executor = nullptr) = 0;
 
  private:

@@ -101,11 +101,12 @@ class FunctionVector : public BaseVector {
   };
 
   FunctionVector(velox::memory::MemoryPool* pool, TypePtr type)
-      : BaseVector(pool, type, BufferPtr(nullptr), 0) {}
-
-  VectorEncoding::Simple encoding() const override {
-    return VectorEncoding::Simple::FUNCTION;
-  }
+      : BaseVector(
+            pool,
+            type,
+            VectorEncoding::Simple::FUNCTION,
+            BufferPtr(nullptr),
+            0) {}
 
   // Implements evaluation of the lambda function literal special
   // form. This assigns a function to a specified set of rows. This
@@ -128,14 +129,7 @@ class FunctionVector : public BaseVector {
     functions_.push_back(callable);
   }
 
-  bool equalValueAt(
-      const BaseVector* /*other*/,
-      vector_size_t /*index*/,
-      vector_size_t /*otherIndex*/) const override {
-    throw std::logic_error("equalValueAt not defined for FunctionVector");
-  }
-
-  int32_t compare(
+  std::optional<int32_t> compare(
       const BaseVector* /*other*/,
       vector_size_t /*index*/,
       vector_size_t /*otherIndex*/,

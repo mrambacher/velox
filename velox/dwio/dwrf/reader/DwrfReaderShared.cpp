@@ -14,12 +14,13 @@
  * limitations under the License.
  */
 
-#include "velox/dwio/dwrf/reader/DwrfReaderShared.h"
 #include <exception>
 #include <optional>
+
 #include "velox/dwio/common/TypeUtils.h"
 #include "velox/dwio/common/exception/Exceptions.h"
 #include "velox/dwio/dwrf/common/Statistics.h"
+#include "velox/dwio/dwrf/reader/DwrfReaderShared.h"
 #include "velox/dwio/dwrf/reader/SelectiveColumnReader.h"
 #include "velox/dwio/dwrf/reader/StripeStream.h"
 
@@ -202,8 +203,8 @@ DwrfReaderShared::DwrfReaderShared(
           options.getDecrypterFactory(),
           options.getBufferedInputFactory()
               ? options.getBufferedInputFactory()
-              : BufferedInputFactory::baseFactory(),
-          options.getDataCacheConfig().get())),
+              : dwio::common::BufferedInputFactory::baseFactoryShared(),
+          options.getFileNum())),
       options_(options) {}
 
 std::unique_ptr<StripeInformation> DwrfReaderShared::getStripe(
@@ -366,7 +367,7 @@ uint64_t DwrfReaderShared::getMemoryUse(
   // Decompressors need buffers for each stream
   uint64_t decompressorMemory = 0;
   auto compression = readerBase.getCompressionKind();
-  if (compression != CompressionKind_NONE) {
+  if (compression != dwio::common::CompressionKind_NONE) {
     for (int32_t i = 0; i < footer.types_size(); i++) {
       if (cs.shouldReadNode(i)) {
         const proto::Type& type = footer.types(i);
@@ -374,7 +375,7 @@ uint64_t DwrfReaderShared::getMemoryUse(
             maxStreamsForType(type) * readerBase.getCompressionBlockSize();
       }
     }
-    if (compression == CompressionKind_SNAPPY) {
+    if (compression == dwio::common::CompressionKind_SNAPPY) {
       decompressorMemory *= 2; // Snappy decompressor uses a second buffer
     }
   }
@@ -383,7 +384,7 @@ uint64_t DwrfReaderShared::getMemoryUse(
 }
 
 void DwrfRowReaderShared::startNextStripe() {
-  if (newStripeLoaded) {
+  if (newStripeLoaded || currentStripe >= lastStripe) {
     return;
   }
 

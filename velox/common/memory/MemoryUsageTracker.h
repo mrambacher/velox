@@ -265,13 +265,19 @@ class MemoryUsageTracker
     }
   }
 
-  int maxTotalBytes() const {
+  int64_t maxTotalBytes() const {
     return usage(maxMemory_, UsageType::kTotalMem);
   }
 
   void setGrowCallback(GrowCallback func) {
     growCallback_ = func;
   }
+
+  /// Checks if it is likely that the reservation on 'this' can be
+  /// incremented by 'increment'. Returns false if this seems
+  /// unlikely. Otherwise attempts the reservation increment and returns
+  /// true if succeeded.
+  bool maybeReserve(int64_t increment);
 
  private:
   static constexpr int64_t kMB = 1 << 20;
@@ -367,11 +373,11 @@ class MemoryUsageTracker
   std::mutex mutex_;
   std::shared_ptr<MemoryUsageTracker> parent_;
   UsageType type_;
-  std::array<std::atomic<int64_t>, 2> currentUsageInBytes_{};
+  std::array<std::atomic<int64_t>, 3> currentUsageInBytes_{};
   std::array<std::atomic<int64_t>, 3> peakUsageInBytes_{};
   std::array<int64_t, 3> maxMemory_;
-  std::array<int64_t, 3> numAllocs_{};
-  std::array<int64_t, 3> cumulativeBytes_{};
+  std::array<std::atomic<int64_t>, 3> numAllocs_{};
+  std::array<std::atomic<int64_t>, 3> cumulativeBytes_{};
 
   int64_t reservation_{0};
 
@@ -416,7 +422,7 @@ class MemoryUsageTracker
   //  Decrements usage in 'this' and parents.
   void decrementUsage(UsageType type, int64_t size) noexcept;
 
-  void checkNonNegativeSizes(const char* message) const {
+  void checkNonNegativeSizes(const char* FOLLY_NONNULL message) const {
     if (user(currentUsageInBytes_) < 0 || system(currentUsageInBytes_) < 0 ||
         total(currentUsageInBytes_) < 0) {
       LOG_EVERY_N(ERROR, 100)

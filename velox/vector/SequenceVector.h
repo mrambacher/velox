@@ -44,8 +44,7 @@ class SequenceVector : public SimpleVector<T> {
       size_t length,
       std::shared_ptr<BaseVector> sequenceValues,
       BufferPtr sequenceLengths,
-      const folly::F14FastMap<std::string, std::string>& metaData =
-          cdvi::EMPTY_METADATA,
+      const SimpleVectorStats<T>& stats = {},
       std::optional<int32_t> distinctCount = std::nullopt,
       std::optional<vector_size_t> nullCount = std::nullopt,
       std::optional<bool> sorted = std::nullopt,
@@ -54,10 +53,6 @@ class SequenceVector : public SimpleVector<T> {
 
  public:
   ~SequenceVector() override = default;
-
-  inline VectorEncoding::Simple encoding() const override {
-    return VectorEncoding::Simple::SEQUENCE;
-  }
 
   bool mayHaveNulls() const override {
     return sequenceValues_->mayHaveNulls();
@@ -99,7 +94,7 @@ class SequenceVector : public SimpleVector<T> {
    *
    * @param byteOffset - the byte offset to laod from
    */
-  __m256i loadSIMDValueBufferAt(size_t index) const;
+  xsimd::batch<T> loadSIMDValueBufferAt(size_t index) const;
 
   /**
    * Returns a shared_ptr to the underlying byte buffer holding the values for

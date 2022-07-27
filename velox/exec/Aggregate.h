@@ -15,13 +15,9 @@
  */
 #pragma once
 
-#include "velox/common/serialization/Registry.h"
+#include "velox/common/memory/HashStringAllocator.h"
 #include "velox/core/PlanNode.h"
 #include "velox/vector/BaseVector.h"
-
-namespace facebook::velox {
-class HashStringAllocator;
-}
 
 namespace facebook::velox::exec {
 
@@ -31,7 +27,7 @@ class AggregateFunctionSignature;
 // and single aggregation.
 bool isRawInput(core::AggregationNode::Step step);
 
-// Returns true if aggregation produces final result, e.g. final
+// Returns false if aggregation produces final result, e.g. final
 // and single aggregation.
 bool isPartialOutput(core::AggregationNode::Step step);
 
@@ -58,7 +54,13 @@ class Aggregate {
   }
 
   // Returns true if the accumulator never takes more than
-  // accumulatorFixedWidthSize() bytes.
+  // accumulatorFixedWidthSize() bytes. If this is false, the
+  // accumulator needs to track its changing variable length footprint
+  // using RowSizeTracker (Aggregate::trackRowSize), see ArrayAggAggregate for
+  // sample usage. A group row with at least one variable length key or
+  // aggregate will have a 32-bit slot at offset RowContainer::rowSize_ for
+  // keeping track of per-row size. The size is relevant for keeping caps on
+  // result set and spilling batch sizes with skewed data.
   virtual bool isFixedSize() const {
     return true;
   }
@@ -104,7 +106,8 @@ class Aggregate {
   // @param rows Rows of the 'args' to add to the accumulators. These may not be
   // contiguous if the aggregation has mask or is configured to drop null
   // grouping keys. The latter would be the case when aggregation is followed
-  // by the join on the grouping keys.
+  // by the join on the grouping keys. 'rows' is guaranteed to have at least one
+  // active row.
   // @param args Raw input.
   // @param mayPushdown True if aggregation can be pushdown down via LazyVector.
   // The pushdown can happen only if this flag is true and 'args' is a single
@@ -122,7 +125,8 @@ class Aggregate {
   // @param rows Rows of the 'args' to add to the accumulators. These may not be
   // contiguous if the aggregation has mask or is configured to drop null
   // grouping keys. The latter would be the case when aggregation is followed
-  // by the join on the grouping keys.
+  // by the join on the grouping keys. 'rows' is guaranteed to have at least one
+  // active row.
   // @param args Intermediate results produced by extractAccumulators().
   // @param mayPushdown True if aggregation can be pushdown down via LazyVector.
   // The pushdown can happen only if this flag is true and 'args' is a single
@@ -137,7 +141,8 @@ class Aggregate {
   // aggregation.
   // @param group Pointer to the start of the group row.
   // @param rows Rows of the 'args' to add to the accumulators. These may not
-  // be contiguous if the aggregation has mask.
+  // be contiguous if the aggregation has mask. 'rows' is guaranteed to have at
+  // least one active row.
   // @param args Raw input to add to the accumulators.
   // @param mayPushdown True if aggregation can be pushdown down via LazyVector.
   // The pushdown can happen only if this flag is true and 'args' is a single
@@ -152,7 +157,8 @@ class Aggregate {
   // aggregation.
   // @param group Pointer to the start of the group row.
   // @param rows Rows of the 'args' to add to the accumulators. These may not
-  // be contiguous if the aggregation has mask.
+  // be contiguous if the aggregation has mask. 'rows' is guaranteed to have at
+  // least one active row.
   // @param args Intermediate results produced by extractAccumulators().
   // @param mayPushdown True if aggregation can be pushdown down via LazyVector.
   // The pushdown can happen only if this flag is true and 'args' is a single
@@ -204,7 +210,20 @@ class Aggregate {
       const std::vector<TypePtr>& argTypes,
       const TypePtr& resultType);
 
+  // Returns the intermediate type for 'name' with signature
+  // 'argTypes'. Throws if cannot resolve.
+  static TypePtr intermediateType(
+      const std::string& name,
+      const std::vector<TypePtr>& argTypes);
+
  protected:
+  // Shorthand for maintaining accumulator variable length size in
+  // accumulator update methods. Use like: { auto tracker =
+  // trackRowSize(group); update(group); }
+  RowSizeTracker<char, uint32_t> trackRowSize(char* group) {
+    return RowSizeTracker<char, uint32_t>(group[rowSizeOffset_], *allocator_);
+  }
+
   bool isNull(char* group) const {
     return numNulls_ && (group[nullByte_] & nullMask_);
   }
@@ -254,7 +273,7 @@ class Aggregate {
 
   static void clearNull(uint64_t* rawNulls, vector_size_t index) {
     if (rawNulls) {
-      bits::clearBit(rawNulls, index);
+      bits::clearNull(rawNulls, index);
     }
   }
 

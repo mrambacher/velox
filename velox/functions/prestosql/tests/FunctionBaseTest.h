@@ -16,11 +16,11 @@
 #pragma once
 
 #include <gtest/gtest.h>
+
 #include "velox/expression/Expr.h"
 #include "velox/parse/Expressions.h"
 #include "velox/parse/ExpressionsParser.h"
 #include "velox/type/Type.h"
-#include "velox/vector/tests/VectorMaker.h"
 #include "velox/vector/tests/VectorTestBase.h"
 
 namespace facebook::velox::functions::test {
@@ -66,21 +66,35 @@ class FunctionBaseTest : public testing::Test,
 
   std::shared_ptr<const core::ITypedExpr> makeTypedExpr(
       const std::string& text,
-      const std::shared_ptr<const RowType>& rowType) {
+      const RowTypePtr& rowType) {
     auto untyped = parse::parseExpr(text);
     return core::Expressions::inferTypes(untyped, rowType, execCtx_.pool());
+  }
+
+  // Use this directly if you want to evaluate a manually-constructed expression
+  // tree and don't want it to cast the returned vector.
+  VectorPtr evaluate(
+      const std::shared_ptr<const core::ITypedExpr>& typedExpr,
+      const RowVectorPtr& data) {
+    return evaluateImpl<exec::ExprSet>(typedExpr, data);
   }
 
   // Use this directly if you don't want it to cast the returned vector.
   VectorPtr evaluate(const std::string& expression, const RowVectorPtr& data) {
     auto rowType = std::dynamic_pointer_cast<const RowType>(data->type());
-    exec::ExprSet exprSet({makeTypedExpr(expression, rowType)}, &execCtx_);
+    auto typedExpr = makeTypedExpr(expression, rowType);
 
-    auto rows = std::make_unique<SelectivityVector>(data->size());
-    exec::EvalCtx evalCtx(&execCtx_, &exprSet, data.get());
-    std::vector<VectorPtr> results(1);
-    exprSet.eval(*rows, &evalCtx, &results);
-    return results[0];
+    return evaluate(typedExpr, data);
+  }
+
+  // Use this function if you want to evaluate a manually-constructed expression
+  // tree.
+  template <typename T>
+  std::shared_ptr<T> evaluate(
+      const std::shared_ptr<const core::ITypedExpr>& typedExpr,
+      const RowVectorPtr& data) {
+    auto result = evaluate(typedExpr, data);
+    return castEvaluateResult<T>(result, typedExpr->toString());
   }
 
   template <typename T>
@@ -88,16 +102,18 @@ class FunctionBaseTest : public testing::Test,
       const std::string& expression,
       const RowVectorPtr& data) {
     auto result = evaluate(expression, data);
-    VELOX_CHECK(result, "Expression evaluation result is null: {}", expression);
+    return castEvaluateResult<T>(result, expression);
+  }
 
-    auto castedResult = std::dynamic_pointer_cast<T>(result);
-    VELOX_CHECK(
-        castedResult,
-        "Expression evaluation result is not of expected type: {} -> {} vector of type {}",
-        expression,
-        result->encoding(),
-        result->type()->toString());
-    return castedResult;
+  template <typename T>
+  std::shared_ptr<T> evaluateSimplified(
+      const std::string& expression,
+      const RowVectorPtr& data) {
+    auto rowType = std::dynamic_pointer_cast<const RowType>(data->type());
+    auto typedExpr = makeTypedExpr(expression, rowType);
+    auto result = evaluateImpl<exec::ExprSetSimplified>(typedExpr, data);
+
+    return castEvaluateResult<T>(result, expression);
   }
 
   template <typename T>
@@ -162,20 +178,6 @@ class FunctionBaseTest : public testing::Test,
                                : ReturnType(result->valueAt(0));
   }
 
-  // TODO: Enable ASSERT_EQ for vectors
-  static void assertEqualVectors(
-      const VectorPtr& expected,
-      const VectorPtr& actual,
-      const std::string& additionalContext = "") {
-    ASSERT_EQ(expected->size(), actual->size());
-
-    for (auto i = 0; i < expected->size(); i++) {
-      ASSERT_TRUE(expected->equalValueAt(actual.get(), i, i))
-          << "at " << i << ": " << expected->toString(i) << " vs. "
-          << actual->toString(i) << additionalContext;
-    }
-  }
-
   // Asserts that `func` throws `VeloxUserError`. Optionally, checks if
   // `expectedErrorMessage` is a substr of the exception message thrown.
   template <typename TFunc>
@@ -221,7 +223,7 @@ class FunctionBaseTest : public testing::Test,
   /// @param body Body of the lambda as SQL expression.
   void registerLambda(
       const std::string& name,
-      const std::shared_ptr<const RowType>& signature,
+      const RowTypePtr& signature,
       TypePtr rowType,
       const std::string& body) {
     core::Expressions::registerLambda(
@@ -230,6 +232,37 @@ class FunctionBaseTest : public testing::Test,
 
   std::shared_ptr<core::QueryCtx> queryCtx_{core::QueryCtx::createForTest()};
   core::ExecCtx execCtx_{pool_.get(), queryCtx_.get()};
+
+ private:
+  template <typename T>
+  std::shared_ptr<T> castEvaluateResult(
+      const VectorPtr& result,
+      const std::string& expression) {
+    VELOX_CHECK(result, "Expression evaluation result is null: {}", expression);
+
+    auto castedResult = std::dynamic_pointer_cast<T>(result);
+    VELOX_CHECK(
+        castedResult,
+        "Expression evaluation result is not of expected type: {} -> {} vector of type {}",
+        expression,
+        result->encoding(),
+        result->type()->toString());
+    return castedResult;
+  }
+
+  template <typename ExprSet>
+  VectorPtr evaluateImpl(
+      const std::shared_ptr<const core::ITypedExpr>& typedExpr,
+      const RowVectorPtr& data) {
+    auto rows = std::make_unique<SelectivityVector>(data->size());
+    std::vector<VectorPtr> results(1);
+
+    ExprSet exprSet({typedExpr}, &execCtx_);
+    exec::EvalCtx evalCtx(&execCtx_, &exprSet, data.get());
+    exprSet.eval(*rows, &evalCtx, &results);
+
+    return results[0];
+  }
 };
 
 } // namespace facebook::velox::functions::test

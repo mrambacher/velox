@@ -25,8 +25,8 @@
 #include "velox/expression/SimpleFunctionRegistry.h"
 #include "velox/expression/VectorFunction.h"
 #include "velox/expression/tests/ExpressionFuzzer.h"
-#include "velox/expression/tests/VectorFuzzer.h"
 #include "velox/type/Type.h"
+#include "velox/vector/fuzzer/VectorFuzzer.h"
 #include "velox/vector/tests/VectorMaker.h"
 
 DEFINE_int32(
@@ -223,7 +223,14 @@ std::optional<CallableSignature> processSignature(
   // Process each argument and figure out its type.
   for (const auto& arg : signature.argumentTypes()) {
     auto resolvedType = SignatureBinder::tryResolveType(arg, {});
-    VELOX_CHECK_NOT_NULL(resolvedType);
+
+    // TODO: Check if any input is Generic and substitute all
+    // possible primitive types, creating a list of signatures to fuzz.
+    if (!resolvedType) {
+      LOG(WARNING) << "Skipping unsupported signature with generic: "
+                   << functionName << signature.toString();
+      return std::nullopt;
+    }
 
     onlyPrimitiveTypes &= resolvedType->isPrimitiveType();
     callable.args.emplace_back(resolvedType);
@@ -496,13 +503,17 @@ class ExpressionFuzzer {
       exec::ExprSet exprSetCommon({plan}, &execCtx_);
       exec::EvalCtx evalCtxCommon(&execCtx_, &exprSetCommon, rowVector.get());
 
-      exprSetCommon.eval(rows, &evalCtxCommon, &commonEvalResult);
-    } catch (...) {
-      if (!canThrow) {
-        LOG(ERROR)
-            << "Common eval wasn't supposed to throw, but it did. Aborting.";
-        throw;
+      try {
+        exprSetCommon.eval(rows, &evalCtxCommon, &commonEvalResult);
+      } catch (...) {
+        if (!canThrow) {
+          LOG(ERROR)
+              << "Common eval wasn't supposed to throw, but it did. Aborting.";
+          throw;
+        }
+        exceptionCommonPtr = std::current_exception();
       }
+    } catch (...) {
       exceptionCommonPtr = std::current_exception();
     }
 
@@ -514,13 +525,17 @@ class ExpressionFuzzer {
       exec::EvalCtx evalCtxSimplified(
           &execCtx_, &exprSetSimplified, rowVector.get());
 
-      exprSetSimplified.eval(rows, &evalCtxSimplified, &simplifiedEvalResult);
-    } catch (...) {
-      if (!canThrow) {
-        LOG(ERROR)
-            << "Simplified eval wasn't supposed to throw, but it did. Aborting.";
-        throw;
+      try {
+        exprSetSimplified.eval(rows, &evalCtxSimplified, &simplifiedEvalResult);
+      } catch (...) {
+        if (!canThrow) {
+          LOG(ERROR)
+              << "Simplified eval wasn't supposed to throw, but it did. Aborting.";
+          throw;
+        }
+        exceptionSimplifiedPtr = std::current_exception();
       }
+    } catch (...) {
       exceptionSimplifiedPtr = std::current_exception();
     }
 

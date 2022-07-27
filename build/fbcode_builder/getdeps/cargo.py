@@ -7,14 +7,18 @@
 import os
 import re
 import shutil
+import typing
 
 from .builder import BuilderBase
+
+if typing.TYPE_CHECKING:
+    from .buildopts import BuildOptions
 
 
 class CargoBuilder(BuilderBase):
     def __init__(
         self,
-        build_opts,
+        build_opts: "BuildOptions",
         ctx,
         manifest,
         src_dir,
@@ -110,19 +114,20 @@ directory = "{vendored_dir}"
 """
                     )
 
-        # Point to vendored crates.io if possible
-        try:
-            from .facebook.rust import vendored_crates
+        if self.build_opts.fbsource_dir:
+            # Point to vendored crates.io if possible
+            try:
+                from .facebook.rust import vendored_crates
 
-            vendored_crates(self.build_opts, cargo_config_file)
-        except ImportError:
-            # This FB internal module isn't shippped to github,
-            # so just rely on cargo downloading crates on it's own
-            pass
+                vendored_crates(self.build_opts.fbsource_dir, cargo_config_file)
+            except ImportError:
+                # This FB internal module isn't shippped to github,
+                # so just rely on cargo downloading crates on it's own
+                pass
 
         return dep_to_git
 
-    def _prepare(self, install_dirs, reconfigure):
+    def _prepare(self, install_dirs, reconfigure) -> None:
         build_source_dir = self.build_source_dir()
         self.recreate_dir(self.src_dir, build_source_dir)
 

@@ -18,8 +18,8 @@
 #include "common/encode/Base64.h"
 #include "folly/json.h"
 
-namespace facebook {
-namespace velox {
+namespace facebook::velox {
+
 namespace {
 folly::json::serialization_opts& getOpts() {
   static folly::json::serialization_opts opts;
@@ -72,6 +72,20 @@ struct VariantEquality<TypeKind::DATE> {
       return evaluateNullEquality<NullEqualsNull>(a, b);
     } else {
       return a.value<TypeKind::DATE>() == b.value<TypeKind::DATE>();
+    }
+  }
+};
+
+// interval day time
+template <>
+struct VariantEquality<TypeKind::INTERVAL_DAY_TIME> {
+  template <bool NullEqualsNull>
+  static bool equals(const variant& a, const variant& b) {
+    if (a.isNull() || b.isNull()) {
+      return evaluateNullEquality<NullEqualsNull>(a, b);
+    } else {
+      return a.value<TypeKind::INTERVAL_DAY_TIME>() ==
+          b.value<TypeKind::INTERVAL_DAY_TIME>();
     }
   }
 };
@@ -287,11 +301,17 @@ std::string variant::toJson() const {
       auto& date = value<TypeKind::DATE>();
       return '"' + date.toString() + '"';
     }
+    case TypeKind::INTERVAL_DAY_TIME: {
+      auto& interval = value<TypeKind::INTERVAL_DAY_TIME>();
+      return '"' + interval.toString() + '"';
+    }
     case TypeKind::OPAQUE: {
       // Return expression that we can't parse back - we use toJson for
       // debugging only. Variant::serialize should actually serialize the data.
       return "\"Opaque<" + value<TypeKind::OPAQUE>().type->toString() + ">\"";
     }
+    case TypeKind::SHORT_DECIMAL:
+    case TypeKind::LONG_DECIMAL:
     case TypeKind::FUNCTION:
     case TypeKind::UNKNOWN:
     case TypeKind::INVALID:
@@ -376,6 +396,7 @@ folly::dynamic variant::serialize() const {
     }
 
     case TypeKind::DATE:
+    case TypeKind::INTERVAL_DAY_TIME:
     case TypeKind::TIMESTAMP:
     case TypeKind::INVALID:
       VELOX_NYI();
@@ -458,6 +479,7 @@ variant variant::create(const folly::dynamic& variantobj) {
       return variant::create<TypeKind::DOUBLE>(obj.asDouble());
     }
     case TypeKind::DATE:
+    case TypeKind::INTERVAL_DAY_TIME:
     case TypeKind::TIMESTAMP:
       FOLLY_FALLTHROUGH;
     case TypeKind::INVALID:
@@ -517,6 +539,10 @@ uint64_t variant::hash() const {
       auto dateValue = value<TypeKind::DATE>();
       return folly::Hash{}(dateValue.days());
     }
+    case TypeKind::INTERVAL_DAY_TIME: {
+      auto interval = value<TypeKind::INTERVAL_DAY_TIME>();
+      return folly::Hash{}(interval.milliseconds());
+    }
     case TypeKind::TIMESTAMP: {
       auto timestampValue = value<TypeKind::TIMESTAMP>();
       return folly::Hash{}(
@@ -545,5 +571,56 @@ uint64_t variant::hash() const {
   }
 }
 
-} // namespace velox
-} // namespace facebook
+/*static*/ bool variant::equalsFloatingPointWithEpsilon(
+    const variant& a,
+    const variant& b) {
+  if (a.isNull() or b.isNull()) {
+    return false;
+  }
+  if (a.kind_ == TypeKind::REAL) {
+    return fabs(a.value<TypeKind::REAL>() - b.value<TypeKind::REAL>()) <
+        kEpsilon;
+  }
+  return fabs(a.value<TypeKind::DOUBLE>() - b.value<TypeKind::DOUBLE>()) <
+      kEpsilon;
+}
+
+bool variant::lessThanWithEpsilon(const variant& other) const {
+  if (other.kind_ != this->kind_) {
+    return other.kind_ < this->kind_;
+  }
+  if ((kind_ == TypeKind::REAL) or (kind_ == TypeKind::DOUBLE)) {
+    if (isNull() && !other.isNull()) {
+      return true;
+    }
+    if (isNull() || other.isNull()) {
+      return false;
+    }
+
+    // If floating point values are roughly equal, then none of them is less.
+    if (equalsFloatingPointWithEpsilon(*this, other)) {
+      return false;
+    }
+    return *this < other;
+  }
+
+  return VELOX_DYNAMIC_TYPE_DISPATCH_ALL(lessThan, kind_, *this, other);
+}
+
+// Uses kEpsilon to compare floating point types (REAL and DOUBLE).
+// For testing purposes.
+bool variant::equalsWithEpsilon(const variant& other) const {
+  if (other.kind_ != this->kind_) {
+    return false;
+  }
+  if (other.isNull()) {
+    return this->isNull();
+  }
+  if ((kind_ == TypeKind::REAL) or (kind_ == TypeKind::DOUBLE)) {
+    return equalsFloatingPointWithEpsilon(*this, other);
+  }
+
+  return VELOX_DYNAMIC_TYPE_DISPATCH_ALL(equals, kind_, *this, other);
+}
+
+} // namespace facebook::velox

@@ -13,10 +13,15 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
+#include "velox/common/file/FileSystems.h"
 #include "velox/dwio/dwrf/test/utils/BatchMaker.h"
 #include "velox/exec/Aggregate.h"
+#include "velox/exec/PlanNodeStats.h"
+#include "velox/exec/tests/utils/AssertQueryBuilder.h"
 #include "velox/exec/tests/utils/OperatorTestBase.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
+#include "velox/exec/tests/utils/TempDirectoryPath.h"
 #include "velox/expression/FunctionSignature.h"
 
 using facebook::velox::exec::Aggregate;
@@ -188,10 +193,12 @@ static bool FB_ANONYMOUS_VARIABLE(g_AggregateFunction) =
 
 class AggregationTest : public OperatorTestBase {
  protected:
-  std::vector<RowVectorPtr> makeVectors(
-      const std::shared_ptr<const RowType>& rowType,
-      vector_size_t size,
-      int numVectors) {
+  void SetUp() override {
+    filesystems::registerLocalFileSystem();
+  }
+
+  std::vector<RowVectorPtr>
+  makeVectors(const RowTypePtr& rowType, vector_size_t size, int numVectors) {
     std::vector<RowVectorPtr> vectors;
     for (int32_t i = 0; i < numVectors; ++i) {
       auto vector = std::dynamic_pointer_cast<RowVector>(
@@ -220,7 +227,7 @@ class AggregationTest : public OperatorTestBase {
     auto op = PlanBuilder()
                   .values(vectors)
                   .aggregation(
-                      {rowType_->getChildIdx(keyName)},
+                      {keyName},
                       aggregates,
                       {},
                       core::AggregationNode::Step::kPartial,
@@ -269,7 +276,7 @@ class AggregationTest : public OperatorTestBase {
     auto op = PlanBuilder()
                   .values(vectors)
                   .aggregation(
-                      {0, 1, 6},
+                      {"c0", "c1", "c6"},
                       aggregates,
                       {},
                       core::AggregationNode::Step::kPartial,
@@ -342,7 +349,68 @@ class AggregationTest : public OperatorTestBase {
     }
   }
 
-  std::shared_ptr<const RowType> rowType_{
+  // Inserts 'key' into 'order' with random bits and a serial
+  // number. The serial number makes repeats of 'key' unique and the
+  // random bits randomize the order in the set.
+  void insertRandomOrder(
+      int64_t key,
+      int64_t serial,
+      folly::F14FastSet<uint64_t>& order) {
+    // The word has 24 bits of grouping key, 8 random bits and 32 bits of serial
+    // number.
+    order.insert(
+        ((folly::Random::rand32(rng_) & 0xff) << 24) | key | (serial << 32));
+  }
+
+  // Returns the key from a value inserted with insertRandomOrder().
+  int32_t randomOrderKey(uint64_t key) {
+    return key & ((1 << 24) - 1);
+  }
+
+  void addBatch(
+      int32_t count,
+      RowVectorPtr rows,
+      BufferPtr& dictionary,
+      std::vector<RowVectorPtr>& batches) {
+    std::vector<VectorPtr> children;
+    dictionary->setSize(count * sizeof(vector_size_t));
+    children.push_back(BaseVector::wrapInDictionary(
+        BufferPtr(nullptr), dictionary, count, rows->childAt(0)));
+    children.push_back(BaseVector::wrapInDictionary(
+        BufferPtr(nullptr), dictionary, count, rows->childAt(1)));
+    children.push_back(children[1]);
+    batches.push_back(vectorMaker_.rowVector(children));
+    dictionary = AlignedBuffer::allocate<vector_size_t>(
+        dictionary->capacity() / sizeof(vector_size_t), rows->pool());
+  }
+
+  // Makes batches which reference rows in 'rows' via dictionary. The
+  // dictionary indices are given by 'order', wich has values with
+  // indices plus random bits so as to create randomly scattered,
+  // sometimes repeated values.
+  void makeBatches(
+      RowVectorPtr rows,
+      folly::F14FastSet<uint64_t>& order,
+      std::vector<RowVectorPtr>& batches) {
+    constexpr int32_t kBatch = 1000;
+    BufferPtr dictionary =
+        AlignedBuffer::allocate<vector_size_t>(kBatch, rows->pool());
+    auto rawIndices = dictionary->asMutable<vector_size_t>();
+    int32_t counter = 0;
+    for (auto& n : order) {
+      rawIndices[counter++] = randomOrderKey(n);
+      if (counter == kBatch) {
+        addBatch(counter, rows, dictionary, batches);
+        rawIndices = dictionary->asMutable<vector_size_t>();
+        counter = 0;
+      }
+    }
+    if (counter) {
+      addBatch(counter, rows, dictionary, batches);
+    }
+  }
+
+  RowTypePtr rowType_{
       ROW({"c0", "c1", "c2", "c3", "c4", "c5", "c6"},
           {BIGINT(),
            SMALLINT(),
@@ -406,7 +474,9 @@ TEST_F(AggregationTest, global) {
 
   assertQuery(
       op,
-      "SELECT sum(15), sum(c1), sum(c2), sum(c4), sum(c5), min(15), min(c1), min(c2), min(c3), min(c4), min(c5), max(15), max(c1), max(c2), max(c3), max(c4), max(c5) FROM tmp");
+      "SELECT sum(15), sum(c1), sum(c2), sum(c4), sum(c5), "
+      "min(15), min(c1), min(c2), min(c3), min(c4), min(c5), "
+      "max(15), max(c1), max(c2), max(c3), max(c4), max(c5) FROM tmp");
 }
 
 TEST_F(AggregationTest, singleBigintKey) {
@@ -469,7 +539,7 @@ TEST_F(AggregationTest, aggregateOfNulls) {
   auto op = PlanBuilder()
                 .values(vectors)
                 .aggregation(
-                    {0},
+                    {"c0"},
                     {"sum(c1)", "min(c1)", "max(c1)"},
                     {},
                     core::AggregationNode::Step::kPartial,
@@ -494,85 +564,85 @@ TEST_F(AggregationTest, aggregateOfNulls) {
 
 TEST_F(AggregationTest, hashmodes) {
   rng_.seed(1);
-  std::vector<std::string> keyNames = {"C0", "C1", "C2", "C3", "C4", "C5"};
-  std::vector<std::shared_ptr<const Type>> types = {
-      BIGINT(), SMALLINT(), TINYINT(), VARCHAR(), VARCHAR(), VARCHAR()};
-  rowType_ = std::make_shared<RowType>(std::move(keyNames), std::move(types));
+  auto rowType =
+      ROW({"c0", "c1", "c2", "c3", "c4", "c5"},
+          {BIGINT(), SMALLINT(), TINYINT(), VARCHAR(), VARCHAR(), VARCHAR()});
 
   std::vector<RowVectorPtr> batches;
 
   // 20K rows with all at low cardinality.
-  makeModeTestKeys(rowType_, 20000, 2, 2, 2, 4, 4, 4, batches);
+  makeModeTestKeys(rowType, 20000, 2, 2, 2, 4, 4, 4, batches);
   // 20K rows with all at slightly higher cardinality, still in array range.
-  makeModeTestKeys(rowType_, 20000, 2, 2, 2, 4, 16, 4, batches);
+  makeModeTestKeys(rowType, 20000, 2, 2, 2, 4, 16, 4, batches);
   // 100K rows with cardinality outside of array range. We transit to
   // generic hash table from normalized keys when running out of quota
   // for distinct string storage for the sixth key.
-  makeModeTestKeys(rowType_, 100000, 1000000, 2, 2, 4, 4, 1000000, batches);
+  makeModeTestKeys(rowType, 100000, 1000000, 2, 2, 4, 4, 1000000, batches);
   createDuckDbTable(batches);
-  auto op = PlanBuilder()
-                .values(batches)
-                .singleAggregation({0, 1, 2, 3, 4, 5}, {"sum(1)"})
-                .planNode();
+  auto op =
+      PlanBuilder()
+          .values(batches)
+          .singleAggregation({"c0", "c1", "c2", "c3", "c4", "c5"}, {"sum(1)"})
+          .planNode();
 
   assertQuery(
       op,
       "SELECT c0, c1, C2, C3, C4, C5, sum(1) FROM tmp "
-      " GROUP BY c0, C1, C2, c3, C4, C5");
+      " GROUP BY c0, c1, c2, c3, c4, c5");
 }
 
 TEST_F(AggregationTest, rangeToDistinct) {
   rng_.seed(1);
-  std::vector<std::string> keyNames = {"C0", "C1", "C2", "C3", "C4", "C5"};
-  std::vector<std::shared_ptr<const Type>> types = {
-      BIGINT(), SMALLINT(), TINYINT(), VARCHAR(), VARCHAR(), VARCHAR()};
-  rowType_ = std::make_shared<RowType>(std::move(keyNames), std::move(types));
+  auto rowType =
+      ROW({"c0", "c1", "c2", "c3", "c4", "c5"},
+          {BIGINT(), SMALLINT(), TINYINT(), VARCHAR(), VARCHAR(), VARCHAR()});
 
   std::vector<RowVectorPtr> batches;
   // 20K rows with all at low cardinality. c0 is a range.
-  makeModeTestKeys(rowType_, 20000, 2000, 2, 2, 4, 4, 4, batches);
+  makeModeTestKeys(rowType, 20000, 2000, 2, 2, 4, 4, 4, batches);
   // 20 rows that make c0 represented as distincts.
-  makeModeTestKeys(rowType_, 20, 200000000, 2, 2, 4, 4, 4, batches);
+  makeModeTestKeys(rowType, 20, 200000000, 2, 2, 4, 4, 4, batches);
   // More keys in the low cardinality range. We see if these still hit
   // after the re-encoding of c0.
-  makeModeTestKeys(rowType_, 10000, 2000, 2, 2, 4, 4, 4, batches);
+  makeModeTestKeys(rowType, 10000, 2000, 2, 2, 4, 4, 4, batches);
 
   createDuckDbTable(batches);
-  auto op = PlanBuilder()
-                .values(batches)
-                .singleAggregation({0, 1, 2, 3, 4, 5}, {"sum(1)"})
-                .planNode();
+  auto op =
+      PlanBuilder()
+          .values(batches)
+          .singleAggregation({"c0", "c1", "c2", "c3", "c4", "c5"}, {"sum(1)"})
+          .planNode();
 
   assertQuery(
       op,
-      "SELECT c0, c1, C2, C3, C4, C5, sum(1) FROM tmp "
-      " GROUP BY c0, C1, C2, c3, C4, C5");
+      "SELECT c0, c1, c2, c3, c4, c5, sum(1) FROM tmp "
+      " GROUP BY c0, c1, c2, c3, c4, c5");
 }
 
 TEST_F(AggregationTest, allKeyTypes) {
   // Covers different key types. Unlike the integer/string tests, the
   // hash table begins life in the generic mode, not array or
   // normalized key. Add types here as they become supported.
-  std::vector<std::string> keyNames = {"C0", "C1", "C2", "C3", "C4", "C5"};
-  std::vector<std::shared_ptr<const Type>> types = {
-      DOUBLE(), REAL(), BIGINT(), INTEGER(), BOOLEAN(), VARCHAR()};
-  rowType_ = std::make_shared<RowType>(std::move(keyNames), std::move(types));
+  auto rowType =
+      ROW({"c0", "c1", "c2", "c3", "c4", "c5"},
+          {DOUBLE(), REAL(), BIGINT(), INTEGER(), BOOLEAN(), VARCHAR()});
 
   std::vector<RowVectorPtr> batches;
   for (auto i = 0; i < 10; ++i) {
     batches.push_back(std::static_pointer_cast<RowVector>(
-        BatchMaker::createBatch(rowType_, 100, *pool_)));
+        BatchMaker::createBatch(rowType, 100, *pool_)));
   }
   createDuckDbTable(batches);
-  auto op = PlanBuilder()
-                .values(batches)
-                .singleAggregation({0, 1, 2, 3, 4, 5}, {"sum(1)"})
-                .planNode();
+  auto op =
+      PlanBuilder()
+          .values(batches)
+          .singleAggregation({"c0", "c1", "c2", "c3", "c4", "c5"}, {"sum(1)"})
+          .planNode();
 
   assertQuery(
       op,
-      "SELECT c0, c1, C2, C3, C4, C5, sum(1) FROM tmp "
-      " GROUP BY c0, C1, C2, c3, C4, C5");
+      "SELECT c0, c1, c2, c3, c4, c5, sum(1) FROM tmp "
+      " GROUP BY c0, c1, c2, c3, c4, c5");
 }
 
 TEST_F(AggregationTest, partialAggregationMemoryLimit) {
@@ -589,30 +659,284 @@ TEST_F(AggregationTest, partialAggregationMemoryLimit) {
 
   // Set an artificially low limit on the amount of data to accumulate in
   // the partial aggregation.
-  CursorParameters params;
-  params.queryCtx = core::QueryCtx::createForTest();
-
-  params.queryCtx->setConfigOverridesUnsafe({
-      {core::QueryConfig::kMaxPartialAggregationMemory, "100"},
-  });
 
   // Distinct aggregation.
-  params.planNode = PlanBuilder()
-                        .values(vectors)
-                        .partialAggregation({0}, {})
-                        .finalAggregation()
-                        .planNode();
-
-  assertQuery(params, "SELECT distinct c0 FROM tmp");
+  AssertQueryBuilder(duckDbQueryRunner_)
+      .config(core::QueryConfig::kMaxPartialAggregationMemory, "100")
+      .plan(PlanBuilder()
+                .values(vectors)
+                .partialAggregation({"c0"}, {})
+                .finalAggregation()
+                .planNode())
+      .assertResults("SELECT distinct c0 FROM tmp");
 
   // Count aggregation.
-  params.planNode = PlanBuilder()
-                        .values(vectors)
-                        .partialAggregation({0}, {"count(1)"})
-                        .finalAggregation()
-                        .planNode();
+  AssertQueryBuilder(duckDbQueryRunner_)
+      .config(core::QueryConfig::kMaxPartialAggregationMemory, "100")
+      .plan(PlanBuilder()
+                .values(vectors)
+                .partialAggregation({"c0"}, {"count(1)"})
+                .finalAggregation()
+                .planNode())
+      .assertResults("SELECT c0, count(1) FROM tmp GROUP BY 1");
+}
 
-  assertQuery(params, "SELECT c0, count(1) FROM tmp GROUP BY 1");
+// Validates partial aggregate output types for SUM/MIN/MAX.
+TEST_F(AggregationTest, validatePartialTypes) {
+  auto vectors = makeVectors(rowType_, 10, 1);
+  auto execAggr = [&](const std::vector<std::string>& aggregates) {
+    auto plan = PlanBuilder()
+                    .values(vectors)
+                    .partialAggregation({}, aggregates)
+                    .planNode();
+    return AssertQueryBuilder(plan).copyResults(pool());
+  };
+
+  RowVectorPtr output;
+
+  // C0 - BIGINT
+  // TODO: sum(c0) overflows int64_t and fails UBSAN.
+  output = execAggr({"min(c0)", "max(c0)"});
+  EXPECT_EQ(BIGINT(), output->childAt(0)->type());
+  EXPECT_EQ(BIGINT(), output->childAt(1)->type());
+
+  // C1 - SMALLINT
+  output = execAggr({"sum(c1)", "min(c1)", "max(c1)"});
+  EXPECT_EQ(BIGINT(), output->childAt(0)->type());
+  EXPECT_EQ(BIGINT(), output->childAt(1)->type());
+  EXPECT_EQ(BIGINT(), output->childAt(2)->type());
+
+  // C2 - INTEGER
+  output = execAggr({"sum(c2)", "min(c2)", "max(c2)"});
+  EXPECT_EQ(BIGINT(), output->childAt(0)->type());
+  EXPECT_EQ(BIGINT(), output->childAt(1)->type());
+  EXPECT_EQ(BIGINT(), output->childAt(2)->type());
+
+  // C3 - BIGINT
+  // TODO: sum(c3) overflows int64_t and fails UBSAN.
+  output = execAggr({"min(c3)", "max(c3)"});
+  EXPECT_EQ(BIGINT(), output->childAt(0)->type());
+  EXPECT_EQ(BIGINT(), output->childAt(1)->type());
+
+  // C4 - REAL
+  output = execAggr({"sum(c4)", "min(c4)", "max(c4)"});
+  EXPECT_EQ(DOUBLE(), output->childAt(0)->type());
+  EXPECT_EQ(REAL(), output->childAt(1)->type());
+  EXPECT_EQ(REAL(), output->childAt(2)->type());
+
+  // C5 - DOUBLE
+  output = execAggr({"sum(c5)", "min(c5)", "max(c5)"});
+  EXPECT_EQ(DOUBLE(), output->childAt(0)->type());
+  EXPECT_EQ(DOUBLE(), output->childAt(1)->type());
+  EXPECT_EQ(DOUBLE(), output->childAt(2)->type());
+
+  // C6 - VARCHAR
+  output = execAggr({"min(c6)", "max(c6)"});
+  EXPECT_EQ(VARCHAR(), output->childAt(0)->type());
+  EXPECT_EQ(VARCHAR(), output->childAt(1)->type());
+
+  // Can't sum strings.
+  EXPECT_THROW(execAggr({"sum(c6)"}), VeloxUserError);
+}
+
+TEST_F(AggregationTest, spill) {
+  using core::QueryConfig;
+  constexpr int32_t kNumDistinct = 200000;
+  constexpr int64_t kMaxBytes = 24LL << 20; // 24 MB
+  rng_.seed(1);
+  rowType_ = ROW({"c0", "c1", "a"}, {INTEGER(), VARCHAR(), VARCHAR()});
+  // The input batch has kNumDistinct distinct keys. The repeat count of a key
+  // is given by min(1, (k % 100) - 90). The batch is repeated 3 times, each
+  // time in a different order.
+  RowVectorPtr rows = std::static_pointer_cast<RowVector>(
+      BaseVector::create(rowType_, kNumDistinct, pool_.get()));
+  folly::F14FastSet<uint64_t> order1;
+  folly::F14FastSet<uint64_t> order2;
+  folly::F14FastSet<uint64_t> order3;
+  auto c0 = rows->childAt(0)->as<FlatVector<int32_t>>();
+  c0->resize(kNumDistinct);
+  auto c1 = rows->childAt(1)->as<FlatVector<StringView>>();
+  c1->resize(kNumDistinct);
+  int32_t totalCount = 0;
+  for (int32_t i = 0; i < kNumDistinct; ++i) {
+    c0->set(i, i);
+    std::string str = fmt::format("{}{}", i, i);
+    c1->set(i, StringView(str));
+    auto numRepeats = std::max(1, (i % 100) - 90);
+    // We make random permutations of the data by adding the indices into a set
+    // with a random 6 high bits followed by a serial number. These are inlined
+    // in the F14FastSet in an order that depends on the hash number.
+    for (auto j = 0; j < numRepeats; ++j) {
+      ++totalCount;
+      insertRandomOrder(i, totalCount, order1);
+      insertRandomOrder(i, totalCount, order2);
+      insertRandomOrder(i, totalCount, order3);
+    }
+  }
+  std::vector<RowVectorPtr> batches;
+  makeBatches(rows, order1, batches);
+  makeBatches(rows, order2, batches);
+  makeBatches(rows, order3, batches);
+  auto results =
+      AssertQueryBuilder(PlanBuilder()
+                             .values(batches)
+                             .singleAggregation({"c0", "c1"}, {"array_agg(c2)"})
+                             .planNode())
+          .copyResults(pool_.get());
+
+  auto tempDirectory = exec::test::TempDirectoryPath::create();
+  auto queryCtx = core::QueryCtx::createForTest();
+  queryCtx->pool()->setMemoryUsageTracker(
+      velox::memory::MemoryUsageTracker::create(kMaxBytes, 0, kMaxBytes));
+
+  auto task =
+      AssertQueryBuilder(PlanBuilder()
+                             .values(batches)
+                             .singleAggregation({"c0", "c1"}, {"array_agg(c2)"})
+                             .planNode())
+          .queryCtx(queryCtx)
+          .config(QueryConfig::kSpillPath, tempDirectory->path)
+          .assertResults(results);
+
+  auto stats = task->taskStats().pipelineStats;
+
+  // Over 20MB spilled.
+  EXPECT_LT(20 << 20, stats[0].operatorStats[1].spilledBytes);
+}
+
+/// Verify number of memory allocations in the HashAggregation operator.
+TEST_F(AggregationTest, memoryAllocations) {
+  vector_size_t size = 1'024;
+  std::vector<RowVectorPtr> data;
+  for (auto i = 0; i < 10; ++i) {
+    data.push_back(makeRowVector({
+        makeFlatVector<int64_t>(size, [](auto row) { return row; }),
+        makeFlatVector<int64_t>(size, [](auto row) { return row + 3; }),
+    }));
+  }
+
+  createDuckDbTable(data);
+
+  core::PlanNodeId projectNodeId;
+  core::PlanNodeId aggNodeId;
+  auto plan = PlanBuilder()
+                  .values(data)
+                  .project({"c0 + c1"})
+                  .capturePlanNodeId(projectNodeId)
+                  .singleAggregation({}, {"sum(p0)"})
+                  .capturePlanNodeId(aggNodeId)
+                  .planNode();
+
+  auto task = assertQuery(plan, "SELECT sum(c0 + c1) FROM tmp");
+
+  // Verify memory allocations. Project operator should allocate a single vector
+  // and re-use it. Aggregation should make 2 allocations: 1 for the
+  // RowContainer holding single accumulator and 1 for the result.
+  auto planStats = toPlanStats(task->taskStats());
+  ASSERT_EQ(1, planStats.at(projectNodeId).numMemoryAllocations);
+  ASSERT_EQ(2, planStats.at(aggNodeId).numMemoryAllocations);
+
+  plan = PlanBuilder()
+             .values(data)
+             .project({"c0", "c0 + c1"})
+             .capturePlanNodeId(projectNodeId)
+             .singleAggregation({"c0"}, {"sum(p1)"})
+             .capturePlanNodeId(aggNodeId)
+             .planNode();
+
+  task = assertQuery(plan, "SELECT c0, sum(c0 + c1) FROM tmp GROUP BY 1");
+
+  // Verify memory allocations. Project operator should allocate a single vector
+  // and re-use it. Aggregation should make 5 allocations: 1 for the hash table,
+  // 1 for the RowContainer holding accumulators, 3 for results (2 for values
+  // and nulls buffers of the grouping key column, 1 for sum column).
+  planStats = toPlanStats(task->taskStats());
+  ASSERT_EQ(1, planStats.at(projectNodeId).numMemoryAllocations);
+  ASSERT_EQ(5, planStats.at(aggNodeId).numMemoryAllocations);
+}
+
+TEST_F(AggregationTest, groupingSets) {
+  vector_size_t size = 1'000;
+  auto data = makeRowVector(
+      {"k1", "k2", "a", "b"},
+      {
+          makeFlatVector<int64_t>(size, [](auto row) { return row % 11; }),
+          makeFlatVector<int64_t>(size, [](auto row) { return row % 17; }),
+          makeFlatVector<int64_t>(size, [](auto row) { return row; }),
+          makeFlatVector<StringView>(
+              size,
+              [](auto row) { return StringView(std::string(row % 12, 'x')); }),
+      });
+
+  createDuckDbTable({data});
+
+  auto plan =
+      PlanBuilder()
+          .values({data})
+          .groupId({{"k1"}, {"k2"}}, {"a", "b"})
+          .singleAggregation(
+              {"k1", "k2", "group_id"},
+              {"count(1) as count_1", "sum(a) as sum_a", "max(b) as max_b"})
+          .project({"k1", "k2", "count_1", "sum_a", "max_b"})
+          .planNode();
+
+  assertQuery(
+      plan,
+      "SELECT k1, k2, count(1), sum(a), max(b) FROM tmp GROUP BY GROUPING SETS ((k1), (k2))");
+
+  // Compute a subset of aggregates per grouping set by using masks based on
+  // group_id column.
+  plan = PlanBuilder()
+             .values({data})
+             .groupId({{"k1"}, {"k2"}}, {"a", "b"})
+             .project(
+                 {"k1",
+                  "k2",
+                  "group_id",
+                  "a",
+                  "b",
+                  "group_id = 0 as mask_a",
+                  "group_id = 1 as mask_b"})
+             .singleAggregation(
+                 {"k1", "k2", "group_id"},
+                 {"count(1) as count_1", "sum(a) as sum_a", "max(b) as max_b"},
+                 {"", "mask_a", "mask_b"})
+             .project({"k1", "k2", "count_1", "sum_a", "max_b"})
+             .planNode();
+
+  assertQuery(
+      plan,
+      "SELECT k1, null, count(1), sum(a), null FROM tmp GROUP BY k1 "
+      "UNION ALL "
+      "SELECT null, k2, count(1), null, max(b) FROM tmp GROUP BY k2");
+
+  // Cube.
+  plan = PlanBuilder()
+             .values({data})
+             .groupId({{"k1", "k2"}, {"k1"}, {"k2"}, {}}, {"a", "b"})
+             .singleAggregation(
+                 {"k1", "k2", "group_id"},
+                 {"count(1) as count_1", "sum(a) as sum_a", "max(b) as max_b"})
+             .project({"k1", "k2", "count_1", "sum_a", "max_b"})
+             .planNode();
+
+  assertQuery(
+      plan,
+      "SELECT k1, k2, count(1), sum(a), max(b) FROM tmp GROUP BY CUBE (k1, k2)");
+
+  // Rollup.
+  plan = PlanBuilder()
+             .values({data})
+             .groupId({{"k1", "k2"}, {"k1"}, {}}, {"a", "b"})
+             .singleAggregation(
+                 {"k1", "k2", "group_id"},
+                 {"count(1) as count_1", "sum(a) as sum_a", "max(b) as max_b"})
+             .project({"k1", "k2", "count_1", "sum_a", "max_b"})
+             .planNode();
+
+  assertQuery(
+      plan,
+      "SELECT k1, k2, count(1), sum(a), max(b) FROM tmp GROUP BY ROLLUP (k1, k2)");
 }
 
 } // namespace

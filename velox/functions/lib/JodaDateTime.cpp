@@ -16,6 +16,7 @@
 
 #include "velox/functions/lib/JodaDateTime.h"
 #include <cctype>
+#include <string>
 #include <unordered_map>
 #include "velox/common/base/Exceptions.h"
 #include "velox/type/TimestampConversion.h"
@@ -24,6 +25,7 @@
 namespace facebook::velox::functions {
 
 static thread_local std::string timezoneBuffer = "+00:00";
+static const char* defaultTrailingOffset = "00";
 
 namespace {
 
@@ -169,11 +171,13 @@ void parseFail(const std::string& input, const char* cur, const char* end) {
 // not be parsed.
 int64_t
 parseTimezoneOffset(const char* cur, const char* end, JodaDate& jodaDate) {
-  // For timezone offset ids, there are only two formats allowed by Joda:
+  // For timezone offset ids, there are three formats allowed by Joda:
   //
   // 1. '+' or '-' followed by two digits: "+00"
   // 2. '+' or '-' followed by two digits, ":", then two more digits:
   //    "+00:00"
+  // 3. '+' or '-' followed by four digits:
+  //    "+0000"
   if (cur < end && (*cur == '-' || *cur == '+')) {
     // Long format: "+00:00"
     if ((end - cur) >= 6 && *(cur + 3) == ':') {
@@ -186,6 +190,22 @@ parseTimezoneOffset(const char* cur, const char* end, JodaDate& jodaDate) {
       }
       return 6;
     }
+    // Long format without colon: "+0000"
+    else if ((end - cur) >= 5 && *(cur + 3) != ':') {
+      // Same fast path described above.
+      if (std::strncmp(cur + 1, "0000", 4) == 0) {
+        jodaDate.timezoneId = 0;
+      } else {
+        // We need to concatenate the 3 first chars with ":" followed by the
+        // last 2 chars before calling getTimeZoneID, so we use a static
+        // thread_local buffer to prevent extra allocations.
+        std::memcpy(&timezoneBuffer[0], cur, 3);
+        std::memcpy(&timezoneBuffer[4], cur + 3, 2);
+
+        jodaDate.timezoneId = util::getTimeZoneID(timezoneBuffer);
+      }
+      return 5;
+    }
     // Short format: "+00"
     else if ((end - cur) >= 3) {
       // Same fast path described above.
@@ -196,12 +216,63 @@ parseTimezoneOffset(const char* cur, const char* end, JodaDate& jodaDate) {
         // calling getTimeZoneID, so we use a static thread_local buffer to
         // prevent extra allocations.
         std::memcpy(&timezoneBuffer[0], cur, 3);
+        std::memcpy(&timezoneBuffer[4], defaultTrailingOffset, 2);
         jodaDate.timezoneId = util::getTimeZoneID(timezoneBuffer);
       }
       return 3;
     }
   }
   throw std::runtime_error("Unable to parse timezone offset id.");
+}
+
+// According to JodaFormatSpecifier enum class
+std::string getSpecifierName(int enumInt) {
+  switch (enumInt) {
+    case 0:
+      return "ERA";
+    case 1:
+      return "CENTURY_OF_ERA";
+    case 2:
+      return "YEAR_OF_ERA";
+    case 3:
+      return "WEEK_YEAR";
+    case 4:
+      return "WEEK_OF_WEEK_YEAR";
+    case 5:
+      return "DAY_OF_WEEK";
+    case 6:
+      return "DAY_OF_WEEK_TEXT";
+    case 7:
+      return "YEAR";
+    case 8:
+      return "DAY_OF_YEAR";
+    case 9:
+      return "MONTH_OF_YEAR";
+    case 10:
+      return "DAY_OF_MONTH";
+    case 11:
+      return "HALFDAY_OF_DAY";
+    case 12:
+      return "HOUR_OF_HALFDAY";
+    case 13:
+      return "CLOCK_HOUR_OF_HALFDAY";
+    case 14:
+      return "HOUR_OF_DAY";
+    case 15:
+      return "CLOCK_HOUR_OF_DAY";
+    case 16:
+      return "MINUTE_OF_HOUR";
+    case 17:
+      return "SECOND_OF_MINUTE";
+    case 18:
+      return "FRACTION_OF_SECOND";
+    case 19:
+      return "TIMEZONE";
+    case 20:
+      return "TIMEZONE_OFFSET_ID";
+    default:
+      return "[Specifier not updated to conversion function yet]";
+  }
 }
 
 void parseFromPattern(
@@ -276,8 +347,15 @@ void parseFromPattern(
         jodaDate.second = number;
         break;
 
+      case JodaFormatSpecifier::FRACTION_OF_SECOND:
+        jodaDate.microsecond = number * util::kMicrosPerMsec;
+        break;
+
       default:
-        VELOX_NYI("Numeric Joda specifier not implemented yet.");
+        VELOX_NYI(
+            "Numeric Joda specifier JodaFormatSpecifier::" +
+            getSpecifierName(static_cast<int>(curPattern)) +
+            " not implemented yet.");
     }
   } else {
     try {

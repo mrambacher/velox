@@ -14,8 +14,8 @@
  * limitations under the License.
  */
 #include "velox/expression/Expr.h"
+#include "velox/expression/StringWriter.h"
 #include "velox/expression/VectorFunction.h"
-#include "velox/expression/VectorUdfTypeSystem.h"
 #include "velox/functions/lib/StringEncodingUtils.h"
 #include "velox/functions/lib/string/StringImpl.h"
 #include "velox/vector/FlatVector.h"
@@ -37,7 +37,7 @@ class ReverseFunction : public exec::VectorFunction {
         const FlatVector<StringView>* input,
         FlatVector<StringView>* results) {
       rows.applyToSelected([&](int row) {
-        auto proxy = exec::StringProxy<FlatVector<StringView>>(results, row);
+        auto proxy = exec::StringWriter<>(results, row);
         stringImpl::reverse<isAscii>(proxy, input->valueAt(row).getString());
         proxy.finalize();
       });

@@ -14,9 +14,11 @@
  * limitations under the License.
  */
 #pragma once
+#include "velox/common/base/RuntimeMetrics.h"
 #include "velox/common/time/CpuWallTimer.h"
 #include "velox/core/PlanNode.h"
 #include "velox/exec/Driver.h"
+#include "velox/exec/JoinBridge.h"
 #include "velox/type/Filter.h"
 
 namespace facebook::velox::exec {
@@ -32,12 +34,13 @@ struct IdentityProjection {
 };
 
 struct MemoryStats {
-  uint64_t userMemoryReservation = {};
-  uint64_t revocableMemoryReservation = {};
-  uint64_t systemMemoryReservation = {};
-  uint64_t peakUserMemoryReservation = {};
-  uint64_t peakSystemMemoryReservation = {};
-  uint64_t peakTotalMemoryReservation = {};
+  uint64_t userMemoryReservation{0};
+  uint64_t revocableMemoryReservation{0};
+  uint64_t systemMemoryReservation{0};
+  uint64_t peakUserMemoryReservation{0};
+  uint64_t peakSystemMemoryReservation{0};
+  uint64_t peakTotalMemoryReservation{0};
+  uint64_t numMemoryAllocations{0};
 
   void update(const std::shared_ptr<memory::MemoryUsageTracker>& tracker) {
     if (!tracker) {
@@ -48,6 +51,7 @@ struct MemoryStats {
     peakUserMemoryReservation = tracker->getPeakUserBytes();
     peakSystemMemoryReservation = tracker->getPeakSystemBytes();
     peakTotalMemoryReservation = tracker->getPeakTotalBytes();
+    numMemoryAllocations = tracker->getNumAllocs();
   }
 
   void add(const MemoryStats& other) {
@@ -60,6 +64,7 @@ struct MemoryStats {
         peakSystemMemoryReservation, other.peakSystemMemoryReservation);
     peakTotalMemoryReservation =
         std::max(peakTotalMemoryReservation, other.peakTotalMemoryReservation);
+    numMemoryAllocations += other.numMemoryAllocations;
   }
 
   void clear() {
@@ -69,56 +74,47 @@ struct MemoryStats {
     peakUserMemoryReservation = 0;
     peakSystemMemoryReservation = 0;
     peakTotalMemoryReservation = 0;
-  }
-};
-
-struct RuntimeMetric {
-  int64_t sum{0};
-  int64_t count{0};
-  int64_t min{std::numeric_limits<int64_t>::max()};
-  int64_t max{std::numeric_limits<int64_t>::min()};
-
-  void addValue(int64_t value) {
-    sum += value;
-    count++;
-    min = std::min(min, value);
-    max = std::max(max, value);
-  }
-
-  void merge(const RuntimeMetric& other) {
-    sum += other.sum;
-    count += other.count;
-    min = std::min(min, other.min);
-    max = std::max(max, other.max);
+    numMemoryAllocations = 0;
   }
 };
 
 struct OperatorStats {
-  // Initial ordinal position in the operator's pipeline.
+  /// Initial ordinal position in the operator's pipeline.
   int32_t operatorId = 0;
   int32_t pipelineId = 0;
   core::PlanNodeId planNodeId;
-  // Name for reporting. We use Presto compatible names set at
-  // construction of the Operator where applicable.
+
+  /// Name for reporting. We use Presto compatible names set at
+  /// construction of the Operator where applicable.
   std::string operatorType;
 
-  // Number of splits (or chunks of work). Split can be a part of data file to
-  // read.
+  /// Number of splits (or chunks of work). Split can be a part of data file to
+  /// read.
   int64_t numSplits{0};
 
-  // Bytes read from raw source, e.g. compressed file or network connection.
+  /// Bytes read from raw source, e.g. compressed file or network connection.
   uint64_t rawInputBytes = 0;
   uint64_t rawInputPositions = 0;
 
   CpuWallTiming addInputTiming;
-  // Bytes of input in terms of retained size of input vectors.
+
+  /// Bytes of input in terms of retained size of input vectors.
   uint64_t inputBytes = 0;
   uint64_t inputPositions = 0;
 
+  /// Number of input batches / vectors. Allows to compute an average batch
+  /// size.
+  uint64_t inputVectors = 0;
+
   CpuWallTiming getOutputTiming;
-  // Bytes of output in terms of retained size of vectors.
+
+  /// Bytes of output in terms of retained size of vectors.
   uint64_t outputBytes = 0;
   uint64_t outputPositions = 0;
+
+  /// Number of output batches / vectors. Allows to compute an average batch
+  /// size.
+  uint64_t outputVectors = 0;
 
   uint64_t physicalWrittenBytes = 0;
 
@@ -128,7 +124,15 @@ struct OperatorStats {
 
   MemoryStats memoryStats;
 
+  // Total bytes written for spilling.
+  uint64_t spilledBytes{0};
+
+  // Total rows written for spilling.
+  uint64_t spilledRows{0};
+
   std::unordered_map<std::string, RuntimeMetric> runtimeStats;
+
+  int numDrivers = 0;
 
   OperatorStats(
       int32_t _operatorId,
@@ -140,8 +144,13 @@ struct OperatorStats {
         planNodeId(std::move(_planNodeId)),
         operatorType(std::move(_operatorType)) {}
 
-  void addRuntimeStat(const std::string& name, int64_t value) {
-    runtimeStats[name].addValue(value);
+  void addRuntimeStat(const std::string& name, const RuntimeCounter& value) {
+    if (UNLIKELY(runtimeStats.count(name) == 0)) {
+      runtimeStats.insert(std::pair(name, RuntimeMetric(value.unit)));
+    } else {
+      VELOX_CHECK_EQ(runtimeStats.at(name).unit, value.unit);
+    }
+    runtimeStats.at(name).addValue(value.value);
   }
 
   void add(const OperatorStats& other);
@@ -152,25 +161,11 @@ class OperatorCtx {
  public:
   explicit OperatorCtx(DriverCtx* driverCtx);
 
-  velox::memory::MemoryPool* pool() const {
-    return pool_;
-  }
-
-  memory::MappedMemory* mappedMemory() const;
-
   const std::shared_ptr<Task>& task() const {
     return driverCtx_->task;
   }
 
   const std::string& taskId() const;
-
-  core::ExecCtx* execCtx() const {
-    return driverCtx_->execCtx.get();
-  }
-
-  core::QueryCtx* queryCtx() const {
-    return driverCtx_->execCtx->queryCtx();
-  }
 
   Driver* driver() const {
     return driverCtx_->driver;
@@ -180,12 +175,29 @@ class OperatorCtx {
     return driverCtx_;
   }
 
+  velox::memory::MemoryPool* pool() const {
+    return pool_;
+  }
+
+  memory::MappedMemory* mappedMemory() const;
+
+  core::ExecCtx* execCtx() const;
+
+  // Makes an extract of QueryCtx for use in a connector. 'planNodeId'
+  // is the id of the calling TableScan. This and the task id identify
+  // the scan for column access tracking.
+  std::shared_ptr<connector::ConnectorQueryCtx> createConnectorQueryCtx(
+      const std::string& connectorId,
+      const std::string& planNodeId) const;
+
  private:
   DriverCtx* driverCtx_;
   velox::memory::MemoryPool* pool_;
 
   // These members are created on demand.
   mutable memory::MappedMemory* mappedMemory_{nullptr};
+  mutable std::unique_ptr<core::ExecCtx> execCtx_;
+  mutable std::unique_ptr<connector::ExpressionEvaluator> expressionEvaluator_;
 };
 
 // Query operator
@@ -199,15 +211,27 @@ class Operator {
 
     // Translates plan node to operator. Returns nullptr if the plan node cannot
     // be handled by this factory.
-    virtual std::unique_ptr<Operator> translate(
-        DriverCtx* ctx,
-        int32_t id,
-        const std::shared_ptr<const core::PlanNode>& node) = 0;
+    virtual std::unique_ptr<Operator>
+    toOperator(DriverCtx* ctx, int32_t id, const core::PlanNodePtr& node) = 0;
+
+    // Translates plan node to join bridge. Returns nullptr if the plan node
+    // cannot be handled by this factory.
+    virtual std::unique_ptr<JoinBridge> toJoinBridge(
+        const core::PlanNodePtr& /* node */) {
+      return nullptr;
+    }
+
+    // Translates plan node to operator supplier. Returns nullptr if the plan
+    // node cannot be handled by this factory.
+    virtual OperatorSupplier toOperatorSupplier(
+        const core::PlanNodePtr& /* node */) {
+      return nullptr;
+    }
 
     // Returns max driver count for the plan node. Returns std::nullopt if the
     // plan node cannot be handled by this factory.
     virtual std::optional<uint32_t> maxDrivers(
-        const std::shared_ptr<const core::PlanNode>& /* node */) {
+        const core::PlanNodePtr& /* node */) {
       return std::nullopt;
     }
   };
@@ -312,7 +336,6 @@ class Operator {
   // should be called after this.
   virtual void close() {
     input_ = nullptr;
-    output_ = nullptr;
     results_.clear();
   }
 
@@ -331,7 +354,7 @@ class Operator {
 
   void recordBlockingTime(uint64_t start);
 
-  virtual std::string toString();
+  virtual std::string toString() const;
 
   velox::memory::MemoryPool* pool() {
     return operatorCtx_->pool();
@@ -348,44 +371,31 @@ class Operator {
   // Calls all the registered PlanNodeTranslators on 'planNode' and
   // returns the result of the first one that returns non-nullptr
   // or nullptr if all return nullptr.
-  static std::unique_ptr<Operator> fromPlanNode(
-      DriverCtx* ctx,
-      int32_t id,
-      const std::shared_ptr<const core::PlanNode>& planNode);
+  static std::unique_ptr<Operator>
+  fromPlanNode(DriverCtx* ctx, int32_t id, const core::PlanNodePtr& planNode);
+
+  // Calls all the registered PlanNodeTranslators on 'planNode' and
+  // returns the result of the first one that returns non-nullptr
+  // or nullptr if all return nullptr.
+  static std::unique_ptr<JoinBridge> joinBridgeFromPlanNode(
+      const core::PlanNodePtr& planNode);
+
+  // Calls all the registered PlanNodeTranslators on 'planNode' and
+  // returns the result of the first one that returns non-nullptr
+  // or nullptr if all return nullptr.
+  static OperatorSupplier operatorSupplierFromPlanNode(
+      const core::PlanNodePtr& planNode);
 
   // Calls `maxDrivers` on all the registered PlanNodeTranslators and returns
   // the first one that is not std::nullopt or std::nullopt otherwise.
-  static std::optional<uint32_t> maxDrivers(
-      const std::shared_ptr<const core::PlanNode>& planNode);
+  static std::optional<uint32_t> maxDrivers(const core::PlanNodePtr& planNode);
 
  protected:
   static std::vector<std::unique_ptr<PlanNodeTranslator>>& translators();
 
-  // Clears the columns of 'output_' that are projected from
-  // 'input_'. This should be done when preparing to produce a next
-  // batch of output to drop any lingering references to row
-  // number mappings or input vectors. In this way input vectors do
-  // not have to be copied and will be singly referenced by their
-  // producer.
-  void clearIdentityProjectedOutput();
-
-  // Returns a previously used result vector if it exists and is suitable for
-  // reuse, nullptr otherwise.
-  VectorPtr getResultVector(ChannelIndex index);
-
-  // Fills 'result' with a vector for each input of
-  // 'resultProjection_'. These are recycled from 'output_' if
-  // suitable for reuse.
-  void getResultVectors(std::vector<VectorPtr>* result);
-
-  // Copies 'input_' and 'results_' into 'output_' according to
+  // Creates output vector from 'input_' and 'results_' according to
   // 'identityProjections_' and 'resultProjections_'.
   RowVectorPtr fillOutput(vector_size_t size, BufferPtr mapping);
-
-  // Drops references to identity projected columns from 'output_' and
-  // clears 'input_'. The producer will see its vectors as singly
-  // referenced.
-  void inputProcessed();
 
   std::unique_ptr<OperatorCtx> operatorCtx_;
   OperatorStats stats_;
@@ -394,10 +404,6 @@ class Operator {
   // Holds the last data from addInput until it is processed. Reset after the
   // input is processed.
   RowVectorPtr input_;
-
-  // Holds the last data returned by getOutput. References vectors
-  // from 'input_' and from 'results_'. Reused if singly referenced.
-  RowVectorPtr output_;
 
   bool noMoreInput_ = false;
   std::vector<IdentityProjection> identityProjections_;
@@ -415,23 +421,21 @@ class Operator {
       dynamicFilters_;
 };
 
-constexpr ChannelIndex kConstantChannel =
-    std::numeric_limits<ChannelIndex>::max();
-
 /// Given a row type returns indices for the specified subset of columns.
 std::vector<ChannelIndex> toChannels(
     const RowTypePtr& rowType,
-    const std::vector<std::shared_ptr<const core::FieldAccessTypedExpr>>&
-        fields);
+    const std::vector<std::shared_ptr<const core::ITypedExpr>>& exprs);
 
-ChannelIndex exprToChannel(const core::ITypedExpr* expr, TypePtr type);
+ChannelIndex exprToChannel(const core::ITypedExpr* expr, const TypePtr& type);
 
-/// Given an input type and output type that contains a subset of the input type
-/// columns possibly in different order returns the indices of the output
-/// columns in the input type.
+/// Given a source output type and target input type we return the indices of
+/// the target input columns in the source output type.
+/// The target output type is used to determine if the projection is identity.
+/// An empty indices vector is returned when projection is identity.
 std::vector<ChannelIndex> calculateOutputChannels(
-    const RowTypePtr& inputType,
-    const RowTypePtr& outputType);
+    const RowTypePtr& sourceOutputType,
+    const RowTypePtr& targetInputType,
+    const RowTypePtr& targetOutputType);
 
 // A first operator in a Driver, e.g. table scan or exchange client.
 class SourceOperator : public Operator {
@@ -469,7 +473,8 @@ class OperatorRuntimeStatWriter : public BaseRuntimeStatWriter {
  public:
   explicit OperatorRuntimeStatWriter(Operator* op) : operator_{op} {}
 
-  void addRuntimeStat(const std::string& name, int64_t value) override {
+  void addRuntimeStat(const std::string& name, const RuntimeCounter& value)
+      override {
     if (operator_) {
       operator_->stats().addRuntimeStat(name, value);
     }

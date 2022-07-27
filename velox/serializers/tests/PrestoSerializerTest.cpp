@@ -14,14 +14,16 @@
  * limitations under the License.
  */
 #include "velox/serializers/PrestoSerializer.h"
+#include <folly/Random.h>
 #include <gtest/gtest.h>
 #include "velox/common/memory/ByteStream.h"
 #include "velox/functions/prestosql/types/TimestampWithTimeZoneType.h"
 #include "velox/vector/BaseVector.h"
 #include "velox/vector/ComplexVector.h"
-#include "velox/vector/tests/VectorMaker.h"
+#include "velox/vector/tests/VectorTestBase.h"
 
 using namespace facebook::velox;
+using namespace facebook::velox::test;
 
 class PrestoSerializerTest : public ::testing::Test {
  protected:
@@ -61,7 +63,7 @@ class PrestoSerializerTest : public ::testing::Test {
 
     serializer->append(rowVector, folly::Range(rows.data(), numRows));
     facebook::velox::serializer::presto::PrestoOutputStreamListener listener;
-    OutputStream out(output, &listener);
+    OStreamOutputStream out(output, &listener);
     serializer->flush(&out);
   }
 
@@ -94,15 +96,6 @@ class PrestoSerializerTest : public ::testing::Test {
     std::vector<VectorPtr> childVectors = {a, b};
 
     return vectorMaker_->rowVector(childVectors);
-  }
-
-  void assertEqualVectors(VectorPtr actual, VectorPtr expected) {
-    ASSERT_EQ(actual->size(), expected->size());
-    for (int i = 0; i < expected->size(); i++) {
-      ASSERT_TRUE(expected->equalValueAt(actual.get(), i, i))
-          << "at " << i << ". Expected: " << expected->toString(i)
-          << ", got: " << actual->toString(i);
-    }
   }
 
   void testRoundTrip(VectorPtr vector) {
@@ -200,6 +193,20 @@ TEST_F(PrestoSerializerTest, timestampWithTimeZone) {
       BufferPtr(nullptr),
       100,
       std::vector<VectorPtr>{timestamp, timezone});
+
+  testRoundTrip(vector);
+
+  // Add some nulls.
+  for (auto i = 0; i < 100; i += 7) {
+    vector->setNull(i, true);
+  }
+  testRoundTrip(vector);
+}
+
+TEST_F(PrestoSerializerTest, intervalDayTime) {
+  auto vector = vectorMaker_->flatVector<IntervalDayTime>(100, [](auto row) {
+    return IntervalDayTime(row + folly::Random::rand32());
+  });
 
   testRoundTrip(vector);
 

@@ -13,13 +13,12 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include "velox/exec/tests/utils/AssertQueryBuilder.h"
 #include "velox/exec/tests/utils/HiveConnectorTestBase.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
 
 using namespace facebook::velox;
 using namespace facebook::velox::exec::test;
-
-static const std::string kWriter = "LocalPartitionTest.Writer";
 
 class LocalPartitionTest : public HiveConnectorTestBase {
  protected:
@@ -42,7 +41,7 @@ class LocalPartitionTest : public HiveConnectorTestBase {
       const std::vector<RowVectorPtr>& vectors) {
     auto filePaths = makeFilePaths(vectors.size());
     for (auto i = 0; i < vectors.size(); i++) {
-      writeToFile(filePaths[i]->path, kWriter, vectors[i]);
+      writeToFile(filePaths[i]->path, vectors[i]);
     }
     return filePaths;
   }
@@ -59,6 +58,28 @@ class LocalPartitionTest : public HiveConnectorTestBase {
     ASSERT_EQ(stats.outputPositions, expectedPositions);
     ASSERT_TRUE(stats.inputBytes > 0);
     ASSERT_EQ(stats.inputBytes, stats.outputBytes);
+  }
+
+  void assertTaskReferenceCount(
+      const std::shared_ptr<exec::Task>& task,
+      int expected) {
+    // Make sure there is only one reference to Task left, i.e. no Driver is
+    // blocked forever. Wait for a bit if that's not immediately the case.
+    if (task.use_count() > expected) {
+      std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+    ASSERT_EQ(expected, task.use_count());
+  }
+
+  void waitForTaskState(
+      const std::shared_ptr<exec::Task>& task,
+      exec::TaskState expected) {
+    if (task->state() != expected) {
+      auto& executor = folly::QueuedImmediateExecutor::instance();
+      auto future = task->stateChangeFuture(1'000'000).via(&executor);
+      future.wait();
+      EXPECT_EQ(expected, task->state());
+    }
   }
 };
 
@@ -86,8 +107,7 @@ TEST_F(LocalPartitionTest, gather) {
                 .singleAggregation({}, {"count(1)", "min(c0)", "max(c0)"})
                 .planNode();
 
-  auto task = assertQuery(
-      op, std::vector<std::shared_ptr<TempFilePath>>{}, "SELECT 300, -71, 152");
+  auto task = assertQuery(op, "SELECT 300, -71, 152");
   verifyExchangeSourceOperatorStats(task, 300);
 
   auto filePaths = writeToFiles(vectors);
@@ -113,19 +133,13 @@ TEST_F(LocalPartitionTest, gather) {
            .singleAggregation({}, {"count(1)", "min(c0)", "max(c0)"})
            .planNode();
 
-  int32_t fileIndex = 0;
-  task = ::assertQuery(
-      op,
-      [&](exec::Task* task) {
-        while (fileIndex < filePaths.size()) {
-          auto planNodeId = scanNodeIds[fileIndex];
-          addSplit(task, planNodeId, makeHiveSplit(filePaths[fileIndex]->path));
-          task->noMoreSplits(planNodeId);
-          ++fileIndex;
-        }
-      },
-      "SELECT 300, -71, 152",
-      duckDbQueryRunner_);
+  AssertQueryBuilder queryBuilder(op, duckDbQueryRunner_);
+  for (auto i = 0; i < filePaths.size(); ++i) {
+    queryBuilder.split(
+        scanNodeIds[i], makeHiveConnectorSplit(filePaths[i]->path));
+  }
+
+  task = queryBuilder.assertResults("SELECT 300, -71, 152");
   verifyExchangeSourceOperatorStats(task, 300);
 }
 
@@ -148,39 +162,31 @@ TEST_F(LocalPartitionTest, partition) {
     auto builder = PlanBuilder(planNodeIdGenerator);
     auto scanNode = builder.tableScan(rowType).planNode();
     scanNodeIds.push_back(scanNode->id());
-    return builder.partialAggregation({0}, {"count(1)"}).planNode();
+    return builder.partialAggregation({"c0"}, {"count(1)"}).planNode();
   };
 
   auto op = PlanBuilder(planNodeIdGenerator)
                 .localPartition(
-                    {0},
+                    {"c0"},
                     {
                         scanAggNode(),
                         scanAggNode(),
                         scanAggNode(),
                     })
-                .partialAggregation({0}, {"count(1)"})
+                .partialAggregation({"c0"}, {"count(1)"})
                 .planNode();
 
   createDuckDbTable(vectors);
 
-  CursorParameters params;
-  params.planNode = op;
-  params.maxDrivers = 2;
+  AssertQueryBuilder queryBuilder(op, duckDbQueryRunner_);
+  queryBuilder.maxDrivers(2);
+  for (auto i = 0; i < filePaths.size(); ++i) {
+    queryBuilder.split(
+        scanNodeIds[i], makeHiveConnectorSplit(filePaths[i]->path));
+  }
 
-  uint32_t fileIndex = 0;
-  auto task = ::assertQuery(
-      params,
-      [&](exec::Task* task) {
-        while (fileIndex < filePaths.size()) {
-          auto planNodeId = scanNodeIds[fileIndex];
-          addSplit(task, planNodeId, makeHiveSplit(filePaths[fileIndex]->path));
-          task->noMoreSplits(planNodeId);
-          ++fileIndex;
-        }
-      },
-      "SELECT c0, count(1) FROM tmp GROUP BY 1",
-      duckDbQueryRunner_);
+  auto task =
+      queryBuilder.assertResults("SELECT c0, count(1) FROM tmp GROUP BY 1");
   verifyExchangeSourceOperatorStats(task, 300);
 }
 
@@ -211,20 +217,10 @@ TEST_F(LocalPartitionTest, maxBufferSizeGather) {
                 .singleAggregation({}, {"count(1)", "min(c0)", "max(c0)"})
                 .planNode();
 
-  CursorParameters params;
-  params.planNode = op;
-  params.queryCtx = core::QueryCtx::createForTest();
+  auto task = AssertQueryBuilder(op, duckDbQueryRunner_)
+                  .config(core::QueryConfig::kMaxLocalExchangeBufferSize, "100")
+                  .assertResults("SELECT 2100, -71, 228");
 
-  // Set an artificially low buffer size limit to trigger blocking behavior.
-  params.queryCtx->setConfigOverridesUnsafe({
-      {core::QueryConfig::kMaxLocalExchangeBufferSize, "100"},
-  });
-
-  auto task = ::assertQuery(
-      params,
-      [&](exec::Task* /*task*/) {},
-      "SELECT 2100, -71, 228",
-      duckDbQueryRunner_);
   verifyExchangeSourceOperatorStats(task, 2100);
 }
 
@@ -253,53 +249,33 @@ TEST_F(LocalPartitionTest, maxBufferSizePartition) {
 
   auto op = PlanBuilder(planNodeIdGenerator)
                 .localPartition(
-                    {0},
+                    {"c0"},
                     {
                         scanNode(),
                         scanNode(),
                         scanNode(),
                     })
-                .partialAggregation({0}, {"count(1)"})
+                .partialAggregation({"c0"}, {"count(1)"})
                 .planNode();
 
-  CursorParameters params;
-  params.planNode = op;
-  params.maxDrivers = 2;
-  params.queryCtx = core::QueryCtx::createForTest();
+  AssertQueryBuilder queryBuilder(op, duckDbQueryRunner_);
+  queryBuilder.maxDrivers(2);
+  for (auto i = 0; i < filePaths.size(); ++i) {
+    queryBuilder.split(
+        scanNodeIds[i % 3], makeHiveConnectorSplit(filePaths[i]->path));
+  }
 
   // Set an artificially low buffer size limit to trigger blocking behavior.
-  params.queryCtx->setConfigOverridesUnsafe({
-      {core::QueryConfig::kMaxLocalExchangeBufferSize, "100"},
-  });
+  queryBuilder.config(core::QueryConfig::kMaxLocalExchangeBufferSize, "100");
 
-  uint32_t fileIndex = 0;
-  auto addSplits = [&](exec::Task* task) {
-    while (fileIndex < filePaths.size()) {
-      auto planNodeId = scanNodeIds[fileIndex % 3];
-      addSplit(task, planNodeId, makeHiveSplit(filePaths[fileIndex]->path));
-      task->noMoreSplits(planNodeId);
-      ++fileIndex;
-    }
-  };
-
-  auto task = ::assertQuery(
-      params,
-      addSplits,
-      "SELECT c0, count(1) FROM tmp GROUP BY 1",
-      duckDbQueryRunner_);
+  auto task =
+      queryBuilder.assertResults("SELECT c0, count(1) FROM tmp GROUP BY 1");
   verifyExchangeSourceOperatorStats(task, 2100);
 
   // Re-run with higher memory limit (enough to hold ~10 vectors at a time).
-  params.queryCtx->setConfigOverridesUnsafe({
-      {core::QueryConfig::kMaxLocalExchangeBufferSize, "10240"},
-  });
+  queryBuilder.config(core::QueryConfig::kMaxLocalExchangeBufferSize, "10240");
 
-  fileIndex = 0;
-  task = ::assertQuery(
-      params,
-      addSplits,
-      "SELECT c0, count(1) FROM tmp GROUP BY 1",
-      duckDbQueryRunner_);
+  task = queryBuilder.assertResults("SELECT c0, count(1) FROM tmp GROUP BY 1");
   verifyExchangeSourceOperatorStats(task, 2100);
 }
 
@@ -333,7 +309,7 @@ TEST_F(LocalPartitionTest, outputLayoutGather) {
                         valuesNode(2),
                     },
                     // Change column order: (c0, c1) -> (c1, c0).
-                    {1, 0})
+                    {"c1", "c0"})
                 .singleAggregation({}, {"count(1)", "min(c0)", "max(c1)"})
                 .planNode();
 
@@ -350,7 +326,7 @@ TEST_F(LocalPartitionTest, outputLayoutGather) {
                    valuesNode(2),
                },
                // Drop column: (c0, c1) -> (c1).
-               {1})
+               {"c1"})
            .singleAggregation({}, {"count(1)", "min(c1)", "max(c1)"})
            .planNode();
 
@@ -397,60 +373,61 @@ TEST_F(LocalPartitionTest, outputLayoutPartition) {
     return PlanBuilder(planNodeIdGenerator).values({vectors[index]}).planNode();
   };
 
-  CursorParameters params;
-  params.maxDrivers = 2;
-  params.planNode =
-      PlanBuilder(planNodeIdGenerator)
-          .localPartition(
-              {0},
-              {
-                  valuesNode(0),
-                  valuesNode(1),
-                  valuesNode(2),
-              },
-              // Change column order: (c0, c1) -> (c1, c0).
-              {1, 0})
-          .partialAggregation({}, {"count(1)", "min(c0)", "max(c1)"})
-          .planNode();
+  auto plan = PlanBuilder(planNodeIdGenerator)
+                  .localPartition(
+                      {"c0"},
+                      {
+                          valuesNode(0),
+                          valuesNode(1),
+                          valuesNode(2),
+                      },
+                      // Change column order: (c0, c1) -> (c1, c0).
+                      {"c1", "c0"})
+                  .partialAggregation({}, {"count(1)", "min(c0)", "max(c1)"})
+                  .planNode();
 
-  auto task = OperatorTestBase::assertQuery(
-      params, "VALUES (146, -71, 123), (154, -70, 123)");
+  auto task = AssertQueryBuilder(plan, duckDbQueryRunner_)
+                  .maxDrivers(2)
+                  .assertResults("VALUES (146, -71, 123), (154, -70, 123)");
+
   verifyExchangeSourceOperatorStats(task, 300);
 
   planNodeIdGenerator->reset();
-  params.planNode =
-      PlanBuilder(planNodeIdGenerator)
-          .localPartition(
-              {0},
-              {
-                  valuesNode(0),
-                  valuesNode(1),
-                  valuesNode(2),
-              },
-              // Drop column: (c0, c1) -> (c1).
-              {1})
-          .partialAggregation({}, {"count(1)", "min(c1)", "max(c1)"})
-          .planNode();
+  plan = PlanBuilder(planNodeIdGenerator)
+             .localPartition(
+                 {"c0"},
+                 {
+                     valuesNode(0),
+                     valuesNode(1),
+                     valuesNode(2),
+                 },
+                 // Drop column: (c0, c1) -> (c1).
+                 {"c1"})
+             .partialAggregation({}, {"count(1)", "min(c1)", "max(c1)"})
+             .planNode();
 
-  task = OperatorTestBase::assertQuery(
-      params, "VALUES (146, 123, 123), (154, 123, 123)");
+  task = AssertQueryBuilder(plan, duckDbQueryRunner_)
+             .maxDrivers(2)
+             .assertResults("VALUES (146, 123, 123), (154, 123, 123)");
   verifyExchangeSourceOperatorStats(task, 300);
 
   planNodeIdGenerator->reset();
-  params.planNode = PlanBuilder(planNodeIdGenerator)
-                        .localPartition(
-                            {0},
-                            {
-                                valuesNode(0),
-                                valuesNode(1),
-                                valuesNode(2),
-                            },
-                            // Drop all columns.
-                            {})
-                        .partialAggregation({}, {"count(1)"})
-                        .planNode();
+  plan = PlanBuilder(planNodeIdGenerator)
+             .localPartition(
+                 {"c0"},
+                 {
+                     valuesNode(0),
+                     valuesNode(1),
+                     valuesNode(2),
+                 },
+                 // Drop all columns.
+                 {})
+             .partialAggregation({}, {"count(1)"})
+             .planNode();
 
-  task = OperatorTestBase::assertQuery(params, "VALUES (146), (154)");
+  task = AssertQueryBuilder(plan, duckDbQueryRunner_)
+             .maxDrivers(2)
+             .assertResults("VALUES (146), (154)");
   verifyExchangeSourceOperatorStats(task, 300);
 }
 
@@ -489,39 +466,193 @@ TEST_F(LocalPartitionTest, multipleExchanges) {
   // exchange re-partitions the results on just the first key.
   auto op = PlanBuilder(planNodeIdGenerator)
                 .localPartition(
-                    {0},
+                    {"c0"},
                     {PlanBuilder(planNodeIdGenerator)
                          .localPartition(
-                             {0, 1},
+                             {"c0", "c1"},
                              {
                                  tableScanNode(),
                                  tableScanNode(),
                                  tableScanNode(),
                              })
-                         .partialAggregation({0, 1}, {"count(1)"})
+                         .partialAggregation({"c0", "c1"}, {"count(1)"})
                          .planNode()})
-                .partialAggregation({0}, {"count(1)", "sum(a0)"})
+                .partialAggregation({"c0"}, {"count(1)", "sum(a0)"})
                 .planNode();
 
   createDuckDbTable(vectors);
 
-  CursorParameters params;
-  params.planNode = op;
-  params.maxDrivers = 2;
+  AssertQueryBuilder queryBuilder(op, duckDbQueryRunner_);
+  for (auto i = 0; i < filePaths.size(); ++i) {
+    queryBuilder.split(
+        scanNodeIds[i], makeHiveConnectorSplit(filePaths[i]->path));
+  }
 
-  uint32_t fileIndex = 0;
-  auto task = ::assertQuery(
-      params,
-      [&](exec::Task* task) {
-        while (fileIndex < filePaths.size()) {
-          auto planNodeId = scanNodeIds[fileIndex];
-          addSplit(task, planNodeId, makeHiveSplit(filePaths[fileIndex]->path));
-          task->noMoreSplits(planNodeId);
-          ++fileIndex;
-        }
-      },
+  queryBuilder.maxDrivers(2).assertResults(
       "SELECT c0, count(1), sum(cnt) FROM ("
       "   SELECT c0, c1, count(1) as cnt FROM tmp GROUP BY 1, 2"
-      ") t GROUP BY 1",
-      duckDbQueryRunner_);
+      ") t GROUP BY 1");
+}
+
+TEST_F(LocalPartitionTest, earlyCompletion) {
+  std::vector<RowVectorPtr> data = {
+      makeRowVector({makeFlatSequence(3, 100)}),
+      makeRowVector({makeFlatSequence(7, 100)}),
+      makeRowVector({makeFlatSequence(11, 100)}),
+      makeRowVector({makeFlatSequence(13, 100)}),
+  };
+
+  auto planNodeIdGenerator = std::make_shared<PlanNodeIdGenerator>();
+  auto plan =
+      PlanBuilder(planNodeIdGenerator)
+          .localPartition(
+              {}, {PlanBuilder(planNodeIdGenerator).values(data).planNode()})
+          .limit(0, 2, true)
+          .planNode();
+
+  auto task = assertQuery(plan, "VALUES (3), (4)");
+
+  verifyExchangeSourceOperatorStats(task, 100);
+
+  // Make sure there is only one reference to Task left, i.e. no Driver is
+  // blocked forever.
+  assertTaskReferenceCount(task, 1);
+}
+
+TEST_F(LocalPartitionTest, earlyCancelation) {
+  std::vector<RowVectorPtr> data = {
+      makeRowVector({makeFlatSequence(3, 100)}),
+      makeRowVector({makeFlatSequence(7, 100)}),
+      makeRowVector({makeFlatSequence(11, 100)}),
+      makeRowVector({makeFlatSequence(13, 100)}),
+  };
+
+  auto planNodeIdGenerator = std::make_shared<PlanNodeIdGenerator>();
+  auto plan =
+      PlanBuilder(planNodeIdGenerator)
+          .localPartition(
+              {}, {PlanBuilder(planNodeIdGenerator).values(data).planNode()})
+          .limit(0, 2'000, true)
+          .planNode();
+
+  CursorParameters params;
+  params.planNode = plan;
+  // Make sure results are queued one batch at a time.
+  params.bufferedBytes = 100;
+
+  auto cursor = std::make_unique<TaskCursor>(params);
+  const auto& task = cursor->task();
+
+  // Fetch first batch of data.
+  ASSERT_TRUE(cursor->moveNext());
+  ASSERT_EQ(100, cursor->current()->size());
+
+  // Cancel the task.
+  task->requestCancel();
+
+  // Fetch the remaining results. This will throw since only one vector can be
+  // buffered in the cursor.
+  try {
+    while (cursor->moveNext()) {
+      ;
+      FAIL() << "Expected a throw due to cancellation";
+    }
+  } catch (const std::exception& e) {
+  }
+
+  // Wait for task to transition to final state.
+  waitForTaskState(task, exec::kCanceled);
+
+  // Make sure there is only one reference to Task left, i.e. no Driver is
+  // blocked forever.
+  assertTaskReferenceCount(task, 1);
+}
+
+TEST_F(LocalPartitionTest, producerError) {
+  std::vector<RowVectorPtr> data = {
+      makeRowVector({makeFlatSequence(3, 100)}),
+      makeRowVector({makeFlatSequence(7, 100)}),
+      makeRowVector({makeFlatSequence(-11, 100)}),
+      makeRowVector({makeFlatSequence(-13, 100)}),
+  };
+
+  auto planNodeIdGenerator = std::make_shared<PlanNodeIdGenerator>();
+  auto plan = PlanBuilder(planNodeIdGenerator)
+                  .localPartition(
+                      {},
+                      {PlanBuilder(planNodeIdGenerator)
+                           .values(data)
+                           .project({"7 / c0"})
+                           .planNode()})
+                  .limit(0, 2'000, true)
+                  .planNode();
+
+  CursorParameters params;
+  params.planNode = plan;
+
+  auto cursor = std::make_unique<TaskCursor>(params);
+  const auto& task = cursor->task();
+
+  // Expect division by zero error.
+  ASSERT_THROW(
+      while (cursor->moveNext()) { ; }, VeloxException);
+
+  // Wait for task to transition to failed state.
+  waitForTaskState(task, exec::kFailed);
+
+  // Make sure there is only one reference to Task left, i.e. no Driver is
+  // blocked forever.
+  assertTaskReferenceCount(task, 1);
+}
+
+TEST_F(LocalPartitionTest, unionAll) {
+  auto data1 = makeRowVector(
+      {"d0", "d1"},
+      {makeFlatVector<int32_t>({10, 11}),
+       makeFlatVector<StringView>({"x", "y"})});
+  auto data2 = makeRowVector(
+      {"e0", "e1"},
+      {makeFlatVector<int32_t>({20, 21}),
+       makeFlatVector<StringView>({"z", "w"})});
+
+  auto planNodeIdGenerator = std::make_shared<PlanNodeIdGenerator>();
+  // For the partition node, use the 1st source's names to define the output
+  // layout and rename the output columns to be different from the sources'.
+  auto plan =
+      PlanBuilder(planNodeIdGenerator)
+          .localPartition(
+              {},
+              {PlanBuilder(planNodeIdGenerator).values({data1}).planNode(),
+               PlanBuilder(planNodeIdGenerator).values({data2}).planNode()},
+              {"d0 AS c0", "d1 AS c1"})
+          .planNode();
+
+  assertQuery(
+      plan,
+      "WITH T1 AS (VALUES (10, 'x'), (11, 'y')), "
+      "T2 AS (VALUES (20, 'z'), (21, 'w')) "
+      "SELECT * FROM T1 UNION ALL SELECT * FROM T2; ");
+}
+
+// Test that LocalExchange returns the data with the proper output type.
+TEST_F(LocalPartitionTest, unionAllLocalExchange) {
+  auto data1 = makeRowVector({"d0"}, {makeFlatVector<StringView>({"x"})});
+  auto data2 = makeRowVector({"e0"}, {makeFlatVector<StringView>({"y"})});
+
+  auto planNodeIdGenerator = std::make_shared<PlanNodeIdGenerator>();
+  auto plan =
+      PlanBuilder(planNodeIdGenerator)
+          .localPartitionRoundRobin(
+              {PlanBuilder(planNodeIdGenerator).values({data1}).planNode(),
+               PlanBuilder(planNodeIdGenerator).values({data2}).planNode()},
+              {"d0 AS g0"})
+          .project({"length(g0)"})
+          .planNode();
+
+  assertQuery(
+      plan,
+      "SELECT length(c0) from ("
+      "SELECT * from (VALUES ('x')) as T1 (c0) UNION ALL "
+      "SELECT * from (VALUES ('y')) as T2 (c0)"
+      ");");
 }

@@ -16,8 +16,8 @@
 
 #pragma once
 
-#include <gtest/gtest_prod.h>
-
+#include "velox/common/base/GTestMacros.h"
+#include "velox/common/time/CpuWallTimer.h"
 #include "velox/dwio/dwrf/common/Compression.h"
 #include "velox/dwio/dwrf/writer/IndexBuilder.h"
 #include "velox/dwio/dwrf/writer/IntegerDictionaryEncoder.h"
@@ -68,20 +68,22 @@ class WriterContext : public CompressionBufferPool {
       handler_ = std::make_unique<encryption::EncryptionHandler>();
     }
     validateConfigs();
-    LOG(INFO) << fmt::format("Compression config: {}", compression);
+    VLOG(1) << fmt::format("Compression config: {}", compression);
     compressionBuffer_ = std::make_unique<dwio::common::DataBuffer<char>>(
         generalPool_, compressionBlockSize + PAGE_HEADER_SIZE);
   }
 
-  bool hasStream(const StreamIdentifier& stream) const {
+  bool hasStream(const DwrfStreamIdentifier& stream) const {
     return streams_.find(stream) != streams_.end();
   }
 
-  const DataBufferHolder& getStream(const StreamIdentifier& stream) const {
+  const DataBufferHolder& getStream(const DwrfStreamIdentifier& stream) const {
     return streams_.at(stream);
   }
 
-  void addBuffer(const StreamIdentifier& stream, folly::StringPiece buffer) {
+  void addBuffer(
+      const DwrfStreamIdentifier& stream,
+      folly::StringPiece buffer) {
     streams_.at(stream).take(buffer);
   }
 
@@ -94,7 +96,7 @@ class WriterContext : public CompressionBufferPool {
   // capacity vs actual usage problem. However, this is ok as an upperbound for
   // flush policy evaluation and would be more accurate after flush.
   std::unique_ptr<BufferedOutputStream> newStream(
-      const StreamIdentifier& stream) {
+      const DwrfStreamIdentifier& stream) {
     DWIO_ENSURE(
         !hasStream(stream), "Stream already exists ", stream.toString());
     streams_.emplace(
@@ -106,8 +108,9 @@ class WriterContext : public CompressionBufferPool {
             getConfig(Config::COMPRESSION_BLOCK_SIZE_MIN),
             getConfig(Config::COMPRESSION_BLOCK_SIZE_EXTEND_RATIO)));
     auto& holder = streams_.at(stream);
-    auto encrypter = handler_->isEncrypted(stream.node)
-        ? std::addressof(handler_->getEncryptionProvider(stream.node))
+    auto encrypter = handler_->isEncrypted(stream.encodingKey().node)
+        ? std::addressof(
+              handler_->getEncryptionProvider(stream.encodingKey().node))
         : nullptr;
     return newStream(compression, holder, encrypter);
   }
@@ -123,7 +126,7 @@ class WriterContext : public CompressionBufferPool {
   }
 
   std::unique_ptr<BufferedOutputStream> newStream(
-      CompressionKind kind,
+      dwio::common::CompressionKind kind,
       DataBufferHolder& holder,
       const dwio::common::encryption::Encrypter* encrypter = nullptr) {
     return createCompressor(kind, *this, holder, *config_, encrypter);
@@ -164,14 +167,15 @@ class WriterContext : public CompressionBufferPool {
         : std::make_unique<IndexBuilder>(std::move(stream));
   }
 
-  void suppressStream(const StreamIdentifier& stream) {
+  void suppressStream(const DwrfStreamIdentifier& stream) {
     DWIO_ENSURE(hasStream(stream));
     auto& collector = streams_.at(stream);
     collector.suppress();
   }
 
   bool isStreamPaged(uint32_t nodeId) const {
-    return (compression != CompressionKind::CompressionKind_NONE) ||
+    return (compression !=
+            dwio::common::CompressionKind::CompressionKind_NONE) ||
         handler_->isEncrypted(nodeId);
   }
 
@@ -253,8 +257,8 @@ class WriterContext : public CompressionBufferPool {
   }
 
   void iterateUnSuppressedStreams(
-      std::function<void(std::pair<const StreamIdentifier, DataBufferHolder>&)>
-          callback) {
+      std::function<void(
+          std::pair<const DwrfStreamIdentifier, DataBufferHolder>&)> callback) {
     for (auto& pair : streams_) {
       if (!pair.second.isSuppressed()) {
         callback(pair);
@@ -278,7 +282,7 @@ class WriterContext : public CompressionBufferPool {
   }
 
   virtual void removeStreams(
-      std::function<bool(const StreamIdentifier&)> predicate) {
+      std::function<bool(const DwrfStreamIdentifier&)> predicate) {
     auto it = streams_.begin();
     while (it != streams_.end()) {
       if (predicate(it->first)) {
@@ -368,11 +372,6 @@ class WriterContext : public CompressionBufferPool {
     return ceil(flushOverheadRatioTracker_.getEstimatedRatio() * dataRawSize);
   }
 
-  // At this point we won't have data to estimate flush overhead.
-  int64_t getEstimatedEncodingSwitchOverhead() const {
-    return stripeRawSize;
-  }
-
   bool checkLowMemoryMode() const {
     return checkLowMemoryMode_;
   }
@@ -447,7 +446,10 @@ class WriterContext : public CompressionBufferPool {
   memory::MemoryPool& generalPool_;
   // Map needs referential stability because reference to map value is stored by
   // another class.
-  folly::F14NodeMap<StreamIdentifier, DataBufferHolder, StreamIdentifierHash>
+  folly::F14NodeMap<
+      DwrfStreamIdentifier,
+      DataBufferHolder,
+      dwio::common::StreamIdentifierHash>
       streams_;
   folly::F14FastMap<
       EncodingKey,
@@ -485,7 +487,7 @@ class WriterContext : public CompressionBufferPool {
   uint64_t stripeRawSize = 0;
 
   // config
-  const CompressionKind compression;
+  const dwio::common::CompressionKind compression;
   const uint64_t compressionBlockSize;
   const bool isIndexEnabled;
   const uint32_t indexStride;
@@ -495,14 +497,15 @@ class WriterContext : public CompressionBufferPool {
   const bool isStreamSizeAboveThresholdCheckEnabled;
   const uint64_t rawDataSizePerBatch;
   const dwio::common::MetricsLogPtr metricLogger;
+  CpuWallTiming flushTiming{};
 
   template <typename TestType>
   friend class WriterEncodingIndexTest;
   friend class IntegerColumnWriterDirectEncodingIndexTest;
   friend class StringColumnWriterDictionaryEncodingIndexTest;
   friend class StringColumnWriterDirectEncodingIndexTest;
-  FRIEND_TEST(TestWriterContext, GetIntDictionaryEncoder);
-  FRIEND_TEST(TestWriterContext, RemoveIntDictionaryEncoderForNode);
+  VELOX_FRIEND_TEST(TestWriterContext, GetIntDictionaryEncoder);
+  VELOX_FRIEND_TEST(TestWriterContext, RemoveIntDictionaryEncoderForNode);
   // TODO: remove once writer code is consolidated
   template <typename TestType>
   friend class WriterEncodingIndexTest2;

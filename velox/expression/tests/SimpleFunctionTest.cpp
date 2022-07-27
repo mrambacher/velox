@@ -15,6 +15,7 @@
  */
 
 #include <cstdint>
+#include <optional>
 #include <string>
 
 #include "glog/logging.h"
@@ -31,6 +32,7 @@
 namespace {
 
 using namespace facebook::velox;
+using namespace facebook::velox::test;
 
 class SimpleFunctionTest : public functions::test::FunctionBaseTest {
  protected:
@@ -91,15 +93,14 @@ template <typename T>
 struct ArrayWriterFunction {
   VELOX_DEFINE_FUNCTION_TYPES(T);
 
-  FOLLY_ALWAYS_INLINE bool call(
+  FOLLY_ALWAYS_INLINE void call(
       out_type<Array<int64_t>>& out,
       const arg_type<int64_t>& input) {
     const size_t size = arrayData[input].size();
     out.reserve(size);
     for (const auto i : arrayData[input]) {
-      out.append(i);
+      out.push_back(i);
     }
-    return true;
   }
 };
 
@@ -129,15 +130,14 @@ template <typename T>
 struct ArrayOfStringsWriterFunction {
   VELOX_DEFINE_FUNCTION_TYPES(T);
 
-  FOLLY_ALWAYS_INLINE bool call(
+  FOLLY_ALWAYS_INLINE void call(
       out_type<Array<Varchar>>& out,
       const arg_type<int64_t>& input) {
     const size_t size = stringArrayData[input].size();
     out.reserve(size);
-    for (const auto value : stringArrayData[input]) {
-      out.append(out_type<Varchar>(StringView(value)));
+    for (const auto& value : stringArrayData[input]) {
+      out.add_item().copy_from(value);
     }
-    return true;
   }
 };
 
@@ -340,9 +340,9 @@ struct ArrayRowWriterFunction {
       const arg_type<int32_t>& input) {
     // Appends each row three times.
     auto tuple = std::make_tuple(rowVectorCol1[input], rowVectorCol2[input]);
-    out.append(std::optional(tuple));
-    out.append(std::optional(tuple));
-    out.append(std::optional(tuple));
+    out.add_item() = tuple;
+    out.add_item() = tuple;
+    out.add_item() = tuple;
     return true;
   }
 };
@@ -425,9 +425,9 @@ struct RowOpaqueWriterFunction {
   FOLLY_ALWAYS_INLINE bool call(
       out_type<Row<std::shared_ptr<MyType>, int64_t>>& out,
       const arg_type<int64_t>& input) {
-    out = std::make_tuple(
-        std::make_shared<MyType>(rowVectorCol1[input], rowVectorCol2[input]),
-        input + 10);
+    out.template get_writer_at<0>() =
+        std::make_shared<MyType>(rowVectorCol1[input], rowVectorCol2[input]);
+    out.template get_writer_at<1>() = input + 10;
     return true;
   }
 };
@@ -527,11 +527,10 @@ template <typename T>
 struct NonDefaultNullBehaviorFunction {
   VELOX_DEFINE_FUNCTION_TYPES(T);
 
-  FOLLY_ALWAYS_INLINE bool callNullable(
+  FOLLY_ALWAYS_INLINE void callNullable(
       out_type<bool>& out,
       const int64_t* input) {
     out = (input == nullptr);
-    return true;
   }
 };
 
@@ -551,19 +550,55 @@ TEST_F(SimpleFunctionTest, nonDefaultNullBehavior) {
   assertEqualVectors(expected, result);
 }
 
+// Ensure that functions can return null (return false).
+template <typename T>
+struct ReturnNullCallFunction {
+  FOLLY_ALWAYS_INLINE bool call(bool& out, const int64_t& input) {
+    return false;
+  }
+};
+
+template <typename T>
+struct ReturnNullCallNullableFunction {
+  FOLLY_ALWAYS_INLINE bool callNullable(bool& out, const int64_t* input) {
+    return false;
+  }
+};
+
+TEST_F(SimpleFunctionTest, returnNull) {
+  registerFunction<ReturnNullCallFunction, bool, int64_t>({"return_null_call"});
+  registerFunction<ReturnNullCallNullableFunction, bool, int64_t>(
+      {"return_null_call_nullable"});
+
+  const size_t rows = 10;
+  auto flatVector = makeFlatVector<int64_t>(rows, [](auto row) { return row; });
+
+  // All null vector.
+  auto expected = makeFlatVector<bool>(
+      rows, [](auto) { return true; }, [](auto) { return true; });
+
+  // Check that null are being properly returned.
+  auto resultCall = evaluate<FlatVector<bool>>(
+      "return_null_call(c0)", makeRowVector({flatVector}));
+  auto resultCallNullable = evaluate<FlatVector<bool>>(
+      "return_null_call_nullable(c0)", makeRowVector({flatVector}));
+
+  assertEqualVectors(expected, resultCall);
+  assertEqualVectors(expected, resultCallNullable);
+}
+
 // Ensures that the call method can be templated.
 template <typename T>
 struct IsInputVarcharFunction {
   VELOX_DEFINE_FUNCTION_TYPES(T);
 
   template <typename TType>
-  FOLLY_ALWAYS_INLINE bool call(out_type<bool>& out, const TType&) {
+  FOLLY_ALWAYS_INLINE void call(out_type<bool>& out, const TType&) {
     if constexpr (std::is_same_v<TType, StringView>) {
       out = true;
     } else {
       out = false;
     }
-    return true;
   }
 };
 
@@ -594,7 +629,7 @@ template <typename T>
 struct MapReaderFunction {
   VELOX_DEFINE_FUNCTION_TYPES(T);
 
-  FOLLY_ALWAYS_INLINE bool call(
+  FOLLY_ALWAYS_INLINE void call(
       int64_t& out,
       const arg_type<Map<int64_t, double>>& input) {
     out = 0;
@@ -604,7 +639,6 @@ struct MapReaderFunction {
         out += entry.second.value();
       }
     }
-    return true;
   }
 };
 
@@ -636,7 +670,7 @@ template <typename T>
 struct MapArrayReaderFunction {
   VELOX_DEFINE_FUNCTION_TYPES(T);
 
-  FOLLY_ALWAYS_INLINE bool call(
+  FOLLY_ALWAYS_INLINE void call(
       double& out,
       const arg_type<Map<int64_t, Array<double>>>& input) {
     out = 0;
@@ -650,7 +684,6 @@ struct MapArrayReaderFunction {
         }
       }
     }
-    return true;
   }
 };
 
@@ -698,16 +731,15 @@ struct MyArrayStringReuseFunction {
 
   static constexpr int32_t reuse_strings_from_arg = 0;
 
-  bool call(out_type<Array<Varchar>>& out, const arg_type<Varchar>& input) {
+  void call(out_type<Array<Varchar>>& out, const arg_type<Varchar>& input) {
     auto start = input.begin();
     auto cur = start;
 
     do {
       cur = std::find(start, input.end(), ' ');
-      out.append(std::optional{StringView(start, cur - start)});
+      out.add_item().copy_from(StringView(start, cur - start));
       start = cur + 1;
     } while (cur < input.end());
-    return true;
   }
 };
 
@@ -737,13 +769,49 @@ TEST_F(SimpleFunctionTest, arrayStringReuse) {
 }
 
 template <typename T>
+struct Substr {
+  VELOX_DEFINE_FUNCTION_TYPES(T);
+
+  static constexpr int32_t reuse_strings_from_arg = 0;
+
+  void call(
+      out_type<Varchar>& out,
+      const arg_type<Varchar>& str,
+      const int32_t& start,
+      const int32_t& length) {
+    out.copy_from(StringView(str.data() + start, length));
+  }
+};
+
+TEST_F(SimpleFunctionTest, stringReuseConstant) {
+  // Test reusing the strings from an argument when that argument is in a
+  // ConstantVector.  Note that the other 2 arguments are FlatVectors to
+  // prevent constant peeling.
+  registerFunction<Substr, Varchar, Varchar, int32_t, int32_t>({"substr"});
+
+  auto constantVector = vectorMaker_.constantVector<StringView>(
+      {"super happy fun string"_sv,
+       "super happy fun string"_sv,
+       "super happy fun string"_sv});
+  auto starts = vectorMaker_.flatVector({0, 1, 2});
+  auto lengths = vectorMaker_.flatVector({1, 2, 3});
+
+  auto result = evaluate<FlatVector<StringView>>(
+      "substr(c0, c1, c2)", makeRowVector({constantVector, starts, lengths}));
+
+  auto expected = vectorMaker_.flatVector({"s"_sv, "up"_sv, "per"_sv});
+  assertEqualVectors(expected, result);
+}
+
+template <typename T>
 struct MapStringOut {
   VELOX_DEFINE_FUNCTION_TYPES(T);
 
-  bool call(out_type<Map<Varchar, Varchar>>& out, int64_t n) {
+  void call(out_type<Map<Varchar, Varchar>>& out, int64_t n) {
     auto string = std::to_string(n);
-    out.emplace(StringView(string), std::optional{StringView(string)});
-    return true;
+    auto [key, value] = out.add_item();
+    key.copy_from(string);
+    value.copy_from(string);
   }
 };
 
@@ -768,6 +836,57 @@ TEST_F(SimpleFunctionTest, mapStringOut) {
           std::string(value.value().data(), value.value().size()),
           std::to_string(i + 1));
     }
+  }
+}
+
+template <typename T>
+struct NonDeterministicFunc {
+  static constexpr bool is_deterministic = false;
+
+  void call(int64_t& out) {
+    static size_t counter = 0;
+    out = counter++;
+  }
+};
+
+// Test that non-deterministic functions do not participate in CSE
+// optimization, or constant folding.
+TEST_F(SimpleFunctionTest, cseDisabled) {
+  registerFunction<NonDeterministicFunc, int64_t>({"new_value"});
+
+  auto input = vectorMaker_.flatVector<int64_t>({1, 2, 3, 4});
+  auto result = evaluate("new_value() + new_value()", makeRowVector({input}));
+  auto* flatResult = result->asFlatVector<int64_t>();
+  ASSERT_EQ(flatResult->valueAt(0), 4);
+  ASSERT_EQ(flatResult->valueAt(1), 6);
+  ASSERT_EQ(flatResult->valueAt(2), 8);
+  ASSERT_EQ(flatResult->valueAt(3), 10);
+}
+
+template <typename T>
+struct NonDeterministicFuncWithInput {
+  static constexpr bool is_deterministic = false;
+
+  void call(int64_t& out, const int64_t& input) {
+    static size_t counter = 0;
+    out = input + counter++;
+  }
+};
+
+TEST_F(SimpleFunctionTest, cseDisabledFuncWithInput) {
+  registerFunction<NonDeterministicFuncWithInput, int64_t, int64_t>(
+      {"new_value_with_input"});
+
+  auto input = vectorMaker_.flatVector<int64_t>({1, 2, 3, 4});
+  {
+    auto result = evaluate(
+        "new_value_with_input(c0) + new_value_with_input(c0)",
+        makeRowVector({input}));
+    auto* flatResult = result->asFlatVector<int64_t>();
+    ASSERT_EQ(flatResult->valueAt(0), 6);
+    ASSERT_EQ(flatResult->valueAt(1), 10);
+    ASSERT_EQ(flatResult->valueAt(2), 14);
+    ASSERT_EQ(flatResult->valueAt(3), 18);
   }
 }
 

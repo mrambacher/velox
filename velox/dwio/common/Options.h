@@ -19,8 +19,8 @@
 #include <limits>
 #include <unordered_set>
 
-#include "velox/common/caching/DataCache.h"
 #include "velox/common/memory/Memory.h"
+#include "velox/dwio/common/BufferedInput.h"
 #include "velox/dwio/common/ColumnSelector.h"
 #include "velox/dwio/common/ErrorTolerance.h"
 #include "velox/dwio/common/InputStream.h"
@@ -28,7 +28,6 @@
 #include "velox/dwio/common/encryption/Encryption.h"
 
 namespace facebook::velox::dwrf {
-class BufferedInputFactory;
 class ColumnReaderFactory;
 } // namespace facebook::velox::dwrf
 
@@ -95,9 +94,15 @@ class RowReaderOptions {
   bool returnFlatVector_ = false;
   ErrorTolerance errorTolerance_;
   std::shared_ptr<ColumnSelector> selector_;
-  velox::common::ScanSpec* scanSpec_ = nullptr;
+  std::shared_ptr<velox::common::ScanSpec> scanSpec_ = nullptr;
   // Node id for map column to a list of keys to be projected as a struct.
   std::unordered_map<uint32_t, std::vector<std::string>> flatmapNodeIdAsStruct_;
+  // Optional executors to enable internal reader parallelism.
+  // 'decodingExecutor' allow parallelising the vector decoding process.
+  // 'ioExecutor' enables parallelism when performing file system read
+  // operations.
+  std::shared_ptr<folly::Executor> decodingExecutor_;
+  std::shared_ptr<folly::Executor> ioExecutor_;
 
  public:
   RowReaderOptions(const RowReaderOptions& other) {
@@ -228,11 +233,11 @@ class RowReaderOptions {
     return errorTolerance_;
   }
 
-  velox::common::ScanSpec* getScanSpec() const {
+  const std::shared_ptr<velox::common::ScanSpec> getScanSpec() const {
     return scanSpec_;
   }
 
-  void setScanSpec(velox::common::ScanSpec* scanSpec) {
+  void setScanSpec(std::shared_ptr<velox::common::ScanSpec> scanSpec) {
     scanSpec_ = scanSpec;
   }
 
@@ -251,6 +256,22 @@ class RowReaderOptions {
   const std::unordered_map<uint32_t, std::vector<std::string>>&
   getMapColumnIdAsStruct() const {
     return flatmapNodeIdAsStruct_;
+  }
+
+  void setDecodingExecutor(std::shared_ptr<folly::Executor> executor) {
+    decodingExecutor_ = executor;
+  }
+
+  void setIOExecutor(std::shared_ptr<folly::Executor> executor) {
+    ioExecutor_ = executor;
+  }
+
+  const std::shared_ptr<folly::Executor>& getDecodingExecutor() const {
+    return decodingExecutor_;
+  }
+
+  const std::shared_ptr<folly::Executor>& getIOExecutor() const {
+    return ioExecutor_;
   }
 };
 
@@ -288,18 +309,6 @@ enum class PrefetchMode {
 };
 
 /**
- * Configuration options for external data caching. Basically if you set this
- * the RowReader will look into the provided |cache| before scheduling any
- * PReads of a byte range corresponding to a stream, and will insert any issued
- * PReads into the same |cache|.
- */
-struct DataCacheConfig {
-  velox::DataCache* cache{nullptr};
-  // We identify the file the data belongs to by an id from StringIdMap.
-  uint64_t filenum;
-};
-
-/**
  * Options for creating a Reader.
  */
 class ReaderOptions {
@@ -307,15 +316,15 @@ class ReaderOptions {
   uint64_t tailLocation;
   velox::memory::MemoryPool* memoryPool;
   FileFormat fileFormat;
-  std::shared_ptr<const velox::RowType> fileSchema;
+  RowTypePtr fileSchema;
   uint64_t autoPreloadLength;
   PrefetchMode prefetchMode;
   int32_t loadQuantum_{kDefaultLoadQuantum};
   int32_t maxCoalesceDistance_{kDefaultCoalesceDistance};
   SerDeOptions serDeOptions;
-  std::shared_ptr<DataCacheConfig> dataCacheConfig_;
+  uint64_t fileNum;
   std::shared_ptr<encryption::DecrypterFactory> decrypterFactory_;
-  velox::dwrf::BufferedInputFactory* bufferedInputFactory_ = nullptr;
+  std::shared_ptr<BufferedInputFactory> bufferedInputFactory_;
 
  public:
   static constexpr int32_t kDefaultLoadQuantum = 8 << 20; // 8MB
@@ -345,7 +354,7 @@ class ReaderOptions {
     autoPreloadLength = other.autoPreloadLength;
     prefetchMode = other.prefetchMode;
     serDeOptions = other.serDeOptions;
-    dataCacheConfig_ = other.dataCacheConfig_;
+    fileNum = other.fileNum;
     decrypterFactory_ = other.decrypterFactory_;
     bufferedInputFactory_ = other.bufferedInputFactory_;
     return *this;
@@ -353,15 +362,6 @@ class ReaderOptions {
 
   ReaderOptions(const ReaderOptions& other) {
     *this = other;
-  }
-
-  /**
-   * Set the data cache config.
-   */
-  ReaderOptions& setDataCacheConfig(
-      std::shared_ptr<DataCacheConfig> dataCacheConfig) {
-    dataCacheConfig_ = std::move(dataCacheConfig);
-    return *this;
   }
 
   /**
@@ -378,6 +378,11 @@ class ReaderOptions {
    */
   ReaderOptions& setFileFormat(FileFormat format) {
     fileFormat = format;
+    return *this;
+  }
+
+  ReaderOptions& setFileNum(uint64_t num) {
+    fileNum = num;
     return *this;
   }
 
@@ -451,16 +456,9 @@ class ReaderOptions {
   }
 
   ReaderOptions& setBufferedInputFactory(
-      velox::dwrf::BufferedInputFactory* factory) {
+      std::shared_ptr<BufferedInputFactory> factory) {
     bufferedInputFactory_ = factory;
     return *this;
-  }
-
-  /**
-   * Get the data cache config.
-   */
-  const std::shared_ptr<DataCacheConfig>& getDataCacheConfig() const {
-    return dataCacheConfig_;
   }
 
   /**
@@ -476,6 +474,10 @@ class ReaderOptions {
    */
   velox::memory::MemoryPool& getMemoryPool() const {
     return *memoryPool;
+  }
+
+  uint64_t getFileNum() const {
+    return fileNum;
   }
 
   /**
@@ -516,11 +518,12 @@ class ReaderOptions {
     return serDeOptions;
   }
 
-  encryption::DecrypterFactory* getDecrypterFactory() const {
-    return decrypterFactory_.get();
+  const std::shared_ptr<encryption::DecrypterFactory> getDecrypterFactory()
+      const {
+    return decrypterFactory_;
   }
 
-  velox::dwrf::BufferedInputFactory* getBufferedInputFactory() const {
+  std::shared_ptr<BufferedInputFactory> getBufferedInputFactory() const {
     return bufferedInputFactory_;
   }
 };

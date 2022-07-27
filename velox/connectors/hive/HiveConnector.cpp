@@ -18,8 +18,6 @@
 #include <memory>
 
 #include "velox/dwio/common/InputStream.h"
-#include "velox/dwio/common/ScanSpec.h"
-#include "velox/dwio/dwrf/common/CachedBufferedInput.h"
 #include "velox/dwio/dwrf/reader/SelectiveColumnReader.h"
 #include "velox/expression/ControlExpr.h"
 #include "velox/type/Conversions.h"
@@ -39,6 +37,46 @@ namespace {
 static const char* kPath = "$path";
 static const char* kBucket = "$bucket";
 } // namespace
+
+HiveTableHandle::HiveTableHandle(
+    std::string connectorId,
+    const std::string& tableName,
+    bool filterPushdownEnabled,
+    SubfieldFilters subfieldFilters,
+    const core::TypedExprPtr& remainingFilter)
+    : ConnectorTableHandle(std::move(connectorId)),
+      tableName_(tableName),
+      filterPushdownEnabled_(filterPushdownEnabled),
+      subfieldFilters_(std::move(subfieldFilters)),
+      remainingFilter_(remainingFilter) {}
+
+HiveTableHandle::~HiveTableHandle() {}
+
+std::string HiveTableHandle::toString() const {
+  std::stringstream out;
+  out << "table: " << tableName_;
+  if (!subfieldFilters_.empty()) {
+    // Sort filters by subfield for deterministic output.
+    std::map<std::string, common::Filter*> orderedFilters;
+    for (const auto& [field, filter] : subfieldFilters_) {
+      orderedFilters[field.toString()] = filter.get();
+    }
+    out << ", range filters: [";
+    bool notFirstFilter = false;
+    for (const auto& [field, filter] : orderedFilters) {
+      if (notFirstFilter) {
+        out << ", ";
+      }
+      out << "(" << field << ", " << filter->toString() << ")";
+      notFirstFilter = true;
+    }
+    out << "]";
+  }
+  if (remainingFilter_) {
+    out << ", remaining filter: (" << remainingFilter_->toString() << ")";
+  }
+  return out.str();
+}
 
 HiveDataSink::HiveDataSink(
     std::shared_ptr<const RowType> inputType,
@@ -122,10 +160,10 @@ static void makeFieldSpecs(
   }
 }
 
-std::unique_ptr<common::ScanSpec> makeScanSpec(
+std::shared_ptr<common::ScanSpec> makeScanSpec(
     const SubfieldFilters& filters,
     const std::shared_ptr<const RowType>& rowType) {
-  auto spec = std::make_unique<common::ScanSpec>("root");
+  auto spec = std::make_shared<common::ScanSpec>("root");
   makeFieldSpecs("", 0, rowType, spec.get());
 
   for (auto& pair : filters) {
@@ -154,7 +192,6 @@ HiveDataSource::HiveDataSource(
         std::shared_ptr<connector::ColumnHandle>>& columnHandles,
     FileHandleFactory* fileHandleFactory,
     velox::memory::MemoryPool* pool,
-    DataCache* dataCache,
     ExpressionEvaluator* expressionEvaluator,
     memory::MappedMemory* mappedMemory,
     const std::string& scanId,
@@ -163,7 +200,6 @@ HiveDataSource::HiveDataSource(
       fileHandleFactory_(fileHandleFactory),
       pool_(pool),
       readerOpts_(pool),
-      dataCache_(dataCache),
       expressionEvaluator_(expressionEvaluator),
       mappedMemory_(mappedMemory),
       scanId_(scanId),
@@ -235,7 +271,7 @@ HiveDataSource::HiveDataSource(
     readerOutputType_ = ROW(std::move(names), std::move(types));
   }
 
-  rowReaderOpts_.setScanSpec(scanSpec_.get());
+  rowReaderOpts_.setScanSpec(scanSpec_);
 
   ioStats_ = std::make_shared<dwio::common::IoStatistics>();
 }
@@ -277,7 +313,7 @@ bool testFilters(
   return true;
 }
 
-class InputStreamHolder : public dwrf::AbstractInputStreamHolder {
+class InputStreamHolder : public dwio::common::AbstractInputStreamHolder {
  public:
   InputStreamHolder(
       FileHandleCachedPtr fileHandle,
@@ -333,8 +369,6 @@ void HiveDataSource::addDynamicFilter(
     fieldSpec.setFilter(filter->clone());
   }
   scanSpec_->resetCachedValues();
-
-  rowReader_->resetFilterCaches();
 }
 
 void HiveDataSource::addSplit(std::shared_ptr<ConnectorSplit> split) {
@@ -352,32 +386,21 @@ void HiveDataSource::addSplit(std::shared_ptr<ConnectorSplit> split) {
   // Decide between AsyncDataCache, legacy DataCache and no cache. All
   // three are supported to enable comparison.
   if (asyncCache) {
-    VELOX_CHECK(
-        !dataCache_,
-        "DataCache should not be present if the MappedMemory is AsyncDataCache");
-    // Make DataCacheConfig to pass the filenum and a null DataCache.
-    if (!readerOpts_.getDataCacheConfig()) {
-      auto dataCacheConfig = std::make_shared<dwio::common::DataCacheConfig>();
-      readerOpts_.setDataCacheConfig(std::move(dataCacheConfig));
-    }
-    readerOpts_.getDataCacheConfig()->filenum = fileHandle_->uuid.id();
-    bufferedInputFactory_ = std::make_unique<dwrf::CachedBufferedInputFactory>(
-        (asyncCache),
-        Connector::getTracker(scanId_, readerOpts_.loadQuantum()),
-        fileHandle_->groupId.id(),
-        [factory = fileHandleFactory_, path = split_->filePath]() {
-          return makeStreamHolder(factory, path);
-        },
-        ioStats_,
-        executor_,
-        readerOpts_);
-    readerOpts_.setBufferedInputFactory(bufferedInputFactory_.get());
-  } else if (dataCache_) {
-    auto dataCacheConfig = std::make_shared<dwio::common::DataCacheConfig>();
-    dataCacheConfig->cache = dataCache_;
-    dataCacheConfig->filenum = fileHandle_->uuid.id();
-    readerOpts_.setDataCacheConfig(std::move(dataCacheConfig));
+    readerOpts_.setFileNum(fileHandle_->uuid.id());
+    bufferedInputFactory_ =
+        std::make_unique<dwio::common::CachedBufferedInputFactory>(
+            (asyncCache),
+            Connector::getTracker(scanId_, readerOpts_.loadQuantum()),
+            fileHandle_->groupId.id(),
+            [factory = fileHandleFactory_, path = split_->filePath]() {
+              return makeStreamHolder(factory, path);
+            },
+            ioStats_,
+            executor_,
+            readerOpts_);
+    readerOpts_.setBufferedInputFactory(bufferedInputFactory_);
   }
+
   if (readerOpts_.getFileFormat() != dwio::common::FileFormat::UNKNOWN) {
     VELOX_CHECK(
         readerOpts_.getFileFormat() == split_->fileFormat,
@@ -504,16 +527,21 @@ RowVectorPtr HiveDataSource::next(uint64_t size) {
 
     auto rowVector = std::dynamic_pointer_cast<RowVector>(output_);
 
+    // In case there is a remaining filter that excludes some but not all rows,
+    // collect the indices of the passing rows. If there is no filter, or it
+    // passes on all rows, leave this as null and let exec::wrap skip wrapping
+    // the results.
     BufferPtr remainingIndices;
     if (remainingFilterExprSet_) {
       rowsRemaining = evaluateRemainingFilter(rowVector);
       VELOX_CHECK_LE(rowsRemaining, rowsScanned);
       if (rowsRemaining == 0) {
-        // no rows passed the remaining filter
+        // No rows passed the remaining filter.
         return RowVector::createEmpty(outputType_, pool_);
       }
 
-      if (rowsRemaining < rowsScanned) {
+      if (rowsRemaining < rowVector->size()) {
+        // Some, but not all rows passed the remaining filter.
         remainingIndices = filterEvalCtx_.selectedIndices;
       }
     }
@@ -582,17 +610,24 @@ void HiveDataSource::setPartitionValue(
   setConstantValue(spec, constValue);
 }
 
-std::unordered_map<std::string, int64_t> HiveDataSource::runtimeStats() {
+std::unordered_map<std::string, RuntimeCounter> HiveDataSource::runtimeStats() {
   auto res = runtimeStats_.toMap();
   res.insert(
-      {{"numPrefetch", ioStats_->prefetch().count()},
-       {"prefetchBytes", ioStats_->prefetch().bytes()},
-       {"numStorageRead", ioStats_->read().count()},
-       {"storageReadBytes", ioStats_->read().bytes()},
-       {"numLocalRead", ioStats_->ssdRead().count()},
-       {"localReadBytes", ioStats_->ssdRead().bytes()},
-       {"numRamRead", ioStats_->ramHit().count()},
-       {"ramReadBytes", ioStats_->ramHit().bytes()}});
+      {{"numPrefetch", RuntimeCounter(ioStats_->prefetch().count())},
+       {"prefetchBytes",
+        RuntimeCounter(
+            ioStats_->prefetch().bytes(), RuntimeCounter::Unit::kBytes)},
+       {"numStorageRead", RuntimeCounter(ioStats_->read().count())},
+       {"storageReadBytes",
+        RuntimeCounter(ioStats_->read().bytes(), RuntimeCounter::Unit::kBytes)},
+       {"numLocalRead", RuntimeCounter(ioStats_->ssdRead().count())},
+       {"localReadBytes",
+        RuntimeCounter(
+            ioStats_->ssdRead().bytes(), RuntimeCounter::Unit::kBytes)},
+       {"numRamRead", RuntimeCounter(ioStats_->ramHit().count())},
+       {"ramReadBytes",
+        RuntimeCounter(
+            ioStats_->ramHit().bytes(), RuntimeCounter::Unit::kBytes)}});
   return res;
 }
 
@@ -610,10 +645,8 @@ int64_t HiveDataSource::estimatedRowSize() {
 HiveConnector::HiveConnector(
     const std::string& id,
     std::shared_ptr<const Config> properties,
-    std::unique_ptr<DataCache> dataCache,
     folly::Executor* FOLLY_NULLABLE executor)
     : Connector(id, properties),
-      dataCache_(std::move(dataCache)),
       fileHandleFactory_(
           std::make_unique<SimpleLRUCache<std::string, FileHandle>>(
               FLAGS_file_handle_cache_mb << 20),

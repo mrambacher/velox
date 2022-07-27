@@ -28,6 +28,7 @@ namespace facebook::velox {
 class AllocationPool {
  public:
   static constexpr int32_t kHashTableOwner = -3;
+  static constexpr int32_t kMinPages = 16;
 
   explicit AllocationPool(
       memory::MappedMemory* mappedMemory,
@@ -70,7 +71,7 @@ class AllocationPool {
   }
 
   // Returns number of bytes left at the end of the current run.
-  int32_t availableInRun() {
+  int32_t availableInRun() const {
     if (!allocation_.numRuns()) {
       return 0;
     }

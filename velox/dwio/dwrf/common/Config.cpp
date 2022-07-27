@@ -24,9 +24,9 @@ Config::Entry<WriterVersion> Config::WRITER_VERSION(
     "orc.writer.version",
     WriterVersion_CURRENT);
 
-Config::Entry<CompressionKind> Config::COMPRESSION(
+Config::Entry<dwio::common::CompressionKind> Config::COMPRESSION(
     "hive.exec.orc.compress",
-    CompressionKind::CompressionKind_ZSTD);
+    dwio::common::CompressionKind::CompressionKind_ZSTD);
 
 Config::Entry<int32_t> Config::ZLIB_COMPRESSION_LEVEL(
     "hive.exec.orc.compress.zlib.level",
@@ -167,5 +167,7 @@ Config::Entry<bool> Config::STREAM_SIZE_ABOVE_THRESHOLD_CHECK_ENABLED(
 
 Config::Entry<uint64_t> Config::RAW_DATA_SIZE_PER_BATCH(
     "hive.exec.orc.raw.data.size.per.batch",
-    50 * 1000 * 1000);
+    50UL * 1024 * 1024);
+
+Config::Entry<bool> Config::MAP_STATISTICS("orc.map.statistics", false);
 } // namespace facebook::velox::dwrf

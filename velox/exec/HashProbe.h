@@ -31,7 +31,15 @@ class HashProbe : public Operator {
       const std::shared_ptr<const core::HashJoinNode>& hashJoinNode);
 
   bool needsInput() const override {
-    return !finished_ && !noMoreInput_ && !input_;
+    if (finished_ || noMoreInput_ || input_) {
+      return false;
+    }
+    if (table_) {
+      return true;
+    }
+    auto channels = operatorCtx_->driverCtx()->driver->canPushdownFilters(
+        this, keyChannels_);
+    return channels.empty();
   }
 
   void addInput(RowVectorPtr input) override;
@@ -59,6 +67,14 @@ class HashProbe : public Operator {
   // Populate output columns.
   void fillOutput(vector_size_t size);
 
+  // Clears the columns of 'output_' that are projected from
+  // 'input_'. This should be done when preparing to produce a next
+  // batch of output to drop any lingering references to row
+  // number mappings or input vectors. In this way input vectors do
+  // not have to be copied and will be singly referenced by their
+  // producer.
+  void clearIdentityProjectedOutput();
+
   // Populate output columns with build-side rows that didn't match join
   // condition.
   RowVectorPtr getNonMatchingOutputForRightJoin();
@@ -81,54 +97,6 @@ class HashProbe : public Operator {
 
   // Channel of probe keys in 'input_'.
   std::vector<ChannelIndex> keyChannels_;
-
-  // Tracks selectivity of a given VectorHasher from the build side and creates
-  // a filter to push down upstream if the hasher is somewhat selective.
-  class DynamicFilterBuilder {
-   public:
-    DynamicFilterBuilder(
-        const VectorHasher& buildHasher,
-        ChannelIndex channel,
-        std::unordered_map<ChannelIndex, std::shared_ptr<common::Filter>>&
-            dynamicFilters)
-        : buildHasher_{buildHasher},
-          channel_{channel},
-          dynamicFilters_{dynamicFilters} {}
-
-    bool isActive() const {
-      return isActive_;
-    }
-
-    void addInput(uint64_t numIn) {
-      numIn_ += numIn;
-    }
-
-    void addOutput(uint64_t numOut) {
-      numOut_ += numOut;
-
-      // Add filter if VectorHasher is somewhat selective, e.g. dropped at least
-      // 1/3 of the rows. Make sure we have seen at least 10K rows.
-      if (isActive_ && numIn_ >= 10'000 && numOut_ < 0.66 * numIn_) {
-        if (auto filter = buildHasher_.getFilter(false)) {
-          dynamicFilters_.emplace(channel_, std::move(filter));
-        }
-        isActive_ = false;
-      }
-    }
-
-   private:
-    const VectorHasher& buildHasher_;
-    const ChannelIndex channel_;
-    std::unordered_map<ChannelIndex, std::shared_ptr<common::Filter>>&
-        dynamicFilters_;
-    uint64_t numIn_{0};
-    uint64_t numOut_{0};
-    bool isActive_{true};
-  };
-
-  // List of DynamicFilterBuilders aligned with keyChannels_. Contains a valid
-  // entry if the driver can push down a filter on the corresponding join key.
-  std::vector<std::optional<DynamicFilterBuilder>> dynamicFilterBuilders_;
 
   // True if the join can become a no-op starting with the next batch of input.
   bool canReplaceWithDynamicFilter_{false};
@@ -177,7 +145,7 @@ class HashProbe : public Operator {
 
   // Tracks probe side rows which had one or more matches on the build side, but
   // didn't pass the filter.
-  class LeftJoinTracker {
+  class NoMatchDetector {
    public:
     // Called for each row that the filter was evaluated on. Expects that probe
     // side rows with multiple matches on the build side are next to each other.
@@ -214,19 +182,58 @@ class HashProbe : public Operator {
     bool currentRowPassed{false};
   };
 
+  // For semi join with extra filter, de-duplicates probe side rows with
+  // multiple matches.
+  class SemiJoinTracker {
+   public:
+    // Called for each row that the filter passes. Expects that probe
+    // side rows with multiple matches are next to each other. Calls onLastMatch
+    // just once for each probe side row with at least one match.
+    template <typename TOnLastMatch>
+    void advance(vector_size_t row, TOnLastMatch onLastMatch) {
+      if (currentRow != row) {
+        if (currentRow != -1) {
+          onLastMatch(currentRow);
+        }
+        currentRow = row;
+      }
+    }
+
+    // Called when all rows from the current input batch were processed. Calls
+    // onLastMatch for the last probe row with at least one match.
+    template <typename TOnLastMatch>
+    void finish(TOnLastMatch onLastMatch) {
+      if (currentRow != -1) {
+        onLastMatch(currentRow);
+      }
+
+      currentRow = -1;
+    }
+
+   private:
+    // The last row number passed to advance for the current input batch.
+    vector_size_t currentRow{-1};
+  };
+
   /// True if this is the last HashProbe operator in the pipeline. It is
   /// responsible for producing non-matching build-side rows for the right join.
   bool lastRightJoinProbe_{false};
 
   BaseHashTable::NotProbedRowsIterator rightJoinIterator_;
 
-  /// For left join, tracks the probe side rows which had matches on the build
-  /// side but didn't pass the filter.
-  LeftJoinTracker leftJoinTracker_;
+  /// For left and anti join with filter, tracks the probe side rows which had
+  /// matches on the build side but didn't pass the filter.
+  NoMatchDetector noMatchDetector_;
+
+  /// For semi join with filter, de-duplicates probe side rows with multiple
+  /// matches.
+  SemiJoinTracker semiJoinTracker_;
 
   // Keeps track of returned results between successive batches of
   // output for a batch of input.
   BaseHashTable::JoinResultIterator results_;
+
+  RowVectorPtr output_;
 
   // Input rows with no nulls in the join keys.
   SelectivityVector nonNullRows_;

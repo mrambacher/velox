@@ -26,7 +26,10 @@ bool checkAddIdentityProjection(
     std::vector<IdentityProjection>& identityProjections) {
   if (auto field = std::dynamic_pointer_cast<const core::FieldAccessTypedExpr>(
           projection)) {
-    if (field->inputs().empty()) {
+    const auto& inputs = field->inputs();
+    if (inputs.empty() ||
+        (inputs.size() == 1 &&
+         dynamic_cast<const core::InputTypedExpr*>(inputs[0].get()))) {
       const auto inputChannel = inputType->getChildIdx(field->name());
       identityProjections.emplace_back(inputChannel, outputChannel);
       return true;
@@ -77,20 +80,14 @@ FilterProject::FilterProject(
 void FilterProject::addInput(RowVectorPtr input) {
   input_ = std::move(input);
   numProcessedInputRows_ = 0;
-  getResultVectors(&results_);
-  int32_t firstProjected;
-  if (resultProjections_.empty()) {
-    firstProjected = results_.size();
-  } else {
-    firstProjected = resultProjections_[0].inputChannel;
-  }
-
-  for (int32_t i = 0; i < firstProjected; ++i) {
-    if (results_[i]) {
-      if (results_[i]->encoding() == VectorEncoding::Simple::FLAT) {
-        results_[i]->clear();
+  if (!resultProjections_.empty()) {
+    results_.resize(resultProjections_.back().inputChannel + 1);
+    for (auto& result : results_) {
+      if (result && result.unique() &&
+          result->encoding() == VectorEncoding::Simple::FLAT) {
+        BaseVector::prepareForReuse(result, 0);
       } else {
-        results_[i] = nullptr;
+        result.reset();
       }
     }
   }
@@ -101,7 +98,7 @@ bool FilterProject::allInputProcessed() {
     return true;
   }
   if (numProcessedInputRows_ == input_->size()) {
-    inputProcessed();
+    input_ = nullptr;
     return true;
   }
   return false;
@@ -113,12 +110,11 @@ bool FilterProject::isFinished() {
 
 RowVectorPtr FilterProject::getOutput() {
   if (allInputProcessed()) {
-    clearIdentityProjectedOutput();
-    clearNonReusableOutput();
     return nullptr;
   }
+
   vector_size_t size = input_->size();
-  LocalSelectivityVector localRows(operatorCtx_->execCtx(), size);
+  LocalSelectivityVector localRows(*operatorCtx_->execCtx(), size);
   auto* rows = localRows.get();
   rows->setAll();
   EvalCtx evalCtx(operatorCtx_->execCtx(), exprs_.get(), input_.get());
@@ -145,7 +141,7 @@ RowVectorPtr FilterProject::getOutput() {
   auto numOut = filter(&evalCtx, *rows);
   numProcessedInputRows_ = size;
   if (numOut == 0) { // no rows passed the filer
-    inputProcessed();
+    input_ = nullptr;
     return nullptr;
   }
 
@@ -161,24 +157,6 @@ RowVectorPtr FilterProject::getOutput() {
 
   return fillOutput(
       numOut, allRowsSelected ? nullptr : filterEvalCtx_.selectedIndices);
-}
-
-void FilterProject::clearNonReusableOutput() {
-  if (!output_) {
-    return;
-  }
-  if (!output_.unique()) {
-    output_ = nullptr;
-    return;
-  }
-  for (auto& child : output_->children()) {
-    if (!child) {
-      continue;
-    }
-    if (!BaseVector::isReusableFlatVector(child)) {
-      child = nullptr;
-    }
-  }
 }
 
 void FilterProject::project(const SelectivityVector& rows, EvalCtx* evalCtx) {

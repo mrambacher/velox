@@ -122,6 +122,7 @@ class InPredicate : public exec::VectorFunction {
         filter = createBigintValuesFilter<int8_t>(inputArgs);
         break;
       case TypeKind::VARCHAR:
+      case TypeKind::VARBINARY:
         filter = createBytesValuesFilter(inputArgs);
         break;
       default:
@@ -132,10 +133,10 @@ class InPredicate : public exec::VectorFunction {
     return std::make_shared<InPredicate>(std::move(filter));
   }
 
-  // x IN (2, null) returns null when x != 2 and true when x == 2
-  // null for x always produces null
+  // x IN (2, null) returns null when x != 2 and true when x == 2.
+  // Null for x always produces null, regardless of 'IN' list.
   bool isDefaultNullBehavior() const override {
-    return false;
+    return true;
   }
 
   void apply(
@@ -167,6 +168,7 @@ class InPredicate : public exec::VectorFunction {
         });
         break;
       case TypeKind::VARCHAR:
+      case TypeKind::VARBINARY:
         applyTyped<StringView>(
             rows, input, context, result, [&](StringView value) {
               return filter_->testBytes(value.data(), value.size());
@@ -182,7 +184,8 @@ class InPredicate : public exec::VectorFunction {
   static std::vector<std::shared_ptr<exec::FunctionSignature>> signatures() {
     // tinyint|smallint|integer|bigint|varchar... -> boolean
     std::vector<std::shared_ptr<exec::FunctionSignature>> signatures;
-    for (auto& type : {"tinyint", "smallint", "integer", "bigint", "varchar"}) {
+    for (auto& type :
+         {"tinyint", "smallint", "integer", "bigint", "varchar", "varbinary"}) {
       signatures.emplace_back(exec::FunctionSignatureBuilder()
                                   .returnType("boolean")
                                   .argumentType(type)

@@ -15,9 +15,10 @@
  */
 
 #include <gtest/gtest.h>
+
+#include "velox/dwio/common/MemoryInputStream.h"
 #include "velox/dwio/common/encryption/TestProvider.h"
 #include "velox/dwio/dwrf/reader/StripeReaderBase.h"
-#include "velox/dwio/dwrf/test/OrcTest.h"
 #include "velox/dwio/dwrf/utils/ProtoUtils.h"
 #include "velox/dwio/type/fbhive/HiveTypeParser.h"
 
@@ -67,7 +68,7 @@ class StripeLoadKeysTest : public Test {
 
     reader_ = std::make_unique<ReaderBase>(
         scopedPool_->getPool(),
-        nullptr,
+        std::make_unique<MemoryInputStream>(nullptr, 0),
         nullptr,
         footer,
         nullptr,

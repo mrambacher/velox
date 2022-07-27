@@ -24,10 +24,6 @@ class StreamingAggregationTest : public OperatorTestBase {
   static CursorParameters makeCursorParameters(
       const std::shared_ptr<const core::PlanNode>& planNode,
       uint32_t preferredOutputBatchSize) {
-    auto queryCtx = core::QueryCtx::createForTest();
-    queryCtx->setConfigOverridesUnsafe(
-        {{core::QueryConfig::kCreateEmptyFiles, "true"}});
-
     CursorParameters params;
     params.planNode = planNode;
     params.queryCtx = core::QueryCtx::createForTest();
@@ -55,9 +51,28 @@ class StreamingAggregationTest : public OperatorTestBase {
     auto plan = PlanBuilder()
                     .values(data)
                     .partialStreamingAggregation(
-                        {0}, {"count(1)", "min(c1)", "max(c1)", "sum(c1)"})
+                        {"c0"},
+                        {"count(1)",
+                         "min(c1)",
+                         "max(c1)",
+                         "sum(c1)",
+                         "approx_percentile(c1, 0.95)"})
                     .finalAggregation()
                     .planNode();
+
+    assertQuery(
+        makeCursorParameters(plan, outputBatchSize),
+        "SELECT c0, count(1), min(c1), max(c1), sum(c1)"
+        "     , approx_quantile(c1, 0.95) "
+        "FROM tmp GROUP BY 1");
+
+    plan = PlanBuilder()
+               .values(data)
+               .project({"c1", "c0"})
+               .partialStreamingAggregation(
+                   {"c0"}, {"count(1)", "min(c1)", "max(c1)", "sum(c1)"})
+               .finalAggregation()
+               .planNode();
 
     assertQuery(
         makeCursorParameters(plan, outputBatchSize),
@@ -69,7 +84,7 @@ class StreamingAggregationTest : public OperatorTestBase {
                .values(data)
                .project({"c0", "c1", "c1 % 7 = 0 AS m1", "c1 % 11 = 0 AS m2"})
                .partialStreamingAggregation(
-                   {0},
+                   {"c0"},
                    {"count(1)", "min(c1)", "max(c1)", "sum(c1)"},
                    {"", "m1", "m2", "m1"})
                .finalAggregation()
@@ -109,29 +124,22 @@ class StreamingAggregationTest : public OperatorTestBase {
   void testMultiKeyAggregation(
       const std::vector<RowVectorPtr>& keys,
       uint32_t outputBatchSize = 1'024) {
-    std::vector<ChannelIndex> preGroupedChannels(numKeys(keys));
-    std::iota(preGroupedChannels.begin(), preGroupedChannels.end(), 0);
-
-    testMultiKeyAggregation(keys, preGroupedChannels, outputBatchSize);
+    testMultiKeyAggregation(
+        keys, keys[0]->type()->asRow().names(), outputBatchSize);
   }
 
   void testMultiKeyAggregation(
       const std::vector<RowVectorPtr>& keys,
-      const std::vector<ChannelIndex>& preGroupedChannels,
+      const std::vector<std::string>& preGroupedKeys,
       uint32_t outputBatchSize = 1'024) {
     auto data = addPayload(keys);
     createDuckDbTable(data);
 
-    auto numKeys = this->numKeys(keys);
-
-    std::vector<ChannelIndex> keyChannels(numKeys);
-    std::iota(keyChannels.begin(), keyChannels.end(), 0);
-
     auto plan = PlanBuilder()
                     .values(data)
                     .aggregation(
-                        keyChannels,
-                        preGroupedChannels,
+                        keys[0]->type()->asRow().names(),
+                        preGroupedKeys,
                         {"count(1)", "min(c1)", "max(c1)", "sum(c1)"},
                         {},
                         core::AggregationNode::Step::kPartial,
@@ -142,7 +150,7 @@ class StreamingAggregationTest : public OperatorTestBase {
     // Generate a list of grouping keys to use in the query: c0, c1, c2,..
     std::ostringstream keySql;
     keySql << "c0";
-    for (auto i = 1; i < numKeys; i++) {
+    for (auto i = 1; i < numKeys(keys); i++) {
       keySql << ", c" << i;
     }
 
@@ -264,6 +272,5 @@ TEST_F(StreamingAggregationTest, partialStreaming) {
       }),
   };
 
-  std::vector<ChannelIndex> preGroupedKeys = {0};
-  testMultiKeyAggregation(keys, preGroupedKeys);
+  testMultiKeyAggregation(keys, {"c0"});
 }

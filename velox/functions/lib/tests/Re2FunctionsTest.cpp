@@ -29,6 +29,9 @@
 #include "velox/vector/FlatVector.h"
 
 namespace facebook::velox::functions {
+
+using namespace facebook::velox::test;
+
 namespace {
 
 std::shared_ptr<exec::VectorFunction> makeRegexExtract(
@@ -195,14 +198,6 @@ TEST_F(Re2FunctionsTest, regexMatch) {
       [&](std::optional<std::string> str, std::optional<std::string> pattern) {
         return evaluateOnce<bool>("re2_match(c0, c1)", str, pattern);
       });
-}
-
-TEST_F(Re2FunctionsTest, regexMatchBadArgs) {
-  const std::optional<std::string> null_string{};
-  // Can't provide multiple template arguments inline in the EXPECT macro.
-  EXPECT_THROW(
-      evaluateOnce<bool>("re2_match(c0, '', '')", null_string),
-      std::invalid_argument);
 }
 
 TEST_F(Re2FunctionsTest, regexMatchBatch) {
@@ -377,16 +372,13 @@ TEST_F(Re2FunctionsTest, likePattern) {
 
   EXPECT_EQ(
       like(
-          u8"\u4FE1\u5FF5 \u7231 \u5E0C\u671B \u2028 abc",
-          u8"\u4FE1\u5FF5 \u7231%"),
+          "\u4FE1\u5FF5 \u7231 \u5E0C\u671B \u2028 abc",
+          "\u4FE1\u5FF5 \u7231%"),
       true);
   EXPECT_EQ(
-      like(u8"\u4FE1\u5FF5 \u7231 \u5E0C\u671B \u2028 ", u8"\u4FE1%\u7231%"),
-      true);
+      like("\u4FE1\u5FF5 \u7231 \u5E0C\u671B \u2028 ", "\u4FE1%\u7231%"), true);
   EXPECT_EQ(
-      like(
-          u8"\u4FE1\u5FF5 \u7231 \u5E0C\u671B \u2028 ",
-          u8"\u7231\u4FE1%\u7231%"),
+      like("\u4FE1\u5FF5 \u7231 \u5E0C\u671B \u2028 ", "\u7231\u4FE1%\u7231%"),
       false);
 
   EXPECT_EQ(like("abc", "MEDIUM POLISHED%"), false);

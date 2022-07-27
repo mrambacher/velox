@@ -55,8 +55,7 @@ class DictionaryVector : public SimpleVector<T> {
       VectorPtr dictionaryValues,
       TypeKind indexTypeKind,
       BufferPtr dictionaryIndexArray,
-      const folly::F14FastMap<std::string, std::string>& metaData =
-          cdvi::EMPTY_METADATA,
+      const SimpleVectorStats<T>& stats = {},
       std::optional<vector_size_t> distinctValueCount = std::nullopt,
       std::optional<vector_size_t> nullCount = std::nullopt,
       std::optional<bool> isSorted = std::nullopt,
@@ -64,10 +63,6 @@ class DictionaryVector : public SimpleVector<T> {
       std::optional<ByteCount> storageByteCount = std::nullopt);
 
   virtual ~DictionaryVector() override = default;
-
-  inline VectorEncoding::Simple encoding() const override {
-    return VectorEncoding::Simple::DICTIONARY;
-  }
 
   bool mayHaveNulls() const override {
     VELOX_DCHECK(initialized_);
@@ -100,27 +95,17 @@ class DictionaryVector : public SimpleVector<T> {
   std::unique_ptr<SimpleVector<uint64_t>> hashAll() const override;
 
   /**
-   * Loads a 256bit vector of data at the virtual byteOffset given
+   * Loads a SIMD vector of data at the virtual byteOffset given
    * Note this method is implemented on each vector type, but is intentionally
    * not virtual for performance reasons
    *
    * @param index at which to start the vector load
    * @return the vector of values starting at the given index
    */
-  __m256i loadSIMDValueBufferAt(size_t index) const;
+  xsimd::batch<T> loadSIMDValueBufferAt(size_t index) const;
 
   inline TypeKind getIndexType() const {
     return indexType_;
-  }
-
-  /**
-   * @return metadata for the internal dictionary value vector. They
-   * hold the min and max value in the dictionary.
-   */
-  // TODO (T61713241): Remove this later.
-  inline const folly::F14FastMap<std::string, std::string>&
-  getDictionaryMetaData() const {
-    return dictionaryMetaData_;
   }
 
   inline const BufferPtr& indices() const {
@@ -167,11 +152,7 @@ class DictionaryVector : public SimpleVector<T> {
   }
 
   BaseVector* loadedVector() override {
-    auto loaded = BaseVector::loadedVectorShared(dictionaryValues_);
-    if (loaded == dictionaryValues_) {
-      return this;
-    }
-    dictionaryValues_ = loaded;
+    dictionaryValues_ = BaseVector::loadedVectorShared(dictionaryValues_);
     setInternalState();
     return this;
   }
@@ -188,7 +169,7 @@ class DictionaryVector : public SimpleVector<T> {
     return dictionaryValues_->wrappedIndex(rawIndices_[index]);
   }
 
-  bool mayAddNulls() const override {
+  bool isNullsWritable() const override {
     return true;
   }
 
@@ -237,9 +218,6 @@ class DictionaryVector : public SimpleVector<T> {
   }
 
   void setInternalState();
-
-  // metadata over the contained vector data
-  folly::F14FastMap<std::string, std::string> dictionaryMetaData_;
 
   // the dictionary indices of the vector can be variable types depending on the
   // size of the dictionary - kept as original and typed

@@ -45,8 +45,7 @@ class ConstantVector final : public SimpleVector<T> {
       size_t length,
       bool isNull,
       T&& val,
-      const folly::F14FastMap<std::string, std::string>& metaData =
-          cdvi::EMPTY_METADATA,
+      const SimpleVectorStats<T>& stats = {},
       std::optional<ByteCount> representedBytes = std::nullopt,
       std::optional<ByteCount> storageByteCount = std::nullopt)
       : ConstantVector(
@@ -55,7 +54,7 @@ class ConstantVector final : public SimpleVector<T> {
             isNull,
             CppToType<T>::create(),
             std::move(val),
-            metaData,
+            stats,
             representedBytes,
             storageByteCount) {}
 
@@ -65,16 +64,16 @@ class ConstantVector final : public SimpleVector<T> {
       bool isNull,
       std::shared_ptr<const Type> type,
       T&& val,
-      const folly::F14FastMap<std::string, std::string>& metaData =
-          cdvi::EMPTY_METADATA,
+      const SimpleVectorStats<T>& stats = {},
       std::optional<ByteCount> representedBytes = std::nullopt,
       std::optional<ByteCount> storageByteCount = std::nullopt)
       : SimpleVector<T>(
             pool,
             type,
+            VectorEncoding::Simple::CONSTANT,
             BufferPtr(nullptr),
             length,
-            metaData,
+            stats,
             isNull ? 0 : 1 /* distinctValueCount */,
             isNull ? length : 0 /* nullCount */,
             true /*isSorted*/,
@@ -98,7 +97,7 @@ class ConstantVector final : public SimpleVector<T> {
     }
     // If this is not encoded integer, or string, set value buffer
     if constexpr (can_simd) {
-      valueBuffer_ = simd::setAll256i(value_);
+      valueBuffer_ = simd::setAll(value_);
     }
   }
 
@@ -114,14 +113,14 @@ class ConstantVector final : public SimpleVector<T> {
       vector_size_t length,
       vector_size_t index,
       VectorPtr base,
-      const folly::F14FastMap<std::string, std::string>& metaData =
-          cdvi::EMPTY_METADATA)
+      const SimpleVectorStats<T>& stats = {})
       : SimpleVector<T>(
             pool,
             base->type(),
+            VectorEncoding::Simple::CONSTANT,
             BufferPtr(nullptr),
             length,
-            metaData,
+            stats,
             std::nullopt,
             std::nullopt,
             true /*isSorted*/,
@@ -133,21 +132,17 @@ class ConstantVector final : public SimpleVector<T> {
         valueVector_(base),
         index_(index) {
     VELOX_CHECK_NE(
-        base->encoding(),
+        base->BaseVector::encoding(),
         VectorEncoding::Simple::CONSTANT,
         "Constant vector cannot wrap Constant vector");
     VELOX_CHECK_NE(
-        base->encoding(),
+        base->BaseVector::encoding(),
         VectorEncoding::Simple::DICTIONARY,
         "Constant vector cannot wrap Dictionary vector");
     setInternalState();
   }
 
   virtual ~ConstantVector() override = default;
-
-  inline VectorEncoding::Simple encoding() const override {
-    return VectorEncoding::Simple::CONSTANT;
-  }
 
   bool isNullAt(vector_size_t /*idx*/) const override {
     VELOX_DCHECK(initialized_);
@@ -162,6 +157,10 @@ class ConstantVector final : public SimpleVector<T> {
   bool mayHaveNullsRecursive() const override {
     VELOX_DCHECK(initialized_);
     return isNull_ || (valueVector_ && valueVector_->mayHaveNullsRecursive());
+  }
+
+  void setNull(vector_size_t /*idx*/, bool /*value*/) override {
+    VELOX_FAIL("setNull not supported on ConstantVector");
   }
 
   const uint64_t* flatRawNulls(const SelectivityVector& rows) override {
@@ -212,7 +211,7 @@ class ConstantVector final : public SimpleVector<T> {
    *
    * @param byteOffset - the byte offset to laod from
    */
-  __m256i loadSIMDValueBufferAt(size_t /* byteOffset */) const {
+  xsimd::batch<T> loadSIMDValueBufferAt(size_t /* byteOffset */) const {
     VELOX_DCHECK(initialized_);
     return valueBuffer_;
   }
@@ -302,10 +301,32 @@ class ConstantVector final : public SimpleVector<T> {
     // nothing to do
   }
 
+  std::optional<int32_t> compare(
+      const BaseVector* other,
+      vector_size_t index,
+      vector_size_t otherIndex,
+      CompareFlags flags) const override {
+    if constexpr (!std::is_same_v<T, ComplexType>) {
+      if (other->isConstantEncoding()) {
+        auto otherConstant = other->asUnchecked<ConstantVector<T>>();
+        if (isNull_ || otherConstant->isNull_) {
+          return BaseVector::compareNulls(
+              isNull_, otherConstant->isNull_, flags);
+        }
+
+        auto result =
+            SimpleVector<T>::comparePrimitiveAsc(value_, otherConstant->value_);
+        return flags.ascending ? result : result * -1;
+      }
+    }
+
+    return SimpleVector<T>::compare(other, index, otherIndex, flags);
+  }
+
   std::string toString() const override {
     std::stringstream out;
-    out << "[" << encoding() << " " << this->type()->toString() << ": "
-        << toString(index_) << " value, " << this->size() << " size]";
+    out << "[" << BaseVector::encoding() << " " << this->type()->toString()
+        << ": " << toString(index_) << " value, " << this->size() << " size]";
     return out.str();
   }
 
@@ -353,7 +374,7 @@ class ConstantVector final : public SimpleVector<T> {
     BaseVector::inMemoryBytes_ += string.size();
     value_ = velox::to<decltype(value_)>(string);
     if constexpr (can_simd) {
-      valueBuffer_ = simd::setAll256i(value_);
+      valueBuffer_ = simd::setAll(value_);
     }
   }
 
@@ -376,9 +397,11 @@ class ConstantVector final : public SimpleVector<T> {
   // Holds the memory for backing non-inlined values represented by StringView.
   BufferPtr stringBuffer_;
   T value_;
-  __m256i valueBuffer_;
   bool isNull_ = false;
   bool initialized_{false};
+
+  // This must be at end to avoid memory corruption.
+  std::conditional_t<can_simd, xsimd::batch<T>, char> valueBuffer_;
 };
 
 template <>
@@ -386,6 +409,9 @@ void ConstantVector<StringView>::setValue(const std::string& string);
 
 template <>
 void ConstantVector<std::shared_ptr<void>>::setValue(const std::string& string);
+
+template <>
+void ConstantVector<ComplexType>::setValue(const std::string& string);
 
 template <typename T>
 using ConstantVectorPtr = std::shared_ptr<ConstantVector<T>>;

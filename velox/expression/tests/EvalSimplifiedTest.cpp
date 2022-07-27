@@ -16,10 +16,12 @@
 
 #include "gtest/gtest.h"
 
-#include "velox/expression/tests/VectorFuzzer.h"
 #include "velox/functions/prestosql/tests/FunctionBaseTest.h"
+#include "velox/vector/fuzzer/VectorFuzzer.h"
+#include "velox/vector/tests/VectorTestBase.h"
 
 using namespace facebook::velox;
+using namespace facebook::velox::test;
 using functions::test::FunctionBaseTest;
 
 // This test suite tests the simplified eval engine by:
@@ -31,12 +33,6 @@ using functions::test::FunctionBaseTest;
 //
 class EvalSimplifiedTest : public FunctionBaseTest {
  protected:
-  void assertEqualVectors(const VectorPtr& expected, const VectorPtr& actual) {
-    ASSERT_EQ(expected->size(), actual->size());
-    FunctionBaseTest::assertEqualVectors(
-        expected, actual, fmt::format(" (seed {}).", seed_));
-  }
-
   void assertExceptions(
       std::exception_ptr commonPtr,
       std::exception_ptr simplifiedPtr) {
@@ -55,7 +51,7 @@ class EvalSimplifiedTest : public FunctionBaseTest {
       const VectorFuzzer::Options& fuzzerOpts,
       folly::Random::DefaultGenerator& rng) {
     if (types == nullptr) {
-      return nullptr;
+      return makeRowVector(ROW({}, {}), 10);
     }
 
     std::vector<VectorPtr> vectors;

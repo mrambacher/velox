@@ -17,6 +17,7 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include "velox/dwio/dwrf/writer/FlushPolicy.h"
 #include "velox/dwio/dwrf/writer/WriterShared.h"
 #include "velox/dwio/type/fbhive/HiveTypeParser.h"
 
@@ -155,7 +156,7 @@ class DummyWriter : public velox::dwrf::WriterShared {
   MOCK_METHOD0(resetImpl, void());
 
   friend class WriterFlushTestHelper;
-  FRIEND_TEST(TestWriterFlush, CheckAgainstMemoryBudget);
+  VELOX_FRIEND_TEST(TestWriterFlush, CheckAgainstMemoryBudget);
 };
 
 // Big idea is to directly manipulate context states (num rows) + memory pool
@@ -258,8 +259,8 @@ class WriterFlushTestHelper {
     options.schema = dwio::type::fbhive::HiveTypeParser().parse(
         "struct<int_val:int,string_val:string>");
     // A completely memory pressure based flush policy.
-    options.flushPolicy = [](bool overMemoryBudget, auto& /* context */) {
-      return overMemoryBudget;
+    options.flushPolicyFactory = []() {
+      return std::make_unique<LambdaFlushPolicy>([]() { return false; });
     };
     auto writer = std::make_unique<DummyWriter>(
         options,
@@ -542,8 +543,8 @@ TEST(TestWriterFlush, MemoryBasedFlushRandom) {
       // {30227679, 20 * kSizeMB, 30},
       {10237629, 10 * kSizeMB, 15},
       {30227679, 10 * kSizeMB, 15},
-      {10237629, 60 * kSizeMB, 84},
-      {30227679, 60 * kSizeMB, 85}};
+      {10237629, 49 * kSizeMB, 69},
+      {30227679, 70 * kSizeMB, 98}};
 
   for (auto& testCase : testCases) {
     WriterFlushTestHelper::testRandomSequence(

@@ -35,78 +35,55 @@ class HiveConnectorTestBase : public OperatorTestBase {
   void SetUp() override;
   void TearDown() override;
 
-  void writeToFile(
-      const std::string& filePath,
-      const std::string& name,
-      RowVectorPtr vector);
+  void writeToFile(const std::string& filePath, RowVectorPtr vector);
 
   void writeToFile(
       const std::string& filePath,
-      const std::string& name,
       const std::vector<RowVectorPtr>& vectors,
       std::shared_ptr<dwrf::Config> config =
           std::make_shared<facebook::velox::dwrf::Config>());
 
   std::vector<RowVectorPtr> makeVectors(
-      const std::shared_ptr<const RowType>& rowType,
+      const RowTypePtr& rowType,
       int32_t numVectors,
       int32_t rowsPerVector);
 
-  std::shared_ptr<exec::Task> assertQuery(
-      const std::shared_ptr<const core::PlanNode>& plan,
-      const std::string& duckDbSql) {
-    return assertQuery(
-        plan, std::vector<std::shared_ptr<TempFilePath>>(), duckDbSql);
-  }
+  using OperatorTestBase::assertQuery;
 
+  /// Assumes plan has a single TableScan node.
   std::shared_ptr<exec::Task> assertQuery(
-      const std::shared_ptr<const core::PlanNode>& plan,
+      const core::PlanNodePtr& plan,
       const std::vector<std::shared_ptr<TempFilePath>>& filePaths,
-      const std::string& duckDbSql);
-
-  std::shared_ptr<exec::Task> assertQuery(
-      const std::shared_ptr<const core::PlanNode>& plan,
-      const std::unordered_map<
-          core::PlanNodeId,
-          std::vector<std::shared_ptr<TempFilePath>>>& filePaths,
       const std::string& duckDbSql);
 
   static std::vector<std::shared_ptr<TempFilePath>> makeFilePaths(int count);
 
-  static std::vector<std::shared_ptr<connector::ConnectorSplit>> makeHiveSplits(
+  static std::vector<std::shared_ptr<connector::ConnectorSplit>>
+  makeHiveConnectorSplits(
       const std::vector<std::shared_ptr<TempFilePath>>& filePaths);
 
-  static std::shared_ptr<connector::hive::HiveConnectorSplit>
-  makeHiveConnectorSplit(
-      const std::string& filePath,
-      uint64_t start = 0,
-      uint64_t length = std::numeric_limits<uint64_t>::max()) {
-    return makeHiveConnectorSplit(filePath, {}, start, length);
-  }
-
-  static std::shared_ptr<connector::hive::HiveConnectorSplit>
-  makeHiveConnectorSplit(
-      const std::string& filePath,
-      const std::unordered_map<std::string, std::optional<std::string>>&
-          partitionKeys,
-      uint64_t start = 0,
-      uint64_t length = std::numeric_limits<uint64_t>::max());
-
-  static exec::Split makeHiveSplit(
+  static std::shared_ptr<connector::ConnectorSplit> makeHiveConnectorSplit(
       const std::string& filePath,
       uint64_t start = 0,
       uint64_t length = std::numeric_limits<uint64_t>::max());
 
-  static exec::Split makeHiveSplitWithGroup(
+  /// Split file at path 'filePath' into 'splitCount' splits.
+  static std::vector<std::shared_ptr<connector::hive::HiveConnectorSplit>>
+  makeHiveConnectorSplits(
       const std::string& filePath,
-      int32_t groupId);
+      uint32_t splitCount,
+      dwio::common::FileFormat format);
 
   static std::shared_ptr<connector::hive::HiveTableHandle> makeTableHandle(
-      common::test::SubfieldFilters subfieldFilters,
-      const std::shared_ptr<const core::ITypedExpr>& remainingFilter =
-          nullptr) {
+      common::test::SubfieldFilters subfieldFilters = {},
+      const core::TypedExprPtr& remainingFilter = nullptr,
+      const std::string& tableName = "hive_table") {
     return std::make_shared<connector::hive::HiveTableHandle>(
-        true, std::move(subfieldFilters), remainingFilter);
+        kHiveConnectorId,
+        tableName,
+        true,
+        std::move(subfieldFilters),
+        remainingFilter);
   }
 
   static std::shared_ptr<connector::hive::HiveColumnHandle> regularColumn(
@@ -121,8 +98,7 @@ class HiveConnectorTestBase : public OperatorTestBase {
       const std::string& name,
       const TypePtr& type);
 
-  static ColumnHandleMap allRegularColumns(
-      const std::shared_ptr<const RowType>& rowType) {
+  static ColumnHandleMap allRegularColumns(const RowTypePtr& rowType) {
     ColumnHandleMap assignments;
     assignments.reserve(rowType->size());
     for (uint32_t i = 0; i < rowType->size(); ++i) {
@@ -132,20 +108,63 @@ class HiveConnectorTestBase : public OperatorTestBase {
     return assignments;
   }
 
-  static void addConnectorSplit(
-      Task* task,
-      const core::PlanNodeId& planNodeId,
-      const std::shared_ptr<connector::ConnectorSplit>& connectorSplit);
-
-  static void
-  addSplit(Task* task, const core::PlanNodeId& planNodeId, exec::Split&& split);
-
   memory::MappedMemory* mappedMemory() {
     return memory::MappedMemory::getInstance();
   }
 
-  SimpleLRUDataCache* dataCache;
   std::unique_ptr<folly::IOThreadPoolExecutor> executor_;
+};
+
+class HiveConnectorSplitBuilder {
+ public:
+  HiveConnectorSplitBuilder(std::string filePath)
+      : filePath_{std::move(filePath)} {}
+
+  HiveConnectorSplitBuilder& start(uint64_t start) {
+    start_ = start;
+    return *this;
+  }
+
+  HiveConnectorSplitBuilder& length(uint64_t length) {
+    length_ = length;
+    return *this;
+  }
+
+  HiveConnectorSplitBuilder& fileFormat(dwio::common::FileFormat format) {
+    fileFormat_ = format;
+    return *this;
+  }
+
+  HiveConnectorSplitBuilder& partitionKey(
+      std::string name,
+      std::optional<std::string> value) {
+    partitionKeys_.emplace(std::move(name), std::move(value));
+    return *this;
+  }
+
+  HiveConnectorSplitBuilder& tableBucketNumber(int32_t bucket) {
+    tableBucketNumber_ = bucket;
+    return *this;
+  }
+
+  std::shared_ptr<connector::hive::HiveConnectorSplit> build() const {
+    return std::make_shared<connector::hive::HiveConnectorSplit>(
+        kHiveConnectorId,
+        "file:" + filePath_,
+        fileFormat_,
+        start_,
+        length_,
+        partitionKeys_,
+        tableBucketNumber_);
+  }
+
+ private:
+  const std::string filePath_;
+  dwio::common::FileFormat fileFormat_{dwio::common::FileFormat::ORC};
+  uint64_t start_{0};
+  uint64_t length_{std::numeric_limits<uint64_t>::max()};
+  std::unordered_map<std::string, std::optional<std::string>> partitionKeys_;
+  std::optional<int32_t> tableBucketNumber_;
 };
 
 } // namespace facebook::velox::exec::test

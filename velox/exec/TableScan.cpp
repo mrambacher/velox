@@ -30,11 +30,12 @@ TableScan::TableScan(
           operatorId,
           tableScanNode->id(),
           "TableScan"),
-      planNodeId_(tableScanNode->id()),
       tableHandle_(tableScanNode->tableHandle()),
       columnHandles_(tableScanNode->assignments()),
       driverCtx_(driverCtx),
-      blockingFuture_(false) {}
+      blockingFuture_(false) {
+  connector_ = connector::getConnector(tableHandle_->connectorId());
+}
 
 RowVectorPtr TableScan::getOutput() {
   if (noMoreSplits_) {
@@ -45,7 +46,7 @@ RowVectorPtr TableScan::getOutput() {
     if (needNewSplit_) {
       exec::Split split;
       auto reason = driverCtx_->task->getSplitOrFuture(
-          driverCtx_->splitGroupId, planNodeId_, split, blockingFuture_);
+          driverCtx_->splitGroupId, planNodeId(), split, blockingFuture_);
       if (reason != BlockingReason::kNotBlocked) {
         return nullptr;
       }
@@ -55,21 +56,29 @@ RowVectorPtr TableScan::getOutput() {
 
         if (dataSource_) {
           auto connectorStats = dataSource_->runtimeStats();
-          for (const auto& entry : connectorStats) {
-            stats_.runtimeStats[entry.first].addValue(entry.second);
+          for (const auto& [name, counter] : connectorStats) {
+            if (UNLIKELY(stats_.runtimeStats.count(name) == 0)) {
+              stats_.runtimeStats.insert(
+                  std::make_pair(name, RuntimeMetric(counter.unit)));
+            } else {
+              VELOX_CHECK_EQ(stats_.runtimeStats.at(name).unit, counter.unit);
+            }
+            stats_.runtimeStats.at(name).addValue(counter.value);
           }
         }
         return nullptr;
       }
 
       const auto& connectorSplit = split.connectorSplit;
-      currentSplitGroupId_ = split.groupId;
       needNewSplit_ = false;
 
-      if (!connector_) {
-        connector_ = connector::getConnector(connectorSplit->connectorId);
-        connectorQueryCtx_ = driverCtx_->createConnectorQueryCtx(
-            connectorSplit->connectorId, planNodeId_);
+      VELOX_CHECK(
+          connector_->connectorId() == connectorSplit->connectorId,
+          "Got splits with different connector IDs");
+
+      if (!dataSource_) {
+        connectorQueryCtx_ = operatorCtx_->createConnectorQueryCtx(
+            connectorSplit->connectorId, planNodeId());
         dataSource_ = connector_->createDataSource(
             outputType_,
             tableHandle_,
@@ -79,22 +88,30 @@ RowVectorPtr TableScan::getOutput() {
           dataSource_->addDynamicFilter(entry.first, entry.second);
         }
         pendingDynamicFilters_.clear();
-      } else {
-        VELOX_CHECK(
-            connector_->connectorId() == connectorSplit->connectorId,
-            "Got splits with different connector IDs");
       }
 
+      debugString_ = fmt::format(
+          "Split {} Task {}",
+          connectorSplit->toString(),
+          operatorCtx_->task()->taskId());
       dataSource_->addSplit(connectorSplit);
       ++stats_.numSplits;
       setBatchSize();
     }
 
     const auto ioTimeStartMicros = getCurrentTimeMicro();
+    ExceptionContextSetter exceptionContext(
+        {[](auto* debugString) {
+           return *static_cast<std::string*>(debugString);
+         },
+         &debugString_});
+
     auto data = dataSource_->next(readBatchSize_);
     stats().addRuntimeStat(
         "dataSourceWallNanos",
-        (getCurrentTimeMicro() - ioTimeStartMicros) * 1'000);
+        RuntimeCounter(
+            (getCurrentTimeMicro() - ioTimeStartMicros) * 1'000,
+            RuntimeCounter::Unit::kNanos));
     stats_.rawInputPositions = dataSource_->getCompletedRows();
     stats_.rawInputBytes = dataSource_->getCompletedBytes();
     if (data) {
@@ -106,8 +123,7 @@ RowVectorPtr TableScan::getOutput() {
       continue;
     }
 
-    driverCtx_->task->splitFinished(planNodeId_, currentSplitGroupId_);
-    currentSplitGroupId_ = -1;
+    driverCtx_->task->splitFinished();
     needNewSplit_ = true;
   }
 }

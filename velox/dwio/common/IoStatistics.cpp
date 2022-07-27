@@ -14,15 +14,13 @@
  * limitations under the License.
  */
 
-#include "velox/dwio/common/IoStatistics.h"
 #include <glog/logging.h>
 #include <atomic>
 #include <utility>
 
-namespace facebook {
-namespace velox {
-namespace dwio {
-namespace common {
+#include "velox/dwio/common/IoStatistics.h"
+
+namespace facebook::velox::dwio::common {
 
 uint64_t IoStatistics::rawBytesRead() const {
   return rawBytesRead_.load(std::memory_order_relaxed);
@@ -88,7 +86,51 @@ IoStatistics::operationStats() const {
   return operationStats_;
 }
 
-} // namespace common
-} // namespace dwio
-} // namespace velox
-} // namespace facebook
+void IoStatistics::merge(const IoStatistics& other) {
+  rawBytesRead_ += other.rawBytesRead_;
+  rawBytesWritten_ += other.rawBytesWritten_;
+
+  rawOverreadBytes_ += other.rawOverreadBytes_;
+  prefetch_.merge(other.prefetch_);
+  read_.merge(other.read_);
+  ramHit_.merge(other.ramHit_);
+  ssdRead_.merge(other.ssdRead_);
+  queryThreadIoLatency_.merge(other.queryThreadIoLatency_);
+  std::lock_guard<std::mutex> l(operationStatsMutex_);
+  for (auto& item : other.operationStats_) {
+    operationStats_[item.first].merge(item.second);
+  }
+}
+
+void OperationCounters::merge(const OperationCounters& other) {
+  resourceThrottleCount += other.resourceThrottleCount;
+  localThrottleCount += other.localThrottleCount;
+  globalThrottleCount += other.globalThrottleCount;
+  retryCount += other.retryCount;
+  latencyInMs += other.latencyInMs;
+  requestCount += other.requestCount;
+  delayInjectedInSecs += other.delayInjectedInSecs;
+}
+
+folly::dynamic serialize(const OperationCounters& counters) {
+  folly::dynamic json = folly::dynamic::object;
+  json["latencyInMs"] = counters.latencyInMs;
+  json["localThrottleCount"] = counters.localThrottleCount;
+  json["resourceThrottleCount"] = counters.resourceThrottleCount;
+  json["globalThrottleCount"] = counters.globalThrottleCount;
+  json["retryCount"] = counters.retryCount;
+  json["requestCount"] = counters.requestCount;
+  json["delayInjectedInSecs"] = counters.delayInjectedInSecs;
+  return json;
+}
+
+folly::dynamic IoStatistics::getOperationStatsSnapshot() const {
+  auto snapshot = operationStats();
+  folly::dynamic json = folly::dynamic::object;
+  for (auto stat : snapshot) {
+    json[stat.first] = serialize(stat.second);
+  }
+  return json;
+}
+
+} // namespace facebook::velox::dwio::common

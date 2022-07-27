@@ -70,19 +70,61 @@ of available functions [can be found here.](https://facebookincubator.github.io/
 
 We provide scripts to help developers setup and install Velox dependencies.
 
+### Get the Velox Source
+```
+git clone --recursive https://github.com/facebookincubator/velox.git
+cd velox
+# if you are updating an existing checkout
+git submodule sync --recursive
+git submodule update --init --recursive
+```
+
 ### Setting up on macOS
 
-See [scripts/setup-macos.sh](scripts/setup-macos.sh)
+Once you have checked out Velox, on an Intel MacOS machine you can setup and then build like so:
+
+```shell
+$ ./scripts/setup-macos.sh 
+$ make
+```
+
+On an M1 MacOS machine you can build like so:
+
+```shell
+$ CPU_TARGET="arm64" ./scripts/setup-macos.sh
+$ CPU_TARGET="arm64" make
+```
+
+You can also produce intel binaries on an M1, use `CPU_TARGET="sse"` for the above.
 
 ### Setting up on Linux (Ubuntu 20.04 or later)
 
-See [scripts/setup-ubuntu.sh](scripts/setup-ubuntu.sh)
+Once you have checked out Velox, you can setup and build like so:
+
+```shell
+$ ./scripts/setup-ubuntu.sh 
+$ make
+```
 
 ### Building Velox
 
 Run `make` in the root directory to compile the sources. For development, use
 `make debug` to build a non-optimized debug version, or `make release` to build
 an optimized version.  Use `make unittest` to build and run tests.
+
+Note that,
+* Velox requires C++17 , thus minimum supported compiler is GCC 5.0 and Clang 5.0.
+* Velox requires the CPU to support instruction sets:
+  * bmi
+  * bmi2
+  * f16c
+* Velox tries to use the following (or equivalent) instruction sets where available:
+  * On Intel CPUs
+    * avx  
+    * avx2
+    * sse
+  * On ARM
+    * Neon
 
 ## Contributing
 
@@ -92,8 +134,9 @@ contribute to the project.
 ## Community
 
 The main communication channel with the Velox OSS community is through the
-[the Velox-OSS Slack workspace](http://velox-oss.slack.com). Please don't
-hesitate in reaching out.
+[the Velox-OSS Slack workspace](http://velox-oss.slack.com). 
+Please reach out to **velox@fb.com** to get access to Velox Slack Channel.
+
 
 ## License
 

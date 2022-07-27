@@ -14,36 +14,22 @@
  * limitations under the License.
  */
 #include "velox/exec/Task.h"
-#include <gtest/gtest.h>
+#include "velox/common/base/tests/GTestUtils.h"
 #include "velox/connectors/hive/HiveConnector.h"
+#include "velox/exec/tests/utils/Cursor.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
+#include "velox/exec/tests/utils/QueryAssertions.h"
 #include "velox/functions/prestosql/registration/RegistrationFunctions.h"
-
-#define VELOX_ASSERT_THROW(expression, errorMessage)                  \
-  try {                                                               \
-    (expression);                                                     \
-    VELOX_FAIL("Expected an exception");                              \
-  } catch (const VeloxException& e) {                                 \
-    ASSERT_TRUE(e.isUserError());                                     \
-    ASSERT_TRUE(e.message().find(errorMessage) != std::string::npos); \
-  }
+#include "velox/parse/TypeResolver.h"
+#include "velox/vector/tests/VectorTestBase.h"
 
 using namespace facebook::velox;
 
-class TaskTest : public testing::Test {
+class TaskTest : public testing::Test, public test::VectorTestBase {
  protected:
   static void SetUpTestCase() {
     functions::prestosql::registerAllScalarFunctions();
-  }
-
-  void useOneSplit(
-      exec::Task& task,
-      uint32_t splitGroupId,
-      const core::PlanNodeId& planNodeId) {
-    exec::Split splitOut;
-    exec::ContinueFuture futureOut{true};
-    task.getSplitOrFuture(splitGroupId, planNodeId, splitOut, futureOut);
-    task.splitFinished(planNodeId, splitGroupId);
+    parse::registerTypeResolver();
   }
 };
 
@@ -68,7 +54,7 @@ TEST_F(TaskTest, wrongPlanNodeForSplit) {
 
   // Try to add split for a non-source node.
   auto errorMessage =
-      "Splits can be associated only with source plan nodes. Plan node ID 1 doesn't refer to a source node.";
+      "Splits can be associated only with leaf plan nodes which require splits. Plan node ID 1 doesn't refer to such plan node.";
   VELOX_ASSERT_THROW(
       task.addSplit("1", exec::Split(folly::copy(connectorSplit))),
       errorMessage)
@@ -86,7 +72,7 @@ TEST_F(TaskTest, wrongPlanNodeForSplit) {
 
   // Try to add split for non-existent node.
   errorMessage =
-      "Splits can be associated only with source plan nodes. Plan node ID 12 doesn't refer to a source node.";
+      "Splits can be associated only with leaf plan nodes which require splits. Plan node ID 12 doesn't refer to such plan node.";
   VELOX_ASSERT_THROW(
       task.addSplit("12", exec::Split(folly::copy(connectorSplit))),
       errorMessage)
@@ -101,91 +87,21 @@ TEST_F(TaskTest, wrongPlanNodeForSplit) {
   VELOX_ASSERT_THROW(task.noMoreSplits("12"), errorMessage)
 
   VELOX_ASSERT_THROW(task.noMoreSplitsForGroup("12", 5), errorMessage)
-}
 
-// Dummy node class to construct a node we don't need.
-class DummyNode : public core::PlanNode {
- public:
-  explicit DummyNode(const core::PlanNodeId& id) : PlanNode(id) {}
+  // Try to add split for a Values source node.
+  plan =
+      exec::test::PlanBuilder()
+          .values({makeRowVector(ROW({"a", "b"}, {INTEGER(), DOUBLE()}), 10)})
+          .project({"a * a", "b + b"})
+          .planFragment();
 
-  const std::shared_ptr<const RowType>& outputType() const override {
-    return outputType_;
-  }
-
-  const std::vector<std::shared_ptr<const PlanNode>>& sources() const override {
-    return sources_;
-  }
-
-  std::string_view name() const override {
-    return id();
-  }
-
- private:
-  std::vector<std::shared_ptr<const core::PlanNode>> sources_;
-  std::shared_ptr<const RowType> outputType_;
-};
-
-// Test if the Task correctly handles split groups.
-TEST_F(TaskTest, splitGroup) {
-  // Create single hive connector split and the task.
-  auto connectorSplit = std::make_shared<connector::hive::HiveConnectorSplit>(
-      "test",
-      "file:/tmp/abc",
-      facebook::velox::dwio::common::FileFormat::ORC,
-      0,
-      100);
-  core::PlanNodeId planNodeId{"0"};
-  auto queryCtx = core::QueryCtx::createForTest();
-  core::PlanFragment planFragment{
-      std::make_shared<DummyNode>(planNodeId),
-      core::ExecutionStrategy::kGrouped,
-      3};
-  auto task = std::make_shared<exec::Task>(
-      "0", std::move(planFragment), 0, std::move(queryCtx));
-
-  // This is the set of completed groups we expect.
-  std::unordered_set<int32_t> completedSplitGroups;
-
-  // Add and complete 3 splits for group 0.
-  task->addSplit(planNodeId, exec::Split(folly::copy(connectorSplit), 0));
-  task->addSplit(planNodeId, exec::Split(folly::copy(connectorSplit), 0));
-  useOneSplit(*task, 0, planNodeId);
-  useOneSplit(*task, 0, planNodeId);
-  task->addSplit(planNodeId, exec::Split(folly::copy(connectorSplit), 0));
-  useOneSplit(*task, 0, planNodeId);
-  EXPECT_EQ(completedSplitGroups, task->taskStats().completedSplitGroups);
-
-  // Declare 'no more splits' for group 0.
-  task->noMoreSplitsForGroup(planNodeId, 0);
-  completedSplitGroups.insert(0);
-  EXPECT_EQ(completedSplitGroups, task->taskStats().completedSplitGroups);
-
-  // Add 3 splits for group 1, declare 'no more splits' for group 1, finish 2
-  // splits from group 1.
-  task->addSplit(planNodeId, exec::Split(folly::copy(connectorSplit), 1));
-  task->addSplit(planNodeId, exec::Split(folly::copy(connectorSplit), 1));
-  task->addSplit(planNodeId, exec::Split(folly::copy(connectorSplit), 1));
-  task->noMoreSplitsForGroup(planNodeId, 1);
-  useOneSplit(*task, 1, planNodeId);
-  useOneSplit(*task, 1, planNodeId);
-  EXPECT_EQ(completedSplitGroups, task->taskStats().completedSplitGroups);
-
-  // Add 2 splits for group 2, declare 'no more splits' for group 2.
-  task->addSplit(planNodeId, exec::Split(folly::copy(connectorSplit), 2));
-  task->addSplit(planNodeId, exec::Split(folly::copy(connectorSplit), 2));
-  task->noMoreSplitsForGroup(planNodeId, 2);
-  EXPECT_EQ(completedSplitGroups, task->taskStats().completedSplitGroups);
-
-  // Finish the last split for group 1
-  useOneSplit(*task, 1, planNodeId);
-  completedSplitGroups.insert(1);
-  EXPECT_EQ(completedSplitGroups, task->taskStats().completedSplitGroups);
-
-  // Finish the 2 split for group 2
-  useOneSplit(*task, 2, planNodeId);
-  useOneSplit(*task, 2, planNodeId);
-  completedSplitGroups.insert(2);
-  EXPECT_EQ(completedSplitGroups, task->taskStats().completedSplitGroups);
+  exec::Task valuesTask(
+      "task-2", std::move(plan), 0, core::QueryCtx::createForTest());
+  errorMessage =
+      "Splits can be associated only with leaf plan nodes which require splits. Plan node ID 0 doesn't refer to such plan node.";
+  VELOX_ASSERT_THROW(
+      valuesTask.addSplit("0", exec::Split(folly::copy(connectorSplit))),
+      errorMessage)
 }
 
 TEST_F(TaskTest, duplicatePlanNodeIds) {
@@ -204,4 +120,282 @@ TEST_F(TaskTest, duplicatePlanNodeIds) {
   VELOX_ASSERT_THROW(
       exec::Task("task-1", std::move(plan), 0, core::QueryCtx::createForTest()),
       "Plan node IDs must be unique. Found duplicate ID: 0.")
+}
+
+// A test join node whose build is skewed in terms of process time. The driver
+// id 0 processes slower than other drivers if paralelism greater than 1
+class TestSkewedJoinNode : public core::PlanNode {
+ public:
+  TestSkewedJoinNode(
+      const core::PlanNodeId& id,
+      core::PlanNodePtr left,
+      core::PlanNodePtr right,
+      const uint64_t slowJoinBuildDelaySeconds)
+      : PlanNode(id),
+        sources_{std::move(left), std::move(right)},
+        slowJoinBuildDelaySeconds_(slowJoinBuildDelaySeconds) {}
+
+  const RowTypePtr& outputType() const override {
+    return sources_[0]->outputType();
+  }
+
+  const std::vector<core::PlanNodePtr>& sources() const override {
+    return sources_;
+  }
+
+  std::string_view name() const override {
+    return "test skewed join";
+  }
+
+  int64_t slowJoinBuildDelaySeconds() const {
+    return slowJoinBuildDelaySeconds_;
+  }
+
+ private:
+  void addDetails(std::stringstream& /* stream */) const override {}
+
+  std::vector<core::PlanNodePtr> sources_;
+  uint64_t slowJoinBuildDelaySeconds_;
+};
+
+// A dummy test join bridge operator
+class TestSkewedJoinBridge : public exec::JoinBridge {
+ public:
+  void setBuildFinished() {
+    std::vector<ContinuePromise> promises;
+    {
+      std::lock_guard<std::mutex> l(mutex_);
+      VELOX_CHECK(
+          !buildFinished_.has_value(),
+          "setBuildFinished may be called only once");
+      buildFinished_ = true;
+      promises = std::move(promises_);
+    }
+    notify(std::move(promises));
+  }
+
+  std::optional<bool> buildFinishedOrFuture(exec::ContinueFuture* future) {
+    std::lock_guard<std::mutex> l(mutex_);
+    VELOX_CHECK(!cancelled_, "Getting data after the build side is aborted");
+    if (buildFinished_.has_value()) {
+      return buildFinished_;
+    }
+    promises_.emplace_back("TestSkewedJoinBridge::buildFinishedOrFuture");
+    *future = promises_.back().getSemiFuture();
+    return std::nullopt;
+  }
+
+ private:
+  std::optional<bool> buildFinished_;
+};
+
+// A dummy test join build operator that simulates driver with id 0 to process
+// slower than other drivers.
+class TestSkewedJoinBuild : public exec::Operator {
+ public:
+  TestSkewedJoinBuild(
+      int32_t operatorId,
+      exec::DriverCtx* driverCtx,
+      std::shared_ptr<const TestSkewedJoinNode> joinNode)
+      : Operator(
+            driverCtx,
+            nullptr,
+            operatorId,
+            joinNode->id(),
+            "TestSkewedJoinBuild"),
+        slowJoinBuildDelaySeconds_(joinNode->slowJoinBuildDelaySeconds()) {}
+
+  void addInput(RowVectorPtr /* input */) override {
+    // Make driver with id 0 slower than other drivers
+    auto driverId = operatorCtx_->driverCtx()->driverId;
+    if (driverId == 0) {
+      std::this_thread::sleep_for(
+          std::chrono::seconds(slowJoinBuildDelaySeconds_));
+    }
+  }
+
+  bool needsInput() const override {
+    return !noMoreInput_;
+  }
+
+  RowVectorPtr getOutput() override {
+    return nullptr;
+  }
+
+  void noMoreInput() override {
+    Operator::noMoreInput();
+    std::vector<ContinuePromise> promises;
+    std::vector<std::shared_ptr<exec::Driver>> peers;
+    // The last Driver to hit CustomJoinBuild::finish gathers the data from
+    // all build Drivers and hands it over to the probe side. At this
+    // point all build Drivers are continued and will free their
+    // state. allPeersFinished is true only for the last Driver of the
+    // build pipeline.
+    if (!operatorCtx_->task()->allPeersFinished(
+            planNodeId(), operatorCtx_->driver(), &future_, promises, peers)) {
+      return;
+    }
+    VELOX_FAIL("Last driver should not finish successfully.");
+  }
+
+  exec::BlockingReason isBlocked(exec::ContinueFuture* future) override {
+    if (!future_.valid()) {
+      return exec::BlockingReason::kNotBlocked;
+    }
+    *future = std::move(future_);
+    return exec::BlockingReason::kWaitForJoinBuild;
+  }
+
+  bool isFinished() override {
+    return !future_.valid() && noMoreInput_;
+  }
+
+ private:
+  exec::ContinueFuture future_{exec::ContinueFuture::makeEmpty()};
+  int64_t slowJoinBuildDelaySeconds_;
+};
+
+// A dummy test join probe operator
+class TestSkewedJoinProbe : public exec::Operator {
+ public:
+  TestSkewedJoinProbe(
+      int32_t operatorId,
+      exec::DriverCtx* driverCtx,
+      std::shared_ptr<const TestSkewedJoinNode> joinNode)
+      : Operator(
+            driverCtx,
+            nullptr,
+            operatorId,
+            joinNode->id(),
+            "CustomJoinProbe") {}
+
+  bool needsInput() const override {
+    return !finished_;
+  }
+
+  void addInput(RowVectorPtr /* input */) override {}
+
+  RowVectorPtr getOutput() override {
+    finished_ = true;
+    return nullptr;
+  }
+
+  exec::BlockingReason isBlocked(exec::ContinueFuture* future) override {
+    auto joinBridge = operatorCtx_->task()->getCustomJoinBridge(
+        operatorCtx_->driverCtx()->splitGroupId, planNodeId());
+    auto buildFinished =
+        std::dynamic_pointer_cast<TestSkewedJoinBridge>(joinBridge)
+            ->buildFinishedOrFuture(future);
+    if (!buildFinished.has_value()) {
+      return exec::BlockingReason::kWaitForJoinBuild;
+    }
+    return exec::BlockingReason::kNotBlocked;
+  }
+
+  bool isFinished() override {
+    return finished_;
+  }
+
+ private:
+  bool finished_{false};
+};
+
+class TestSkewedJoinBridgeTranslator
+    : public exec::Operator::PlanNodeTranslator {
+  std::unique_ptr<exec::Operator> toOperator(
+      exec::DriverCtx* ctx,
+      int32_t id,
+      const core::PlanNodePtr& node) override {
+    if (auto joinNode =
+            std::dynamic_pointer_cast<const TestSkewedJoinNode>(node)) {
+      return std::make_unique<TestSkewedJoinProbe>(id, ctx, joinNode);
+    }
+    return nullptr;
+  }
+
+  std::unique_ptr<exec::JoinBridge> toJoinBridge(
+      const core::PlanNodePtr& node) override {
+    if (auto joinNode =
+            std::dynamic_pointer_cast<const TestSkewedJoinNode>(node)) {
+      return std::make_unique<TestSkewedJoinBridge>();
+    }
+    return nullptr;
+  }
+
+  exec::OperatorSupplier toOperatorSupplier(
+      const core::PlanNodePtr& node) override {
+    if (auto joinNode =
+            std::dynamic_pointer_cast<const TestSkewedJoinNode>(node)) {
+      return [joinNode](int32_t operatorId, exec::DriverCtx* ctx) {
+        return std::make_unique<TestSkewedJoinBuild>(operatorId, ctx, joinNode);
+      };
+    }
+    return nullptr;
+  }
+};
+
+// This test simulates the following execution sequence that potentially can
+// cause a deadlock:
+// 1. A join task comes in to execution.
+// 2. All join bridges finished except for the last one.
+// 3. An abort request comes in to terminate the task.
+// 4. Task::terminate() acquires the task lock, trying to clear/clean various
+// states that contain a bunch of futures, including the ones in BarrierState
+// that serve the purpose of making sure all join builds finish before
+// proceeding.
+// 5. If not handled correctly, the futures that are tried to be cleaned will
+// execute the error block chained in the future, that tries to set error in the
+// task. Setting error requires to acquire the same task lock again.
+// 6. Since we use immediate executor to execute these futures, a dead lock
+// happens.
+TEST_F(TaskTest, testTerminateDeadlock) {
+  const int64_t kSlowJoinBuildDelaySeconds = 2;
+  const int64_t kTaskAbortDelaySeconds = 1;
+  const int64_t kMaxErrorTimeSeconds = 3;
+  exec::Operator::registerOperator(
+      std::make_unique<TestSkewedJoinBridgeTranslator>());
+
+  auto leftBatch = makeRowVector(
+      {makeFlatVector<int32_t>(100, [](auto row) { return row; })});
+  auto rightBatch = makeRowVector(
+      {makeFlatVector<int32_t>(10, [](auto row) { return row; })});
+
+  auto planNodeIdGenerator =
+      std::make_shared<exec::test::PlanNodeIdGenerator>();
+  auto leftNode = exec::test::PlanBuilder(planNodeIdGenerator)
+                      .values({leftBatch}, true)
+                      .planNode();
+  auto rightNode = exec::test::PlanBuilder(planNodeIdGenerator)
+                       .values({rightBatch}, true)
+                       .planNode();
+
+  exec::test::CursorParameters params;
+  params.maxDrivers = 2;
+  params.planNode =
+      exec::test::PlanBuilder(planNodeIdGenerator)
+          .addNode([&leftNode, &rightNode, &kSlowJoinBuildDelaySeconds](
+                       std::string id, core::PlanNodePtr /* input */) {
+            return std::make_shared<TestSkewedJoinNode>(
+                id,
+                std::move(leftNode),
+                std::move(rightNode),
+                kSlowJoinBuildDelaySeconds);
+          })
+          .project({"c0"})
+          .planNode();
+
+  auto cursor = std::make_unique<exec::test::TaskCursor>(params);
+
+  folly::via(cursor->task()->queryCtx()->executor(), [&]() {
+    // We abort after all but last join bridges finish execution. We do this
+    // in another thread because cursor->moveNext() will block.
+    std::this_thread::sleep_for(std::chrono::seconds(kTaskAbortDelaySeconds));
+    cursor->task()->requestAbort();
+  }).onTimeout(std::chrono::seconds(kMaxErrorTimeSeconds), [&]() {
+    // Task should be aborted by now. If it ever comes here, it is likely due
+    // to a deadlock.
+    ASSERT_TRUE(false);
+  });
+
+  VELOX_ASSERT_THROW(cursor->moveNext(), "Aborted for external error");
 }

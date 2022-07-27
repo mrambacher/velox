@@ -22,10 +22,9 @@
 #include <string>
 #include <unordered_map>
 
-namespace facebook {
-namespace velox {
-namespace dwio {
-namespace common {
+#include <folly/dynamic.h>
+
+namespace facebook::velox::dwio::common {
 
 struct OperationCounters {
   uint64_t resourceThrottleCount{0};
@@ -35,6 +34,8 @@ struct OperationCounters {
   uint64_t latencyInMs{0};
   uint64_t requestCount{0};
   uint64_t delayInjectedInSecs{0};
+
+  void merge(const OperationCounters& other);
 };
 
 class IoCounter {
@@ -50,6 +51,11 @@ class IoCounter {
   void increment(uint64_t bytes) {
     ++count_;
     bytes_ += bytes;
+  }
+
+  void merge(const IoCounter& other) {
+    bytes_ += other.bytes_;
+    count_ += other.count_;
   }
 
  private:
@@ -102,6 +108,10 @@ class IoStatistics {
 
   std::unordered_map<std::string, OperationCounters> operationStats() const;
 
+  void merge(const IoStatistics& other);
+
+  folly::dynamic getOperationStatsSnapshot() const;
+
  private:
   std::atomic<uint64_t> rawBytesRead_{0};
   std::atomic<uint64_t> rawBytesWritten_{0};
@@ -130,7 +140,4 @@ class IoStatistics {
   mutable std::mutex operationStatsMutex_;
 };
 
-} // namespace common
-} // namespace dwio
-} // namespace velox
-} // namespace facebook
+} // namespace facebook::velox::dwio::common

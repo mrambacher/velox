@@ -265,13 +265,13 @@ TEST(TestDecompression, testFileSeek) {
   {
     std::vector<uint64_t> offsets(1, 100);
     PositionProvider posn(offsets);
-    stream.seekToRowGroup(posn);
+    stream.seekToPosition(posn);
   }
   EXPECT_EQ(100, stream.ByteCount());
   {
     std::vector<uint64_t> offsets(1, 5);
     PositionProvider posn(offsets);
-    stream.seekToRowGroup(posn);
+    stream.seekToPosition(posn);
   }
   EXPECT_EQ(5, stream.ByteCount());
   ASSERT_EQ(true, stream.Next(&ptr, &len));
@@ -280,7 +280,7 @@ TEST(TestDecompression, testFileSeek) {
   {
     std::vector<uint64_t> offsets(1, 201);
     PositionProvider posn(offsets);
-    EXPECT_THROW(stream.seekToRowGroup(posn), exception::LoggedException);
+    EXPECT_THROW(stream.seekToPosition(posn), exception::LoggedException);
   }
 }
 
@@ -643,6 +643,12 @@ class CompressBuffer {
     buf[2] = static_cast<char>(compressedSize >> 15);
   }
 
+  void writeUncompressedHeader(size_t compressedSize) {
+    buf[0] = static_cast<char>(compressedSize << 1) | 1;
+    buf[1] = static_cast<char>(compressedSize >> 7);
+    buf[2] = static_cast<char>(compressedSize >> 15);
+  }
+
   size_t getCompressedSize() const {
     size_t header = static_cast<unsigned char>(buf[0]);
     header |= static_cast<size_t>(static_cast<unsigned char>(buf[1])) << 8;
@@ -812,7 +818,7 @@ class TestSeek : public ::testing::Test {
     std::unique_ptr<SeekableInputStream> stream = createDecompressor(
         kind,
         std::unique_ptr<SeekableInputStream>(
-            new SeekableArrayInputStream(output, offset2, outputSize)),
+            new SeekableArrayInputStream(output, offset2, outputSize / 10)),
         outputSize,
         pool,
         "TestSeek Decompressor",
@@ -832,7 +838,7 @@ class TestSeek : public ::testing::Test {
       auto pos = arr[i];
       std::vector<uint64_t> list{pos[0], pos[1]};
       PositionProvider pp(list);
-      stream->seekToRowGroup(pp);
+      stream->seekToPosition(pp);
       stream->Next(&data, &size);
       EXPECT_EQ(size, inputSize - pos[1]);
       EXPECT_EQ(0, memcmp(data, input[i] + pos[1], size));
@@ -868,4 +874,46 @@ TEST_F(TestSeek, Zstd) {
 TEST_F(TestSeek, Snappy) {
   auto codec = getCodec(CodecType::SNAPPY);
   runTest(*codec, CompressionKind_SNAPPY);
+}
+
+TEST_F(TestSeek, uncompressed) {
+  constexpr int32_t kSize = 1000;
+  constexpr int32_t kHeaderSize = 3;
+  constexpr int32_t kReadSize = 100;
+  CompressBuffer data(kSize);
+  data.writeUncompressedHeader(kSize);
+  for (auto i = 0; i < kSize; ++i) {
+    data.getCompressed()[i] = static_cast<char>(i);
+  }
+  auto stream = createTestDecompressor(
+      CompressionKind_SNAPPY,
+      std::make_unique<SeekableArrayInputStream>(
+          data.getBuffer(), kSize + 3, kReadSize),
+      5 * kReadSize);
+  const void* result;
+  int32_t size;
+
+  // We expect to see the data in chunks made by the inner input stream.
+  EXPECT_TRUE(stream->Next(&result, &size));
+  EXPECT_EQ(result, data.getCompressed());
+  EXPECT_EQ(kReadSize - kHeaderSize, size);
+
+  EXPECT_TRUE(stream->Next(&result, &size));
+  EXPECT_EQ(result, data.getCompressed() + kReadSize - kHeaderSize);
+
+  // Backup is limited to the last window returned by Next().
+  EXPECT_THROW(stream->BackUp(kReadSize + 1), std::exception);
+
+  EXPECT_TRUE(stream->Next(&result, &size));
+  EXPECT_EQ(result, data.getCompressed() + 2 * kReadSize - kHeaderSize);
+
+  // We seek to a position that is not in the last window returned by
+  // the input of the PagedInputStream but is in the returned bytes of
+  // it. Compressed position is start of stream (the first compression
+  // header), the byte offset if 50 bytes from there.
+  std::vector<uint64_t> offsets{0, 50};
+  PositionProvider position(offsets);
+  stream->seekToPosition(position);
+  EXPECT_TRUE(stream->Next(&result, &size));
+  EXPECT_EQ(result, data.getCompressed() + 50);
 }

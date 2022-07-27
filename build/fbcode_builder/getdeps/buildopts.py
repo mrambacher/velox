@@ -10,13 +10,13 @@ import os
 import subprocess
 import sys
 import tempfile
-from typing import Optional, Mapping
+from typing import Mapping, Optional
 
 from .copytree import containing_repo_type
-from .envfuncs import Env, add_flag, add_path_entry
+from .envfuncs import add_flag, add_path_entry, Env
 from .fetcher import get_fbsource_repo_data, homebrew_package_prefix
 from .manifest import ContextGenerator
-from .platform import HostType, is_windows, get_available_ram
+from .platform import get_available_ram, HostType, is_windows
 
 
 def detect_project(path):
@@ -83,7 +83,7 @@ class BuildOptions(object):
         # If we are running from an fbsource repository, set self.fbsource_dir
         # to allow the ShipIt-based fetchers to use it.
         if self.repo_project == "fbsource":
-            self.fbsource_dir = self.repo_root
+            self.fbsource_dir: Optional[str] = self.repo_root
         else:
             self.fbsource_dir = None
 
@@ -176,7 +176,7 @@ class BuildOptions(object):
     def is_freebsd(self):
         return self.host_type.is_freebsd()
 
-    def get_num_jobs(self, job_weight: int):
+    def get_num_jobs(self, job_weight: int) -> int:
         """Given an estimated job_weight in MiB, compute a reasonable concurrency limit."""
         if self.specified_num_jobs:
             return self.specified_num_jobs
@@ -315,7 +315,7 @@ class BuildOptions(object):
 
         return env
 
-    def add_homebrew_package_to_env(self, package, env):
+    def add_homebrew_package_to_env(self, package, env) -> bool:
         prefix = homebrew_package_prefix(package)
         if prefix and os.path.exists(prefix):
             return self.add_prefix_to_env(
@@ -472,7 +472,7 @@ def find_unused_drive_letter():
     return available[-1]
 
 
-def create_subst_path(path) -> str:
+def create_subst_path(path: str) -> str:
     for _attempt in range(0, 24):
         drive = find_existing_win32_subst_for_path(
             path, subst_mapping=list_win32_subst_letters()

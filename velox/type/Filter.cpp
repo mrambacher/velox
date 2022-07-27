@@ -13,6 +13,12 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
+#include <cstdint>
+#include <limits>
+#include <memory>
+
+#include "velox/common/base/Exceptions.h"
 #include "velox/type/Filter.h"
 
 namespace facebook::velox::common {
@@ -43,6 +49,12 @@ std::string Filter::toString() const {
       break;
     case FilterKind::kBigintValuesUsingBitmask:
       strKind = "BigintValuesUsingBitmask";
+      break;
+    case FilterKind::kNegatedBigintValuesUsingHashTable:
+      strKind = "NegatedBigintValuesUsingHashTable";
+      break;
+    case FilterKind::kNegatedBigintValuesUsingBitmask:
+      strKind = "NegatedBigintValuesUsingBitmask";
       break;
     case FilterKind::kDoubleRange:
       strKind = "DoubleRange";
@@ -94,6 +106,16 @@ bool BigintValuesUsingBitmask::testInt64(int64_t value) const {
     return false;
   }
   return bitmask_[value - min_];
+}
+
+std::vector<int64_t> BigintValuesUsingBitmask::values() const {
+  std::vector<int64_t> values;
+  for (int i = 0; i < bitmask_.size(); i++) {
+    if (bitmask_[i]) {
+      values.push_back(min_ + i);
+    }
+  }
+  return values;
 }
 
 bool BigintValuesUsingBitmask::testInt64Range(
@@ -174,80 +196,73 @@ bool BigintValuesUsingHashTable::testInt64(int64_t value) const {
   return false;
 }
 
-__m256i BigintValuesUsingHashTable::test4x64(__m256i x) {
-  using V64 = simd::Vectors<int64_t>;
-  auto rangeMask = V64::compareGt(V64::setAll(min_), x) |
-      V64::compareGt(x, V64::setAll(max_));
-  if (V64::compareResult(rangeMask) == V64::kAllTrue) {
-    return V64::setAll(0);
+xsimd::batch_bool<int64_t> BigintValuesUsingHashTable::testValues(
+    xsimd::batch<int64_t> x) const {
+  auto outOfRange = (x < xsimd::broadcast<int64_t>(min_)) |
+      (x > xsimd::broadcast<int64_t>(max_));
+  if (simd::toBitMask(outOfRange) == simd::allSetBitMask<int64_t>()) {
+    return xsimd::batch_bool<int64_t>(false);
   }
   if (containsEmptyMarker_) {
-    return Filter::test4x64(x);
+    return Filter::testValues(x);
   }
-  rangeMask ^= -1;
-  auto indices = x * M & sizeMask_;
-  __m256i data = _mm256_mask_i64gather_epi64(
-      V64::setAll(kEmptyMarker),
-      reinterpret_cast<const long long int*>(hashTable_.data()),
-      indices,
-      rangeMask,
-      8);
+  auto allEmpty = xsimd::broadcast<int64_t>(kEmptyMarker);
+  xsimd::batch<int64_t> indices(xsimd::batch<uint64_t>(x) * M & sizeMask_);
+  auto data =
+      simd::maskGather(allEmpty, ~outOfRange, hashTable_.data(), indices);
   // The lanes with kEmptyMarker missed, the lanes matching x hit and the other
   // lanes must check next positions.
 
-  auto result = V64::compareEq(x, data);
-  auto missed = V64::compareEq(data, V64::setAll(kEmptyMarker));
-  uint16_t unresolved = V64::compareBitMask(
-      ~V64::compareResult(result) & ~V64::compareResult(missed));
+  auto result = x == data;
+  auto resultBits = simd::toBitMask(result);
+  auto missed = simd::toBitMask(data == allEmpty);
+  static_assert(decltype(result)::size <= 16);
+  uint16_t unresolved = simd::allSetBitMask<int64_t>() ^ (resultBits | missed);
   if (!unresolved) {
     return result;
   }
-  int64_t indicesArray[4];
-  int64_t valuesArray[4];
-  int64_t resultArray[4];
-  *reinterpret_cast<V64::TV*>(indicesArray) = indices + 1;
-  *reinterpret_cast<V64::TV*>(valuesArray) = x;
-  *reinterpret_cast<V64::TV*>(resultArray) = result;
-  auto allEmpty = V64::setAll(kEmptyMarker);
+  constexpr int kAlign = xsimd::default_arch::alignment();
+  constexpr int kArraySize = xsimd::batch<int64_t>::size;
+  alignas(kAlign) int64_t indicesArray[kArraySize];
+  alignas(kAlign) int64_t valuesArray[kArraySize];
+  (indices + 1).store_aligned(indicesArray);
+  x.store_aligned(valuesArray);
   while (unresolved) {
     auto lane = bits::getAndClearLastSetBit(unresolved);
     // Loop for each unresolved (not hit and
     // not empty) until finding hit or empty.
     int64_t index = indicesArray[lane];
     int64_t value = valuesArray[lane];
-    auto allValue = V64::setAll(value);
+    auto allValue = xsimd::broadcast<int64_t>(value);
     for (;;) {
-      auto line = V64::load(hashTable_.data() + index);
+      auto line = xsimd::load_unaligned(hashTable_.data() + index);
 
-      if (V64::compareResult(V64::compareEq(line, allValue))) {
-        resultArray[lane] = -1;
+      if (simd::toBitMask(line == allValue)) {
+        resultBits |= 1 << lane;
         break;
       }
-      if (V64::compareResult(V64::compareEq(line, allEmpty))) {
-        resultArray[lane] = 0;
+      if (simd::toBitMask(line == allEmpty)) {
+        resultBits &= ~(1 << lane);
         break;
       }
-      index += 4;
+      index += line.size;
       if (index > sizeMask_) {
         index = 0;
       }
     }
   }
-  return V64::load(&resultArray);
+  return simd::fromBitMask<int64_t>(resultBits);
 }
 
-__m256si BigintValuesUsingHashTable::test8x32(__m256i x) {
+xsimd::batch_bool<int32_t> BigintValuesUsingHashTable::testValues(
+    xsimd::batch<int32_t> x) const {
   // Calls 4x64 twice since the hash table is 64 bits wide in any
   // case. A 32-bit hash table would be possible but all the use
   // cases seen are in the 64 bit range.
-  using V32 = simd::Vectors<int32_t>;
-  using V64 = simd::Vectors<int64_t>;
-  auto x8x32 = reinterpret_cast<V32::TV>(x);
-  auto first =
-      V64::compareBitMask(V64::compareResult(test4x64(V32::as4x64<0>(x8x32))));
-  auto second =
-      V64::compareBitMask(V64::compareResult(test4x64(V32::as4x64<1>(x8x32))));
-  return V32::mask(first | (second << 4));
+  auto first = simd::toBitMask(testValues(simd::getHalf<int64_t, 0>(x)));
+  auto second = simd::toBitMask(testValues(simd::getHalf<int64_t, 1>(x)));
+  return simd::fromBitMask<int32_t>(
+      first | (second << xsimd::batch<int64_t>::size));
 }
 
 bool BigintValuesUsingHashTable::testInt64Range(
@@ -273,6 +288,82 @@ bool BigintValuesUsingHashTable::testInt64Range(
   return max >= *it;
 }
 
+NegatedBigintValuesUsingBitmask::NegatedBigintValuesUsingBitmask(
+    int64_t min,
+    int64_t max,
+    const std::vector<int64_t>& values,
+    bool nullAllowed)
+    : Filter(true, nullAllowed, FilterKind::kNegatedBigintValuesUsingBitmask),
+      min_(min),
+      max_(max) {
+  VELOX_CHECK(min <= max, "min must be no greater than max");
+
+  nonNegated_ = std::make_unique<BigintValuesUsingBitmask>(
+      min, max, values, !nullAllowed);
+}
+
+bool NegatedBigintValuesUsingBitmask::testInt64Range(
+    int64_t min,
+    int64_t max,
+    bool hasNull) const {
+  if (hasNull && nullAllowed_) {
+    return true;
+  }
+
+  if (min == max) {
+    return testInt64(min);
+  }
+
+  return true;
+}
+
+NegatedBigintValuesUsingHashTable::NegatedBigintValuesUsingHashTable(
+    int64_t min,
+    int64_t max,
+    const std::vector<int64_t>& values,
+    bool nullAllowed)
+    : Filter(
+          true,
+          nullAllowed,
+          FilterKind::kNegatedBigintValuesUsingHashTable) {
+  nonNegated_ = std::make_unique<BigintValuesUsingHashTable>(
+      min, max, values, !nullAllowed);
+}
+
+bool NegatedBigintValuesUsingHashTable::testInt64Range(
+    int64_t min,
+    int64_t max,
+    bool hasNull) const {
+  if (hasNull && nullAllowed_) {
+    return true;
+  }
+
+  if (min == max) {
+    return testInt64(min);
+  }
+
+  if (max > nonNegated_->max() || min < nonNegated_->min()) {
+    return true;
+  }
+
+  auto lo = std::lower_bound(
+      nonNegated_->values().begin(), nonNegated_->values().end(), min);
+  auto hi = std::lower_bound(
+      nonNegated_->values().begin(), nonNegated_->values().end(), max);
+  assert(
+      lo !=
+      nonNegated_->values().end()); // min is already tested to be <= max_.
+  if (min != *lo || max != *hi) {
+    // at least one of the endpoints of the range succeeds
+    return true;
+  }
+  // Check if all values in this range are in values_ by counting the number
+  // of things between min and max
+  // if distance is any less, then we are missing an element => something
+  // in the range is accepted
+  return (std::distance(lo, hi) != max - min);
+}
+
 namespace {
 std::unique_ptr<Filter> nullOrFalse(bool nullAllowed) {
   if (nullAllowed) {
@@ -280,16 +371,26 @@ std::unique_ptr<Filter> nullOrFalse(bool nullAllowed) {
   }
   return std::make_unique<AlwaysFalse>();
 }
-} // namespace
 
-std::unique_ptr<Filter> createBigintValues(
-    const std::vector<int64_t>& values,
-    bool nullAllowed) {
-  if (values.empty()) {
-    return nullOrFalse(nullAllowed);
+std::unique_ptr<Filter> notNullOrTrue(bool nullAllowed) {
+  if (nullAllowed) {
+    return std::make_unique<AlwaysTrue>();
   }
+  return std::make_unique<IsNotNull>();
+}
 
-  if (values.size() == 1) {
+std::unique_ptr<Filter> createBigintValuesFilter(
+    const std::vector<int64_t>& values,
+    bool nullAllowed,
+    bool negated) {
+  if (values.empty()) {
+    if (!negated) {
+      return nullOrFalse(nullAllowed);
+    }
+    return notNullOrTrue(nullAllowed);
+  }
+  // single-value filter aka ==, the != filter is handled below
+  if (values.size() == 1 && !negated) {
     return std::make_unique<BigintRange>(
         values.front(), values.front(), nullAllowed);
   }
@@ -308,17 +409,61 @@ std::unique_ptr<Filter> createBigintValues(
   int64_t range;
   bool overflow = __builtin_sub_overflow(max, min, &range);
   if (LIKELY(!overflow)) {
+    // all accepted/rejected values form one contiguous block
     if (range + 1 == values.size()) {
-      return std::make_unique<BigintRange>(min, max, nullAllowed);
+      if (!negated) {
+        return std::make_unique<BigintRange>(min, max, nullAllowed);
+      }
+      std::vector<std::unique_ptr<BigintRange>> ranges;
+      ranges.reserve(2);
+      // add inclusive ranges for above and below the desired range of values
+      if (min != std::numeric_limits<int64_t>::min()) {
+        ranges.emplace_back(std::make_unique<BigintRange>(
+            std::numeric_limits<int64_t>::min(), min - 1, false));
+      }
+      if (max != std::numeric_limits<int64_t>::max()) {
+        ranges.emplace_back(std::make_unique<BigintRange>(
+            max + 1, std::numeric_limits<int64_t>::max(), false));
+      }
+      // all values are rejected
+      if (ranges.size() == 0) {
+        return nullOrFalse(nullAllowed);
+      }
+      // range above or range below does not exist
+      if (ranges.size() == 1) {
+        return std::move(ranges[0]);
+      }
+      return std::make_unique<BigintMultiRange>(std::move(ranges), nullAllowed);
     }
 
     if (range < 32 * 64 || range < values.size() * 4 * 64) {
+      if (negated) {
+        return std::make_unique<NegatedBigintValuesUsingBitmask>(
+            min, max, values, nullAllowed);
+      }
       return std::make_unique<BigintValuesUsingBitmask>(
           min, max, values, nullAllowed);
     }
   }
+  if (negated) {
+    return std::make_unique<NegatedBigintValuesUsingHashTable>(
+        min, max, values, nullAllowed);
+  }
   return std::make_unique<BigintValuesUsingHashTable>(
       min, max, values, nullAllowed);
+}
+} // namespace
+
+std::unique_ptr<Filter> createBigintValues(
+    const std::vector<int64_t>& values,
+    bool nullAllowed) {
+  return createBigintValuesFilter(values, nullAllowed, false);
+}
+
+std::unique_ptr<Filter> createNegatedBigintValues(
+    const std::vector<int64_t>& values,
+    bool nullAllowed) {
+  return createBigintValuesFilter(values, nullAllowed, true);
 }
 
 BigintMultiRange::BigintMultiRange(
@@ -350,6 +495,17 @@ int compareRanges(const char* lhs, size_t length, const std::string& rhs) {
 } // namespace
 
 bool BytesRange::testBytes(const char* value, int32_t length) const {
+  if (length == 0) {
+    // Empty string. value is null. This is the smallest possible string.
+    // It passes the following filters: < non-empty, <= empty | non-empty, >=
+    // empty.
+    if (lowerUnbounded_) {
+      return !upper_.empty() || !upperExclusive_;
+    }
+
+    return lower_.empty() && !lowerExclusive_;
+  }
+
   if (singleValue_) {
     if (length != lower_.size()) {
       return false;
@@ -558,6 +714,20 @@ bool MultiRange::testBytesRange(
 
   for (const auto& filter : filters_) {
     if (filter->testBytesRange(min, max, hasNull)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+bool MultiRange::testDoubleRange(double min, double max, bool hasNull) const {
+  if (hasNull && nullAllowed_) {
+    return true;
+  }
+
+  for (const auto& filter : filters_) {
+    if (filter->testDoubleRange(min, max, hasNull)) {
       return true;
     }
   }
@@ -897,6 +1067,21 @@ std::unique_ptr<Filter> BigintValuesUsingBitmask::mergeWith(
     default:
       VELOX_UNREACHABLE();
   }
+}
+
+std::unique_ptr<Filter> NegatedBigintValuesUsingHashTable::mergeWith(
+    const Filter* other) const {
+  // TODO: Add this method to merge with null and other integer filters
+  // and update other mergeWith methods to match
+  (void)other; // silence the linter for now
+  VELOX_NYI("Negated-values merge is not supported yet");
+}
+
+std::unique_ptr<Filter> NegatedBigintValuesUsingBitmask::mergeWith(
+    const Filter* other) const {
+  // TODO: Add this method to merge with null and other integer filters
+  (void)other; // silence the linter for now
+  VELOX_NYI("Negated-values merge is not supported yet");
 }
 
 std::unique_ptr<Filter> BigintValuesUsingBitmask::mergeWith(
