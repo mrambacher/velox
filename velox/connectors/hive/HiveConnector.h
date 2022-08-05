@@ -19,8 +19,8 @@
 #include "velox/connectors/hive/HiveConnectorSplit.h"
 #include "velox/dwio/common/CachedBufferedInput.h"
 #include "velox/dwio/common/IoStatistics.h"
+#include "velox/dwio/common/Reader.h"
 #include "velox/dwio/common/ScanSpec.h"
-#include "velox/dwio/dwrf/reader/DwrfReader.h"
 #include "velox/dwio/dwrf/writer/Writer.h"
 #include "velox/exec/OperatorUtils.h"
 #include "velox/expression/Expr.h"
@@ -146,10 +146,11 @@ class HiveDataSource : public DataSource {
   void addSplit(std::shared_ptr<ConnectorSplit> split) override;
 
   void addDynamicFilter(
-      ChannelIndex outputChannel,
+      column_index_t outputChannel,
       const std::shared_ptr<common::Filter>& filter) override;
 
-  RowVectorPtr next(uint64_t size) override;
+  std::optional<RowVectorPtr> next(uint64_t size, velox::ContinueFuture& future)
+      override;
 
   uint64_t getCompletedRows() override {
     return completedRows_;

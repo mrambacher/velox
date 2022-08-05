@@ -49,6 +49,8 @@ class SimpleVector;
 template <typename T>
 class FlatVector;
 
+class VectorPool;
+
 /**
  * Base class for all columnar-based vectors of any type.
  */
@@ -190,24 +192,6 @@ class BaseVector {
     return nulls_;
   }
 
-  /*
-   * Allocates or reallocates nulls_ with the given size if nulls_ hasn't
-   * been allocated yet or has been allocated with a smaller capacity.
-   */
-  void ensureNullsCapacity(vector_size_t size, bool setNotNull = false) {
-    if (nulls_ && nulls_->capacity() >= bits::nbytes(size)) {
-      return;
-    }
-    if (nulls_) {
-      AlignedBuffer::reallocate<bool>(
-          &nulls_, size, setNotNull ? bits::kNotNull : bits::kNull);
-    } else {
-      nulls_ = AlignedBuffer::allocate<bool>(
-          size, pool_, setNotNull ? bits::kNotNull : bits::kNull);
-    }
-    rawNulls_ = nulls_->as<uint64_t>();
-  }
-
   std::optional<vector_size_t> getDistinctValueCount() const {
     return distinctValueCount_;
   }
@@ -303,9 +287,14 @@ class BaseVector {
     return false;
   }
 
-  // Returns true if this vector is encoded as constant (ConstantVector).
-  virtual bool isConstantEncoding() const {
-    return false;
+  /// Returns true if this vector is encoded as flat (FlatVector).
+  bool isFlatEncoding() const {
+    return encoding_ == VectorEncoding::Simple::FLAT;
+  }
+
+  /// Returns true if this vector is encoded as constant (ConstantVector).
+  bool isConstantEncoding() const {
+    return encoding_ == VectorEncoding::Simple::CONSTANT;
   }
 
   // Returns true if this vector has a scalar type. If so, values are
@@ -398,22 +387,12 @@ class BaseVector {
     return result;
   }
 
-  // Move or copy an element at 'source' row into 'target' row.
-  // This can be more efficient than copy for complex types.
-  virtual void move(vector_size_t source, vector_size_t target) {
-    VELOX_CHECK_LT(source, size());
-    VELOX_CHECK_LT(target, size());
-    if (source != target) {
-      copy(this, target, source, 1);
-    }
-  }
-
   virtual void copy(
       const BaseVector* source,
       vector_size_t targetIndex,
       vector_size_t sourceIndex,
       vector_size_t count) {
-    VELOX_NYI();
+    VELOX_UNSUPPORTED("Only flat vectors support copy operation");
   }
 
   // Returns a vector of the type of 'source' where 'indices' contains
@@ -472,7 +451,8 @@ class BaseVector {
       const SelectivityVector& rows,
       const TypePtr& type,
       velox::memory::MemoryPool* pool,
-      std::shared_ptr<BaseVector>* result);
+      std::shared_ptr<BaseVector>* result,
+      VectorPool* vectorPool = nullptr);
 
   virtual void ensureWritable(const SelectivityVector& rows);
 
@@ -502,7 +482,7 @@ class BaseVector {
   // virtual and defined here because we must be able to access this in type
   // agnostic code without a switch on all data types.
   virtual std::shared_ptr<BaseVector> valueVector() const {
-    throw std::runtime_error("Vector is not a wrapper");
+    VELOX_UNSUPPORTED("Vector is not a wrapper");
   }
 
   virtual BaseVector* loadedVector() {
@@ -517,11 +497,11 @@ class BaseVector {
       std::shared_ptr<BaseVector>);
 
   virtual const BufferPtr& values() const {
-    throw std::runtime_error("Only flat vectors have a values buffer");
+    VELOX_UNSUPPORTED("Only flat vectors have a values buffer");
   }
 
   virtual const void* valuesAsVoid() const {
-    throw std::runtime_error("Only flat vectors have a values buffer");
+    VELOX_UNSUPPORTED("Only flat vectors have a values buffer");
   }
 
   // Returns true for flat vectors with unique values buffer and no
@@ -655,10 +635,25 @@ class BaseVector {
     return left == right || right == TypeKind::UNKNOWN;
   }
 
-  virtual std::string toString() const;
+  /// Returns a brief summary of the vector. If 'recursive' is true, includes a
+  /// summary of all the layers of encodings starting with the top layer.
+  ///
+  /// For example,
+  ///     with recursive 'false':
+  ///
+  ///         [DICTIONARY INTEGER: 5 elements, no nulls]
+  ///
+  ///     with recursive 'true':
+  ///
+  ///         [DICTIONARY INTEGER: 5 elements, no nulls], [FLAT INTEGER: 10
+  ///             elements, no nulls]
+  std::string toString(bool recursive = false) const;
 
+  /// Returns string representation of the value in the specified row.
   virtual std::string toString(vector_size_t index) const;
 
+  /// Returns a list of values in rows [from, to). By default rows are separated
+  /// by a new line and include row numbers.
   std::string toString(
       vector_size_t from,
       vector_size_t to,
@@ -674,6 +669,32 @@ class BaseVector {
   }
 
  protected:
+  /// Returns a brief summary of the vector. The default implementation includes
+  /// encoding, type, number of rows and number of nulls.
+  ///
+  /// For example,
+  ///     [FLAT INTEGER: 3 elements, no nulls]
+  ///     [DICTIONARY INTEGER: 5 elements, 1 nulls]
+  virtual std::string toSummaryString() const;
+
+  /*
+   * Allocates or reallocates nulls_ with the given size if nulls_ hasn't
+   * been allocated yet or has been allocated with a smaller capacity.
+   */
+  void ensureNullsCapacity(vector_size_t size, bool setNotNull = false) {
+    if (nulls_ && nulls_->capacity() >= bits::nbytes(size)) {
+      return;
+    }
+    if (nulls_) {
+      AlignedBuffer::reallocate<bool>(
+          &nulls_, size, setNotNull ? bits::kNotNull : bits::kNull);
+    } else {
+      nulls_ = AlignedBuffer::allocate<bool>(
+          size, pool_, setNotNull ? bits::kNotNull : bits::kNull);
+    }
+    rawNulls_ = nulls_->as<uint64_t>();
+  }
+
   FOLLY_ALWAYS_INLINE static std::optional<int32_t>
   compareNulls(bool thisNull, bool otherNull, CompareFlags flags) {
     DCHECK(thisNull || otherNull);

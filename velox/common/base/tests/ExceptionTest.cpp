@@ -15,6 +15,7 @@
  */
 
 #include <fmt/format.h>
+#include <folly/Random.h>
 #include <gtest/gtest.h>
 
 #include "velox/common/base/Exceptions.h"
@@ -67,6 +68,128 @@ void verifyVeloxException(
             << "\nException message prefix mismatch.\n\nExpected prefix: "
             << messagePrefix << "\n\nActual message: " << e.what();
       });
+}
+
+void testExceptionTraceCollectionControl(bool userException, bool enabled) {
+  // Disable rate control in the test.
+  FLAGS_velox_exception_user_stacktrace_rate_limit_ms = 0;
+  FLAGS_velox_exception_system_stacktrace_rate_limit_ms = 0;
+
+  if (userException) {
+    FLAGS_velox_exception_user_stacktrace_enabled = enabled ? true : false;
+    FLAGS_velox_exception_system_stacktrace_enabled = folly::Random::oneIn(2);
+  } else {
+    FLAGS_velox_exception_system_stacktrace_enabled = enabled ? true : false;
+    FLAGS_velox_exception_user_stacktrace_enabled = folly::Random::oneIn(2);
+  }
+  try {
+    if (userException) {
+      throw ::facebook::velox::VeloxUserError(
+          "file_name",
+          1,
+          "function_name()",
+          "operator()",
+          "test message",
+          "",
+          ::facebook::velox::error_code::kArithmeticError,
+          false);
+    } else {
+      throw ::facebook::velox::VeloxRuntimeError(
+          "file_name",
+          1,
+          "function_name()",
+          "operator()",
+          "test message",
+          "",
+          ::facebook::velox::error_code::kArithmeticError,
+          false);
+    }
+  } catch (::facebook::velox::VeloxException& e) {
+    SCOPED_TRACE(fmt::format(
+        "enabled: {}, user flag: {}, sys flag: {}",
+        enabled,
+        FLAGS_velox_exception_user_stacktrace_enabled,
+        FLAGS_velox_exception_system_stacktrace_enabled));
+    ASSERT_EQ(
+        userException,
+        e.exceptionType() == ::facebook::velox::VeloxException::Type::kUser);
+    ASSERT_EQ(enabled, e.stackTrace() != nullptr);
+  }
+}
+
+void testExceptionTraceCollectionRateControl(
+    bool userException,
+    bool hasRateLimit) {
+  // Disable rate control in the test.
+  // Enable trace rate control in the test.
+  FLAGS_velox_exception_user_stacktrace_enabled = true;
+  FLAGS_velox_exception_system_stacktrace_enabled = true;
+  // Set rate control interval to a large value to avoid time related test
+  // flakiness.
+  const int kRateLimitIntervalMs = 4000;
+  if (hasRateLimit) {
+    // Wait a bit to ensure that the last stack trace collection time has
+    // passed sufficient long.
+    /* sleep override */
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(kRateLimitIntervalMs)); // NOLINT
+  }
+  if (userException) {
+    FLAGS_velox_exception_user_stacktrace_rate_limit_ms =
+        hasRateLimit ? kRateLimitIntervalMs : 0;
+    FLAGS_velox_exception_system_stacktrace_rate_limit_ms =
+        folly::Random::rand32();
+  } else {
+    // Set rate control to a large interval to avoid time related test
+    // flakiness.
+    FLAGS_velox_exception_system_stacktrace_rate_limit_ms =
+        hasRateLimit ? kRateLimitIntervalMs : 0;
+    FLAGS_velox_exception_user_stacktrace_rate_limit_ms =
+        folly::Random::rand32();
+  }
+  for (int iter = 0; iter < 3; ++iter) {
+    try {
+      if (userException) {
+        throw ::facebook::velox::VeloxUserError(
+            "file_name",
+            1,
+            "function_name()",
+            "operator()",
+            "test message",
+            "",
+            ::facebook::velox::error_code::kArithmeticError,
+            false);
+      } else {
+        throw ::facebook::velox::VeloxRuntimeError(
+            "file_name",
+            1,
+            "function_name()",
+            "operator()",
+            "test message",
+            "",
+            ::facebook::velox::error_code::kArithmeticError,
+            false);
+      }
+    } catch (::facebook::velox::VeloxException& e) {
+      SCOPED_TRACE(fmt::format(
+          "userException: {}, hasRateLimit: {}, user limit: {}ms, sys limit: {}ms",
+          userException,
+          hasRateLimit,
+          FLAGS_velox_exception_user_stacktrace_rate_limit_ms,
+          FLAGS_velox_exception_system_stacktrace_rate_limit_ms));
+      ASSERT_EQ(
+          userException,
+          e.exceptionType() == ::facebook::velox::VeloxException::Type::kUser);
+      ASSERT_EQ(!hasRateLimit || ((iter % 2) == 0), e.stackTrace() != nullptr);
+      // NOTE: with rate limit control, we want to verify if we can collect
+      // stack trace after waiting for a while.
+      if (hasRateLimit && (iter % 2 != 0)) {
+        /* sleep override */
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(kRateLimitIntervalMs)); // NOLINT
+      }
+    }
+  }
 }
 
 // Ensures that expressions on the stream are not evaluated unless the condition
@@ -516,4 +639,22 @@ TEST(ExceptionTest, context) {
       "\nExpression: 1 == 3"
       "\nFunction: operator()"
       "\nFile: ");
+}
+
+TEST(ExceptionTest, traceCollectionEnabling) {
+  // Switch on/off tests.
+  for (const bool enabled : {false, true}) {
+    for (const bool userException : {false, true}) {
+      testExceptionTraceCollectionControl(userException, enabled);
+    }
+  }
+}
+
+TEST(ExceptionTest, traceCollectionRateControl) {
+  // Rate limit tests.
+  for (const bool withLimit : {false, true}) {
+    for (const bool userException : {false, true}) {
+      testExceptionTraceCollectionRateControl(userException, withLimit);
+    }
+  }
 }

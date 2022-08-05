@@ -16,15 +16,15 @@
 
 #pragma once
 
-#include <google/protobuf/wire_format_lite.h>
+#include "velox/dwio/common/IntCodecCommon.h"
+#include "velox/dwio/common/tests/utils/DataFiles.h"
 #include "velox/dwio/dwrf/common/Encryption.h"
-#include "velox/dwio/dwrf/common/IntCodecCommon.h"
 #include "velox/dwio/dwrf/reader/StripeStream.h"
-#include "velox/dwio/dwrf/test/utils/DataFiles.h"
 #include "velox/dwio/dwrf/writer/IndexBuilder.h"
 #include "velox/dwio/dwrf/writer/WriterBase.h"
 
 #include <gmock/gmock.h>
+#include <google/protobuf/wire_format_lite.h>
 
 namespace facebook::velox::dwrf {
 
@@ -33,7 +33,8 @@ namespace facebook::velox::dwrf {
 using MemoryPool = memory::MemoryPool;
 
 inline std::string getExampleFilePath(const std::string& fileName) {
-  return test::getDataFilePath("velox/dwio/dwrf/test", "examples/" + fileName);
+  return velox::test::getDataFilePath(
+      "velox/dwio/dwrf/test", "examples/" + fileName);
 }
 
 class MockStripeStreams : public StripeStreams {
@@ -65,6 +66,10 @@ class MockStripeStreams : public StripeStreams {
   const proto::ColumnEncoding& getEncoding(
       const EncodingKey& ek) const override {
     return *getEncodingProxy(ek.node);
+  }
+
+  virtual dwio::common::FileFormat getFormat() const override {
+    return dwio::common::FileFormat::DWRF;
   }
 
   MOCK_METHOD2(
@@ -127,11 +132,12 @@ inline int64_t zigZagDecode(uint64_t val) {
 
 inline size_t writeVuLong(char* buffer, size_t pos, uint64_t val) {
   while (true) {
-    if ((val & ~BASE_128_MASK) == 0) {
+    if ((val & ~dwio::common::BASE_128_MASK) == 0) {
       buffer[pos++] = static_cast<char>(val);
       return pos;
     } else {
-      buffer[pos++] = static_cast<char>((val & BASE_128_MASK) | 0x80);
+      buffer[pos++] =
+          static_cast<char>((val & dwio::common::BASE_128_MASK) | 0x80);
       val >>= 7;
     }
   }

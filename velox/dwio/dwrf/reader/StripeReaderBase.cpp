@@ -24,7 +24,7 @@ const proto::StripeInformation& StripeReaderBase::loadStripe(
     uint32_t index,
     bool& preload) {
   auto& footer = reader_->getFooter();
-  DWIO_ENSURE_LT(index, footer.stripes_size(), "invalid stripe index");
+  DWIO_ENSURE_LT(index, footer.stripesSize(), "invalid stripe index");
   auto& stripe = footer.stripes(index);
   auto& cache = reader_->getMetadataCache();
 
@@ -43,11 +43,11 @@ const proto::StripeInformation& StripeReaderBase::loadStripe(
       // If metadata cache exists, adjust read position to avoid re-reading
       // metadata sections
       if (cache) {
-        if (cache->has(proto::StripeCacheMode::INDEX, index)) {
+        if (cache->has(StripeCacheMode::INDEX, index)) {
           offset += stripe.indexlength();
           length -= stripe.indexlength();
         }
-        if (cache->has(proto::StripeCacheMode::FOOTER, index)) {
+        if (cache->has(StripeCacheMode::FOOTER, index)) {
           length -= stripe.footerlength();
         }
       }
@@ -60,7 +60,7 @@ const proto::StripeInformation& StripeReaderBase::loadStripe(
   // load stripe footer
   std::unique_ptr<dwio::common::SeekableInputStream> stream;
   if (cache) {
-    stream = cache->get(proto::StripeCacheMode::FOOTER, index);
+    stream = cache->get(StripeCacheMode::FOOTER, index);
   }
 
   if (!stream) {
@@ -96,7 +96,7 @@ void StripeReaderBase::loadEncryptionKeys(uint32_t index) {
   DWIO_ENSURE_EQ(
       footer_->encryptiongroups_size(), handler_->getEncryptionGroupCount());
   auto& footer = reader_->getFooter();
-  DWIO_ENSURE_LT(index, footer.stripes_size(), "invalid stripe index");
+  DWIO_ENSURE_LT(index, footer.stripesSize(), "invalid stripe index");
 
   auto& stripe = footer.stripes(index);
   // If current stripe has keys, load these keys.

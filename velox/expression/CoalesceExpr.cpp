@@ -18,11 +18,15 @@
 
 namespace facebook::velox::exec {
 
-CoalesceExpr::CoalesceExpr(TypePtr type, std::vector<ExprPtr>&& inputs)
+CoalesceExpr::CoalesceExpr(
+    TypePtr type,
+    std::vector<ExprPtr>&& inputs,
+    bool inputsSupportFlatNoNullsFastPath)
     : SpecialForm(
           std::move(type),
           std::move(inputs),
           kCoalesce,
+          inputsSupportFlatNoNullsFastPath,
           false /* trackCpuUsage */) {
   for (auto i = 1; i < inputs_.size(); i++) {
     VELOX_USER_CHECK_EQ(
@@ -36,11 +40,6 @@ void CoalesceExpr::evalSpecialForm(
     const SelectivityVector& rows,
     EvalCtx& context,
     VectorPtr& result) {
-  // Make sure to include current expression in the error message in case of an
-  // exception.
-  ExceptionContextSetter exceptionContext(
-      {[](auto* expr) { return static_cast<Expr*>(expr)->toString(); }, this});
-
   // Null positions to populate.
   exec::LocalSelectivityVector activeRowsHolder(context, rows.end());
   auto activeRows = activeRowsHolder.get();
@@ -52,10 +51,16 @@ void CoalesceExpr::evalSpecialForm(
       context.mutableFinalSelection(), &rows, context.isFinalSelection());
   VarSetter isFinalSelection(context.mutableIsFinalSelection(), false);
 
+  exec::LocalDecodedVector decodedVector(context);
   for (int i = 0; i < inputs_.size(); i++) {
     inputs_[i]->eval(*activeRows, context, result);
 
-    const uint64_t* rawNulls = result->flatRawNulls(*activeRows);
+    if (!result->mayHaveNulls()) {
+      // No nulls left.
+    }
+
+    decodedVector.get()->decode(*result, *activeRows);
+    const uint64_t* rawNulls = decodedVector->nulls();
     if (!rawNulls) {
       // No nulls left.
       return;

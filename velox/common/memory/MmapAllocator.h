@@ -23,7 +23,7 @@
 #include <mutex>
 #include <unordered_set>
 
-#include "velox/common/base/BitUtil.h"
+#include "velox/common/base/SimdUtil.h"
 #include "velox/common/memory/MappedMemory.h"
 
 namespace facebook::velox::memory {
@@ -67,14 +67,27 @@ class MmapAllocator : public MappedMemory {
       MachinePageCount numPages,
       Allocation* FOLLY_NULLABLE collateral,
       ContiguousAllocation& allocation,
-      std::function<void(int64_t)> beforeAllocCB = nullptr) override;
+      std::function<void(int64_t)> beforeAllocCB = nullptr) override {
+    bool result;
+    stats_.recordAllocate(numPages * kPageSize, 1, [&]() {
+      result = allocateContiguousImpl(
+          numPages, collateral, allocation, beforeAllocCB);
+    });
+    return result;
+  }
 
-  void freeContiguous(ContiguousAllocation& allocation) override;
+  void freeContiguous(ContiguousAllocation& allocation) override {
+    stats_.recordFree(
+        allocation.size(), [&]() { freeContiguousImpl(allocation); });
+  }
 
   // Checks internal consistency of allocation data
   // structures. Returns true if OK. May return false if there are
   // concurrent alocations and frees during the consistency check. This
   // is a false positive but not dangerous.
+  //
+  // Checks that the totals of mapped free and mapped and allocated
+  // pages match the data in the bitmaps in the size classes.
   bool checkConsistency() const override;
 
   MachinePageCount capacity() const {
@@ -96,6 +109,12 @@ class MmapAllocator : public MappedMemory {
   }
 
   std::string toString() const override;
+
+  Stats stats() const override {
+    auto stats = stats_;
+    stats.numAdvise = numAdvisedPages_;
+    return stats;
+  }
 
  private:
   static constexpr uint64_t kAllSet = 0xffffffffffffffff;
@@ -126,7 +145,9 @@ class MmapAllocator : public MappedMemory {
     MachinePageCount free(Allocation& allocation);
 
     // Checks that allocation and map counts match the corresponding bitmaps.
-    ClassPageCount checkConsistency(ClassPageCount& numMapped) const;
+    ClassPageCount checkConsistency(
+        ClassPageCount& numMapped,
+        int32_t& numErrors) const;
 
     // Advises away backing for 'numPages' worth of unallocated mapped class
     // pages. This needs to make an Allocation, for which it needs the
@@ -149,6 +170,14 @@ class MmapAllocator : public MappedMemory {
     std::string toString() const;
 
    private:
+    static constexpr int32_t kNoLastLookup = -1;
+    // Number of bits in 'mappedPages_' for one bit in
+    // 'mappedFreeLookup_'.
+    static constexpr int32_t kPagesPerLookupBit = 512;
+    // Number of extra 0 uint64's at te end of allocation bitmaps for SIMD
+    // checks.
+    static constexpr int32_t kSimdTail = 8;
+
     // Same as allocate, except that this must be called inside
     // 'mutex_'. If 'numUnmapped' is nullptr, the allocated pages must
     // all be backed by memory. Otherwise numUnmapped is updated to be
@@ -160,19 +189,31 @@ class MmapAllocator : public MappedMemory {
         MachinePageCount* FOLLY_NULLABLE numUnmapped,
         MappedMemory::Allocation& out);
 
+    // Returns the bit offset of the first bit of a 512 bit group in
+    // 'pageAllocated_'/'pageMapped_'  that contains at least one mapped free
+    // page. Returns < 0 if none exists.
+    int32_t findMappedFreeGroup();
+
+    // Returns a word of 256 bits with a set bit for each mapped free page in
+    // the range. 'index' is an index of a word in
+    // 'pageAllocated_'/'pageMapped_'. In other words, accesses 4 adjacent
+    // elements for performance. The arrays are appropriately padded at
+    // construction.
+    xsimd::batch<uint64_t> mappedFreeBits(int32_t index);
+
+    // Adds 'numPages' mapped free pages of this size class to 'allocation'. May
+    // only be called if 'mappedFreePages_' >= 'numPages'.
+    void allocateFromMappdFree(int32_t numPages, Allocation& allocation);
+
+    // Marks that 'page' is free and mapped. Called when freeing the page.
+    // 'page' is a page number iin this class.
+    void markMappedFree(ClassPageCount page) {
+      bits::setBit(mappedFreeLookup_.data(), page / kPagesPerLookupBit);
+    }
+
     // Advises away the machine pages of 'this' size class contained in
     // 'allocation'.
     void adviseAway(const Allocation& allocation);
-
-    // Allocates up to 'numPages' of mapped pages from the free/mapped word at
-    // 'wordIndex'. 'candidates' has a bit set for free and mapped pages. The
-    // memory ranges are added to 'allocation'. 'numPages' is decremented by the
-    // count of allocated class pages.
-    void allocateMapped(
-        int32_t wordIndex,
-        uint64_t candidates,
-        ClassPageCount& numPages,
-        MappedMemory::Allocation& allocation);
 
     // Allocates up to 'numPages' of mapped or unmapped pages from the
     // free/mapped word at 'wordIndex'. 'numPages' is decremented by the number
@@ -207,6 +248,20 @@ class MmapAllocator : public MappedMemory {
     // Count of free pages backed by memory.
     ClassPageCount numMappedFreePages_ = 0;
 
+    // Last used index in 'mappedFreeLookup_'.
+    int32_t lastLookupIndex_{kNoLastLookup};
+
+    // has a set bit if the corresponding 8 word range in
+    // pageAllocated_/pageMapped_ has at least one mapped free
+    // bit. Contains 1 bit for each 8 words of
+    // pageAllocated_/pageMapped_.
+    std::vector<uint64_t> mappedFreeLookup_;
+
+    // Number of meaningful words in
+    // 'pageAllocated_'/'pageMapped'. The arrays themselves are padded
+    // with extra zeros for SIMD access.
+    const int32_t pageBitmapSize_;
+
     // Has a 1 bit if the corresponding size class page is allocated.
     std::vector<uint64_t> pageAllocated_;
 
@@ -223,6 +278,14 @@ class MmapAllocator : public MappedMemory {
     // Cumulative count of madvise for pages of 'this'
     uint64_t numAdvisedAway_ = 0;
   };
+
+  bool allocateContiguousImpl(
+      MachinePageCount numPages,
+      Allocation* FOLLY_NULLABLE collateral,
+      ContiguousAllocation& allocation,
+      std::function<void(int64_t)> beforeAllocCB);
+
+  void freeContiguousImpl(ContiguousAllocation& allocation);
 
   // Ensures that there are at least 'newMappedNeeded' pages that are
   // not backing any existing allocation. If capacity_ - numMapped_ <
@@ -271,6 +334,7 @@ class MmapAllocator : public MappedMemory {
   uint64_t numAllocatedPages_ = 0;
   uint64_t numAdvisedPages_ = 0;
   Failure injectedFailure_{Failure::kNone};
+  Stats stats_;
 };
 
 } // namespace facebook::velox::memory

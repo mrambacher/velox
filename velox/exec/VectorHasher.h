@@ -144,7 +144,7 @@ class VectorHasher {
   // reservePct to enableValueIds().
   static constexpr int32_t kNoLimit = -1;
 
-  VectorHasher(TypePtr type, ChannelIndex channel)
+  VectorHasher(TypePtr type, column_index_t channel)
       : channel_(channel), type_(std::move(type)), typeKind_(type_->kind()) {
     if (typeKind_ == TypeKind::BOOLEAN) {
       // We do not need samples to know the cardinality or limits of a bool
@@ -157,11 +157,11 @@ class VectorHasher {
 
   static std::unique_ptr<VectorHasher> create(
       TypePtr type,
-      ChannelIndex channel) {
+      column_index_t channel) {
     return std::make_unique<VectorHasher>(std::move(type), channel);
   }
 
-  ChannelIndex channel() const {
+  column_index_t channel() const {
     return channel_;
   }
 
@@ -175,13 +175,22 @@ class VectorHasher {
 
   static constexpr uint64_t kNullHash = BaseVector::kNullHash;
 
-  // Computes a hash for 'rows' in 'values' and stores it in 'result'.
-  // If 'mix' is true, mixes the hash with existing value in 'result'.
-  void hash(
-      const BaseVector& values,
-      const SelectivityVector& rows,
-      bool mix,
-      raw_vector<uint64_t>& result);
+  // Decodes the 'vector' in preparation for calling hash() or
+  // computeValueIds(). The decoded vector can be accessed via decodedVector()
+  // getter.
+  void decode(const BaseVector& vector, const SelectivityVector& rows) {
+    decoded_.decode(vector, rows);
+  }
+
+  DecodedVector& decodedVector() {
+    return decoded_;
+  }
+
+  // Computes a hash for 'rows' in the vector previously decoded via decode()
+  // call and stores it in 'result'. If 'mix' is true, mixes the hash with
+  // existing value in 'result'.
+  void
+  hash(const SelectivityVector& rows, bool mix, raw_vector<uint64_t>& result);
 
   // Computes a hash for 'rows' using precomputedHash_ (just like from a const
   // vector) and stores it in 'result'.
@@ -195,16 +204,15 @@ class VectorHasher {
   // precomputedHash_. Used for constant partition keys.
   void precompute(const BaseVector& value);
 
-  // Computes a normalized key for 'rows' in 'values' and stores this
-  // in 'result'. If this is not the first hasher with normalized
-  // keys, updates the partially computed normalized key in
+  // Computes a normalized key for 'rows' in the vector previously decoded via
+  // decode() call and stores this in 'result'. If this is not the first hasher
+  // with normalized keys, updates the partially computed normalized key in
   // 'result'. Returns true if all the values could be mapped to the
   // normalized key range. If some values could not be mapped
   // the statistics are updated to reflect the new values. This
   // behavior corresponds to group by, where we must rehash if all the
   // new keys could not be represented.
   bool computeValueIds(
-      const BaseVector& values,
       const SelectivityVector& rows,
       raw_vector<uint64_t>& result);
 
@@ -282,14 +290,6 @@ class VectorHasher {
 
   bool isRange() const {
     return isRange_;
-  }
-
-  void decode(const BaseVector& vector, const SelectivityVector& rows) {
-    decoded_.decode(vector, rows);
-  }
-
-  const DecodedVector& decodedVector() const {
-    return decoded_;
   }
 
   static bool typeKindSupportsValueIds(TypeKind kind) {
@@ -528,7 +528,7 @@ class VectorHasher {
   template <TypeKind Kind>
   void hashValues(const SelectivityVector& rows, bool mix, uint64_t* result);
 
-  const ChannelIndex channel_;
+  const column_index_t channel_;
   const TypePtr type_;
   const TypeKind typeKind_;
 

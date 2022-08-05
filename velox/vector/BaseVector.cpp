@@ -24,6 +24,7 @@
 #include "velox/vector/LazyVector.h"
 #include "velox/vector/SequenceVector.h"
 #include "velox/vector/TypeAliases.h"
+#include "velox/vector/VectorPool.h"
 #include "velox/vector/VectorTypeUtils.h"
 
 namespace facebook {
@@ -101,26 +102,10 @@ static VectorPtr addDictionary(
     BufferPtr indices,
     size_t size,
     VectorPtr vector) {
-  auto base = vector.get();
-  auto pool = base->pool();
-  auto indicesBuffer = indices.get();
-  auto vsize = vector->size();
+  auto pool = vector->pool();
   return std::make_shared<
       DictionaryVector<typename KindToFlatVector<kind>::WrapperType>>(
-      pool,
-      nulls,
-      size,
-      std::move(vector),
-      TypeKind::INTEGER,
-      std::move(indices),
-      SimpleVectorStats<typename KindToFlatVector<kind>::WrapperType>{},
-      indicesBuffer->size() / sizeof(vector_size_t) /*distinctValueCount*/,
-      base->getNullCount(),
-      false /*isSorted*/,
-      base->representedBytes().has_value()
-          ? std::optional<ByteCount>(
-                base->representedBytes().value() * size / (1 + vsize))
-          : std::nullopt);
+      pool, nulls, size, std::move(vector), std::move(indices));
 }
 
 // static
@@ -442,7 +427,7 @@ void BaseVector::resizeIndices(
   *raw = indices->get()->asMutable<vector_size_t>();
 }
 
-std::string BaseVector::toString() const {
+std::string BaseVector::toSummaryString() const {
   std::stringstream out;
   out << "[" << encoding() << " " << type_->toString() << ": " << length_
       << " elements, ";
@@ -452,6 +437,27 @@ std::string BaseVector::toString() const {
     out << countNulls(nulls_, 0, length_) << " nulls";
   }
   out << "]";
+  return out.str();
+}
+
+std::string BaseVector::toString(bool recursive) const {
+  std::stringstream out;
+  out << toSummaryString();
+
+  if (recursive) {
+    switch (encoding()) {
+      case VectorEncoding::Simple::DICTIONARY:
+      case VectorEncoding::Simple::SEQUENCE:
+      case VectorEncoding::Simple::CONSTANT:
+        if (valueVector() != nullptr) {
+          out << ", " << valueVector()->toString(true);
+        }
+        break;
+      default:
+        break;
+    }
+  }
+
   return out.str();
 }
 
@@ -506,9 +512,14 @@ void BaseVector::ensureWritable(
     const SelectivityVector& rows,
     const TypePtr& type,
     velox::memory::MemoryPool* pool,
-    VectorPtr* result) {
+    VectorPtr* result,
+    VectorPool* vectorPool) {
   if (!*result) {
-    *result = BaseVector::create(type, rows.size(), pool);
+    if (vectorPool) {
+      *result = vectorPool->get(type, rows.size());
+    } else {
+      *result = BaseVector::create(type, rows.size(), pool);
+    }
     return;
   }
   auto resultType = (*result)->type();
@@ -538,8 +549,13 @@ void BaseVector::ensureWritable(
   // vector.
   auto targetSize = std::max<vector_size_t>(rows.size(), (*result)->size());
 
-  auto copy =
-      BaseVector::create(isUnknownType ? type : resultType, targetSize, pool);
+  VectorPtr copy;
+  if (vectorPool) {
+    copy = vectorPool->get(isUnknownType ? type : resultType, targetSize);
+  } else {
+    copy =
+        BaseVector::create(isUnknownType ? type : resultType, targetSize, pool);
+  }
   SelectivityVector copyRows(
       std::min<vector_size_t>(targetSize, (*result)->size()));
   copyRows.deselect(rows);
@@ -556,10 +572,22 @@ VectorPtr newConstant(
     velox::memory::MemoryPool* pool) {
   using T = typename KindToFlatVector<kind>::WrapperType;
   T copy = T();
-  if (!value.isNull()) {
-    if constexpr (std::is_same_v<T, StringView>) {
+  TypePtr type;
+  if constexpr (std::is_same_v<T, StringView>) {
+    type = Type::create<kind>();
+    if (!value.isNull()) {
       copy = StringView(value.value<kind>());
-    } else {
+    }
+  } else if constexpr (
+      std::is_same_v<T, ShortDecimal> || std::is_same_v<T, LongDecimal>) {
+    const auto& decimal = value.value<kind>();
+    type = DECIMAL(decimal.precision, decimal.scale);
+    if (!value.isNull()) {
+      copy = decimal.value();
+    }
+  } else {
+    type = Type::create<kind>();
+    if (!value.isNull()) {
       copy = value.value<T>();
     }
   }
@@ -568,30 +596,10 @@ VectorPtr newConstant(
       pool,
       size,
       value.isNull(),
-      Type::create<kind>(),
+      type,
       std::move(copy),
       SimpleVectorStats<T>{},
       sizeof(T) /*representedByteCount*/);
-}
-
-template <>
-VectorPtr newConstant<TypeKind::SHORT_DECIMAL>(
-    variant& value,
-    vector_size_t size,
-    velox::memory::MemoryPool* pool) {
-  // ShortDecimal variant is not supported to create
-  // constant vector.
-  VELOX_UNSUPPORTED();
-}
-
-template <>
-VectorPtr newConstant<TypeKind::LONG_DECIMAL>(
-    variant& value,
-    vector_size_t size,
-    velox::memory::MemoryPool* pool) {
-  // LongDecimal variant is not supported to create
-  // constant vector.
-  VELOX_UNSUPPORTED();
 }
 
 template <>
@@ -629,6 +637,17 @@ std::shared_ptr<BaseVector> BaseVector::createNullConstant(
     return std::make_shared<ConstantVector<ComplexType>>(
         pool, size, true, type, ComplexType());
   }
+
+  if (type->kind() == TypeKind::SHORT_DECIMAL) {
+    return std::make_shared<ConstantVector<ShortDecimal>>(
+        pool, size, true, type, ShortDecimal());
+  }
+
+  if (type->kind() == TypeKind::LONG_DECIMAL) {
+    return std::make_shared<ConstantVector<LongDecimal>>(
+        pool, size, true, type, LongDecimal());
+  }
+
   return BaseVector::createConstant(variant(type->kind()), size, pool);
 }
 
@@ -720,7 +739,7 @@ uint64_t BaseVector::estimateFlatSize() const {
 }
 
 namespace {
-bool isFlatEncoding(VectorEncoding::Simple encoding) {
+bool isReusableEncoding(VectorEncoding::Simple encoding) {
   return encoding == VectorEncoding::Simple::FLAT ||
       encoding == VectorEncoding::Simple::ARRAY ||
       encoding == VectorEncoding::Simple::MAP ||
@@ -732,7 +751,7 @@ bool isFlatEncoding(VectorEncoding::Simple encoding) {
 void BaseVector::prepareForReuse(
     std::shared_ptr<BaseVector>& vector,
     vector_size_t size) {
-  if (!vector.unique() || !isFlatEncoding(vector->encoding())) {
+  if (!vector.unique() || !isReusableEncoding(vector->encoding())) {
     vector = BaseVector::create(vector->type(), size, vector->pool());
     return;
   }

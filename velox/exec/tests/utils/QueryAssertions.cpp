@@ -190,7 +190,9 @@ velox::variant variantAt<TypeKind::DATE>(
 
 template <TypeKind kind>
 velox::variant variantAt(const ::duckdb::Value& value) {
-  using T = typename KindToFlatVector<kind>::WrapperType;
+  // NOTE: duckdb only support native cpp type for GetValue so we need to use
+  // DeepCopiedType instead of WrapperType here.
+  using T = typename TypeTraits<kind>::DeepCopiedType;
   return velox::variant(value.GetValue<T>());
 }
 
@@ -708,8 +710,9 @@ void assertResultsOrdered(
 std::pair<std::unique_ptr<TaskCursor>, std::vector<RowVectorPtr>> readCursor(
     const CursorParameters& params,
     std::function<void(exec::Task*)> addSplits) {
-  std::vector<RowVectorPtr> result;
   auto cursor = std::make_unique<TaskCursor>(params);
+  // 'result' borrows memory from cursor so the life cycle must be shorter.
+  std::vector<RowVectorPtr> result;
   auto* task = cursor->task().get();
   addSplits(task);
 

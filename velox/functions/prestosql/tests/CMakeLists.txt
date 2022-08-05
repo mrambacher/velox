@@ -20,6 +20,7 @@ target_link_libraries(velox_functions_test_lib velox_exec velox_exec_test_util
 add_executable(
   velox_functions_test
   ArithmeticTest.cpp
+  ArrayCombinationsTest.cpp
   ArrayConstructorTest.cpp
   ArrayContainsTest.cpp
   ArrayDistinctTest.cpp
@@ -30,6 +31,7 @@ add_executable(
   ArrayMaxTest.cpp
   ArrayMinTest.cpp
   ArrayPositionTest.cpp
+  ArraySortTest.cpp
   ArraysOverlapTest.cpp
   BitwiseTest.cpp
   CardinalityTest.cpp
@@ -71,7 +73,7 @@ target_link_libraries(
   velox_functions_prestosql
   velox_functions_lib
   velox_exec_test_util
-  velox_dwrf_test_utils
+  velox_dwio_common_test_utils
   gtest
   gtest_main
   ${gflags_LIBRARIES}

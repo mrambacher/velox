@@ -15,7 +15,7 @@
  */
 #include "velox/exec/PartitionedOutputBufferManager.h"
 #include <gtest/gtest.h>
-#include "velox/dwio/dwrf/test/utils/BatchMaker.h"
+#include "velox/dwio/common/tests/utils/BatchMaker.h"
 #include "velox/exec/Exchange.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
 #include "velox/serializers/PrestoSerializer.h"
@@ -86,7 +86,7 @@ class PartitionedOutputBufferManagerTest : public testing::Test {
       int destination,
       std::shared_ptr<const RowType> rowType,
       vector_size_t size) {
-    ContinueFuture future(false);
+    ContinueFuture future;
     auto blockingReason = bufferManager_->enqueue(
         taskId, destination, makeSerializedPage(rowType, size), &future);
     ASSERT_EQ(blockingReason, BlockingReason::kNotBlocked);
@@ -365,7 +365,23 @@ TEST_F(PartitionedOutputBufferManagerTest, errorInQueue) {
     std::lock_guard<std::mutex> l(queue->mutex());
     queue->setErrorLocked("error");
   }
-  ContinueFuture future(false);
+  ContinueFuture future;
   bool atEnd = false;
   EXPECT_THROW(auto page = queue->dequeue(&atEnd, &future), std::runtime_error);
+}
+
+TEST_F(PartitionedOutputBufferManagerTest, serializedPage) {
+  auto iobuf = folly::IOBuf::create(128);
+  std::string payload = "abcdefghijklmnopq";
+  size_t payloadSize = payload.size();
+  std::memcpy(iobuf->writableData(), payload.data(), payloadSize);
+  iobuf->append(payloadSize);
+
+  EXPECT_EQ(0, pool_->getCurrentBytes());
+  {
+    auto serializedPage =
+        std::make_shared<SerializedPage>(std::move(iobuf), pool_.get());
+    EXPECT_EQ(payloadSize, pool_->getCurrentBytes());
+  }
+  EXPECT_EQ(0, pool_->getCurrentBytes());
 }

@@ -72,7 +72,7 @@ HashBuild::HashBuild(
 
   auto numKeys = joinNode->rightKeys().size();
   keyChannels_.reserve(numKeys);
-  folly::F14FastSet<ChannelIndex> keyChannelSet;
+  folly::F14FastSet<column_index_t> keyChannelSet;
   keyChannelSet.reserve(numKeys);
   std::vector<std::unique_ptr<VectorHasher>> keyHashers;
   keyHashers.reserve(numKeys);
@@ -110,7 +110,7 @@ HashBuild::HashBuild(
     // Semi and anti join with no extra filter only needs to know whether there
     // is a match. Hence, no need to store entries with duplicate keys.
     const bool dropDuplicates = !joinNode->filter() &&
-        (joinNode->isSemiJoin() || joinNode->isAntiJoin());
+        (joinNode->isLeftSemiJoin() || joinNode->isAntiJoin());
 
     table_ = HashTable<true>::createForJoin(
         std::move(keyHashers),
@@ -125,9 +125,16 @@ HashBuild::HashBuild(
 void HashBuild::addInput(RowVectorPtr input) {
   activeRows_.resize(input->size());
   activeRows_.setAll();
+
+  auto& hashers = table_->hashers();
+
+  for (auto i = 0; i < hashers.size(); ++i) {
+    auto key = input->childAt(hashers[i]->channel())->loadedVector();
+    hashers[i]->decode(*key, activeRows_);
+  }
+
   if (!isRightJoin(joinType_) && !isFullJoin(joinType_)) {
-    deselectRowsWithNulls(
-        *input, keyChannels_, activeRows_, *operatorCtx_->execCtx());
+    deselectRowsWithNulls(hashers, activeRows_);
   }
 
   if (joinType_ == core::JoinType::kAnti) {
@@ -144,8 +151,6 @@ void HashBuild::addInput(RowVectorPtr input) {
     hashes_.resize(activeRows_.size());
   }
 
-  auto& hashers = table_->hashers();
-
   // As long as analyzeKeys is true, we keep running the keys through
   // the Vectorhashers so that we get a possible mapping of the keys
   // to small ints for array or normalized key. When mayUseValueIds is
@@ -155,16 +160,13 @@ void HashBuild::addInput(RowVectorPtr input) {
   for (auto& hasher : hashers) {
     // TODO: Load only for active rows, except if right/full outer join.
     if (analyzeKeys_) {
-      hasher->computeValueIds(
-          *input->loadedChildAt(hasher->channel()), activeRows_, hashes_);
+      hasher->computeValueIds(activeRows_, hashes_);
       analyzeKeys_ = hasher->mayUseValueIds();
-    } else {
-      hasher->decode(*input->loadedChildAt(hasher->channel()), activeRows_);
     }
   }
   for (auto i = 0; i < dependentChannels_.size(); ++i) {
     decoders_[i]->decode(
-        *input->loadedChildAt(dependentChannels_[i]), activeRows_);
+        *input->childAt(dependentChannels_[i])->loadedVector(), activeRows_);
   }
   auto rows = table_->rows();
   auto nextOffset = rows->nextOffset();
@@ -223,7 +225,7 @@ void HashBuild::noMoreInput() {
   // the last to finish) can continue from the barrier and finish.
   peers.clear();
   for (auto& promise : promises) {
-    promise.setValue(true);
+    promise.setValue();
   }
 
   if (antiJoinHasNullKeys_) {

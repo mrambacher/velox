@@ -23,6 +23,7 @@ TEST_F(VectorToStringTest, flatIntegers) {
   // No nulls.
   auto flat = makeFlatVector<int32_t>({1, 2, 3, 4, 5, 6, 7, 8, 9, 10});
   ASSERT_EQ(flat->toString(), "[FLAT INTEGER: 10 elements, no nulls]");
+  ASSERT_EQ(flat->toString(true), "[FLAT INTEGER: 10 elements, no nulls]");
   ASSERT_EQ(flat->toString(1), "2");
   ASSERT_EQ(flat->toString(3, 8, ", ", false), "4, 5, 6, 7, 8");
 
@@ -30,6 +31,7 @@ TEST_F(VectorToStringTest, flatIntegers) {
   flat = makeFlatVector<int32_t>(
       100, [](auto row) { return row; }, nullEvery(3));
   ASSERT_EQ(flat->toString(), "[FLAT INTEGER: 100 elements, 34 nulls]");
+  ASSERT_EQ(flat->toString(true), "[FLAT INTEGER: 100 elements, 34 nulls]");
   ASSERT_EQ(flat->toString(1), "1");
   ASSERT_EQ(flat->toString(33), "null");
   ASSERT_EQ(flat->toString(0, 7, ", ", false), "null, 1, 2, null, 4, 5, null");
@@ -88,4 +90,138 @@ TEST_F(VectorToStringTest, row) {
       "1: {2, 2.299999952316284, 1}\n"
       "2: {3, 444.55999755859375, 1}");
 }
+
+TEST_F(VectorToStringTest, opaque) {
+  auto opaque = BaseVector::create(OPAQUE<int>(), 10, pool_.get());
+
+  ASSERT_EQ(opaque->toString(), "[FLAT OPAQUE<int>: 10 elements, no nulls]");
+  ASSERT_EQ(
+      opaque->toString(0, 3),
+      "0: <opaque>\n"
+      "1: <opaque>\n"
+      "2: <opaque>");
+}
+
+TEST_F(VectorToStringTest, decimals) {
+  auto shortDecimalFlatVector = makeShortDecimalFlatVector(
+      {1000265, 35610, -314159, 7, 0}, DECIMAL(10, 3));
+  ASSERT_EQ(
+      shortDecimalFlatVector->toString(),
+      "[FLAT SHORT_DECIMAL(10,3): 5 elements, no nulls]");
+  ASSERT_EQ(
+      shortDecimalFlatVector->toString(0, 5),
+      "0: 1000.265\n"
+      "1: 35.610\n"
+      "2: -314.159\n"
+      "3: 0.007\n"
+      "4: 0");
+
+  auto longDecimalFlatVector = makeLongDecimalFlatVector(
+      {1000265, 35610, -314159, 7, 0}, DECIMAL(20, 4));
+  ASSERT_EQ(
+      longDecimalFlatVector->toString(),
+      "[FLAT LONG_DECIMAL(20,4): 5 elements, no nulls]");
+  ASSERT_EQ(
+      longDecimalFlatVector->toString(0, 5),
+      "0: 100.0265\n"
+      "1: 3.5610\n"
+      "2: -31.4159\n"
+      "3: 0.0007\n"
+      "4: 0");
+}
+
+TEST_F(VectorToStringTest, nullableDecimals) {
+  auto shortDecimalFlatVector = makeNullableShortDecimalFlatVector(
+      {1000265, 35610, -314159, 7, std::nullopt}, DECIMAL(10, 3));
+  ASSERT_EQ(
+      shortDecimalFlatVector->toString(),
+      "[FLAT SHORT_DECIMAL(10,3): 5 elements, 1 nulls]");
+  ASSERT_EQ(
+      shortDecimalFlatVector->toString(0, 5),
+      "0: 1000.265\n"
+      "1: 35.610\n"
+      "2: -314.159\n"
+      "3: 0.007\n"
+      "4: null");
+
+  auto longDecimalFlatVector = makeNullableLongDecimalFlatVector(
+      {1000265, 35610, -314159, 7, std::nullopt}, DECIMAL(20, 4));
+  ASSERT_EQ(
+      longDecimalFlatVector->toString(),
+      "[FLAT LONG_DECIMAL(20,4): 5 elements, 1 nulls]");
+  ASSERT_EQ(
+      longDecimalFlatVector->toString(0, 5),
+      "0: 100.0265\n"
+      "1: 3.5610\n"
+      "2: -31.4159\n"
+      "3: 0.0007\n"
+      "4: null");
+}
+
+TEST_F(VectorToStringTest, constant) {
+  // Null constant.
+  auto nullConstant = makeConstant<int32_t>(std::nullopt, 100);
+  ASSERT_EQ(
+      nullConstant->toString(true), "[CONSTANT INTEGER: 100 elements, null]");
+
+  // Non-null constant.
+  auto nonNullConstant = makeConstant<int32_t>(75, 100);
+  ASSERT_EQ(
+      nonNullConstant->toString(true), "[CONSTANT INTEGER: 100 elements, 75]");
+
+  // Non-null complex-type constant.
+  auto arrayVector = makeArrayVector<int32_t>({
+      {1, 2, 3},
+      {4, 5},
+      {6, 7, 8, 9},
+  });
+
+  auto constant = BaseVector::wrapInConstant(100, 1, arrayVector);
+  ASSERT_EQ(
+      constant->toString(true),
+      "[CONSTANT ARRAY<INTEGER>: 100 elements, 2 elements starting at 3 {4, 5}], "
+      "[ARRAY ARRAY<INTEGER>: 3 elements, no nulls]");
+}
+
+TEST_F(VectorToStringTest, dictionary) {
+  auto flat = makeFlatVector<int32_t>({1, 2, 3});
+  auto flatWithNulls =
+      makeNullableFlatVector<int32_t>({1, 2, std::nullopt, 4, 5});
+
+  // Dictionary over flat. No nulls.
+  auto dict = wrapInDictionary(makeIndicesInReverse(3), 3, flat);
+  ASSERT_EQ(dict->toString(), "[DICTIONARY INTEGER: 3 elements, no nulls]");
+  ASSERT_EQ(
+      dict->toString(true),
+      "[DICTIONARY INTEGER: 3 elements, no nulls], "
+      "[FLAT INTEGER: 3 elements, no nulls]");
+
+  // 2 layers of dictionary over flat with nulls.
+  auto doubleDict = BaseVector::wrapInDictionary(
+      makeNulls(4, nullEvery(2)),
+      makeIndices({0, 0, 2, 2}),
+      4,
+      wrapInDictionary(makeIndicesInReverse(3), 3, flatWithNulls));
+  ASSERT_EQ(
+      doubleDict->toString(), "[DICTIONARY INTEGER: 4 elements, 2 nulls]");
+  ASSERT_EQ(
+      doubleDict->toString(true),
+      "[DICTIONARY INTEGER: 4 elements, 2 nulls], "
+      "[DICTIONARY INTEGER: 3 elements, no nulls], "
+      "[FLAT INTEGER: 5 elements, 1 nulls]");
+
+  // Dictionary over constant.
+  auto dictOverConst = BaseVector::wrapInDictionary(
+      makeNulls(4, nullEvery(2)),
+      makeIndices({0, 0, 0, 0}),
+      4,
+      makeConstant<int32_t>(75, 100));
+  ASSERT_EQ(
+      dictOverConst->toString(), "[DICTIONARY INTEGER: 4 elements, 2 nulls]");
+  ASSERT_EQ(
+      dictOverConst->toString(true),
+      "[DICTIONARY INTEGER: 4 elements, 2 nulls], "
+      "[CONSTANT INTEGER: 100 elements, 75]");
+}
+
 } // namespace facebook::velox::test

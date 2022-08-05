@@ -332,9 +332,6 @@ AbstractJoinNode::AbstractJoinNode(
       leftKeys_.size(),
       rightKeys_.size(),
       "JoinNode requires same number of join keys on left and right sides");
-  if (isSemiJoin() || isAntiJoin()) {
-    VELOX_CHECK_NULL(filter, "Semi and anti join does not support filter");
-  }
   auto leftType = sources_[0]->outputType();
   for (auto key : leftKeys_) {
     VELOX_CHECK(
@@ -423,6 +420,100 @@ void AssignUniqueIdNode::addDetails(std::stringstream& /* stream */) const {
 }
 
 namespace {
+RowTypePtr getWindowOutputType(
+    const RowTypePtr& inputType,
+    const std::vector<std::string>& windowColumnNames,
+    const std::vector<WindowNode::Function>& windowFunctions) {
+  VELOX_CHECK_EQ(
+      windowColumnNames.size(),
+      windowFunctions.size(),
+      "Number of window column names must be equal to number of window functions");
+
+  std::vector<std::string> names = inputType->names();
+  std::vector<TypePtr> types = inputType->children();
+
+  for (int32_t i = 0; i < windowColumnNames.size(); i++) {
+    names.push_back(windowColumnNames[i]);
+    types.push_back(windowFunctions[i].functionCall->type());
+  }
+  return ROW(std::move(names), std::move(types));
+}
+
+const char* frameBoundString(const WindowNode::BoundType boundType) {
+  switch (boundType) {
+    case WindowNode::BoundType::kCurrentRow:
+      return "CURRENT ROW";
+    case WindowNode::BoundType::kPreceding:
+      return "PRECEDING";
+    case WindowNode::BoundType::kFollowing:
+      return "FOLLOWING";
+    case WindowNode::BoundType::kUnboundedPreceding:
+      return "UNBOUNDED PRECEDING";
+    case WindowNode::BoundType::kUnboundedFollowing:
+      return "UNBOUNDED FOLLOWING";
+  }
+  VELOX_UNREACHABLE();
+}
+
+const char* windowTypeString(const WindowNode::WindowType windowType) {
+  switch (windowType) {
+    case WindowNode::WindowType::kRows:
+      return "ROWS";
+    case WindowNode::WindowType::kRange:
+      return "RANGE";
+  }
+  VELOX_UNREACHABLE();
+}
+
+void addWindowFunction(
+    std::stringstream& stream,
+    const WindowNode::Function& windowFunction) {
+  stream << windowFunction.functionCall->toString() << " ";
+  auto frame = windowFunction.frame;
+  stream << windowTypeString(frame.type) << " between ";
+  if (frame.startValue) {
+    addKeys(stream, {frame.startValue});
+    stream << " ";
+  }
+  stream << frameBoundString(frame.startType) << " and ";
+  if (frame.endValue) {
+    addKeys(stream, {frame.endValue});
+    stream << " ";
+  }
+  stream << frameBoundString(frame.endType);
+}
+
+} // namespace
+
+WindowNode::WindowNode(
+    PlanNodeId id,
+    std::vector<FieldAccessTypedExprPtr> partitionKeys,
+    std::vector<FieldAccessTypedExprPtr> sortingKeys,
+    std::vector<SortOrder> sortingOrders,
+    std::vector<std::string> windowColumnNames,
+    std::vector<Function> windowFunctions,
+    PlanNodePtr source)
+    : PlanNode(std::move(id)),
+      partitionKeys_(std::move(partitionKeys)),
+      sortingKeys_(std::move(sortingKeys)),
+      sortingOrders_(std::move(sortingOrders)),
+      windowFunctions_(std::move(windowFunctions)),
+      sources_{std::move(source)},
+      outputType_(getWindowOutputType(
+          sources_[0]->outputType(),
+          windowColumnNames,
+          windowFunctions_)) {
+  VELOX_CHECK_GT(
+      windowFunctions_.size(),
+      0,
+      "Window node must have at least one window function");
+  VELOX_CHECK_EQ(
+      sortingKeys_.size(),
+      sortingOrders_.size(),
+      "Number of sorting keys must be equal to the number of sorting orders");
+}
+
+namespace {
 void addSortingKeys(
     std::stringstream& stream,
     const std::vector<FieldAccessTypedExprPtr>& sortingKeys,
@@ -504,6 +595,28 @@ void OrderByNode::addDetails(std::stringstream& stream) const {
     stream << "PARTIAL ";
   }
   addSortingKeys(stream, sortingKeys_, sortingOrders_);
+}
+
+void WindowNode::addDetails(std::stringstream& stream) const {
+  stream << "partition by [";
+  if (!partitionKeys_.empty()) {
+    addFields(stream, partitionKeys_);
+  }
+  stream << "] ";
+
+  stream << "order by [";
+  addSortingKeys(stream, sortingKeys_, sortingOrders_);
+  stream << "] ";
+
+  auto numInputCols = sources_[0]->outputType()->size();
+  auto numOutputCols = outputType_->size();
+  for (auto i = numInputCols; i < numOutputCols; i++) {
+    if (i >= numInputCols + 1) {
+      stream << ", ";
+    }
+    stream << outputType_->names()[i] << " := ";
+    addWindowFunction(stream, windowFunctions_[i - numInputCols]);
+  }
 }
 
 void PlanNode::toString(

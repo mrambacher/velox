@@ -17,9 +17,14 @@
 #include "velox/expression/ExprCompiler.h"
 #include "velox/expression/CastExpr.h"
 #include "velox/expression/CoalesceExpr.h"
-#include "velox/expression/ControlExpr.h"
+#include "velox/expression/ConjunctExpr.h"
+#include "velox/expression/ConstantExpr.h"
 #include "velox/expression/Expr.h"
+#include "velox/expression/FieldReference.h"
+#include "velox/expression/LambdaExpr.h"
 #include "velox/expression/SimpleFunctionRegistry.h"
+#include "velox/expression/SwitchExpr.h"
+#include "velox/expression/TryExpr.h"
 #include "velox/expression/VectorFunction.h"
 
 namespace facebook::velox::exec {
@@ -28,6 +33,13 @@ namespace {
 
 using core::ITypedExpr;
 using core::TypedExprPtr;
+
+const char* const kAnd = "and";
+const char* const kOr = "or";
+const char* const kTry = "try";
+const char* const kSwitch = "switch";
+const char* const kIf = "if";
+const char* const kRowConstructor = "row_constructor";
 
 struct ITypedExprHasher {
   size_t operator()(const ITypedExpr* expr) const {
@@ -170,13 +182,34 @@ std::vector<TypePtr> getTypes(const std::vector<ExprPtr>& exprs) {
   return types;
 }
 
+ExprPtr getRowConstructorExpr(
+    const TypePtr& type,
+    std::vector<ExprPtr>&& compiledChildren,
+    bool trackCpuUsage) {
+  static auto rowConstructorVectorFunction =
+      vectorFunctionFactories().withRLock([](auto& functionMap) {
+        auto functionIterator = functionMap.find(exec::kRowConstructor);
+        return functionIterator->second.factory(exec::kRowConstructor, {});
+      });
+
+  return std::make_shared<Expr>(
+      type,
+      std::move(compiledChildren),
+      rowConstructorVectorFunction,
+      "row",
+      trackCpuUsage);
+}
+
 ExprPtr getSpecialForm(
     const std::string& name,
     const TypePtr& type,
     std::vector<ExprPtr>&& compiledChildren,
     bool trackCpuUsage) {
   if (name == kIf || name == kSwitch) {
-    return std::make_shared<SwitchExpr>(type, std::move(compiledChildren));
+    bool inputsSupportFlatNoNullsFastPath =
+        Expr::allSupportFlatNoNullsFastPath(compiledChildren);
+    return std::make_shared<SwitchExpr>(
+        type, std::move(compiledChildren), inputsSupportFlatNoNullsFastPath);
   }
   if (name == kCast) {
     VELOX_CHECK_EQ(compiledChildren.size(), 1);
@@ -187,19 +220,36 @@ ExprPtr getSpecialForm(
         false /* nullOnFailure */);
   }
   if (name == kAnd) {
+    bool inputsSupportFlatNoNullsFastPath =
+        Expr::allSupportFlatNoNullsFastPath(compiledChildren);
     return std::make_shared<ConjunctExpr>(
-        type, std::move(compiledChildren), true);
+        type,
+        std::move(compiledChildren),
+        true /* isAnd */,
+        inputsSupportFlatNoNullsFastPath);
   }
   if (name == kOr) {
+    bool inputsSupportFlatNoNullsFastPath =
+        Expr::allSupportFlatNoNullsFastPath(compiledChildren);
     return std::make_shared<ConjunctExpr>(
-        type, std::move(compiledChildren), false);
+        type,
+        std::move(compiledChildren),
+        false /* isAnd */,
+        inputsSupportFlatNoNullsFastPath);
   }
   if (name == kTry) {
     VELOX_CHECK_EQ(compiledChildren.size(), 1);
     return std::make_shared<TryExpr>(type, std::move(compiledChildren[0]));
   }
   if (name == kCoalesce) {
-    return std::make_shared<CoalesceExpr>(type, std::move(compiledChildren));
+    bool inputsSupportFlatNoNullsFastPath =
+        Expr::allSupportFlatNoNullsFastPath(compiledChildren);
+    return std::make_shared<CoalesceExpr>(
+        type, std::move(compiledChildren), inputsSupportFlatNoNullsFastPath);
+  }
+  if (name == kRowConstructor) {
+    return getRowConstructorExpr(
+        type, std::move(compiledChildren), trackCpuUsage);
   }
   return nullptr;
 }
@@ -338,15 +388,9 @@ ExprPtr compileExpression(
       compileInputs(expr, scope, config, pool, enableConstantFolding);
   auto inputTypes = getTypes(compiledInputs);
 
-  if (auto concat = dynamic_cast<const core::ConcatTypedExpr*>(expr.get())) {
-    auto vectorFunction = getVectorFunction("row_constructor", inputTypes, {});
-    VELOX_CHECK(vectorFunction, "Vector function row_constructor is missing");
-    result = std::make_shared<Expr>(
-        resultType,
-        std::move(compiledInputs),
-        vectorFunction,
-        "row",
-        trackCpuUsage);
+  if (dynamic_cast<const core::ConcatTypedExpr*>(expr.get())) {
+    result = getRowConstructorExpr(
+        resultType, std::move(compiledInputs), trackCpuUsage);
   } else if (auto cast = dynamic_cast<const core::CastTypedExpr*>(expr.get())) {
     VELOX_CHECK(!compiledInputs.empty());
     result = std::make_shared<CastExpr>(
@@ -361,6 +405,15 @@ ExprPtr compileExpression(
             std::move(compiledInputs),
             trackCpuUsage)) {
       result = specialForm;
+    } else if (
+        auto func = getVectorFunction(
+            call->name(), inputTypes, getConstantInputs(compiledInputs))) {
+      result = std::make_shared<Expr>(
+          resultType,
+          std::move(compiledInputs),
+          func,
+          call->name(),
+          trackCpuUsage);
     } else if (
         auto simpleFunctionEntry =
             SimpleFunctions().resolveFunction(call->name(), inputTypes)) {
@@ -381,15 +434,6 @@ ExprPtr compileExpression(
           std::move(func),
           call->name(),
           trackCpuUsage);
-    } else if (
-        auto func = getVectorFunction(
-            call->name(), inputTypes, getConstantInputs(compiledInputs))) {
-      result = std::make_shared<Expr>(
-          resultType,
-          std::move(compiledInputs),
-          func,
-          call->name(),
-          trackCpuUsage);
     } else {
       VELOX_FAIL(
           "Scalar function not registered: {} ({})",
@@ -401,7 +445,11 @@ ExprPtr compileExpression(
           dynamic_cast<const core::FieldAccessTypedExpr*>(expr.get())) {
     auto fieldReference = std::make_shared<FieldReference>(
         expr->type(), move(compiledInputs), access->name());
-    captureFieldReference(fieldReference.get(), expr.get(), scope);
+    if (access->isInputColumn()) {
+      // We only want to capture references to top level fields, not struct
+      // fields.
+      captureFieldReference(fieldReference.get(), expr.get(), scope);
+    }
     result = fieldReference;
   } else if (auto row = dynamic_cast<const core::InputTypedExpr*>(expr.get())) {
     VELOX_UNSUPPORTED("InputTypedExpr '{}' is not supported", row->toString());
@@ -411,8 +459,13 @@ ExprPtr compileExpression(
     if (constant->hasValueVector()) {
       result = std::make_shared<ConstantExpr>(constant->valueVector());
     } else {
-      result = std::make_shared<ConstantExpr>(
-          BaseVector::createConstant(constant->value(), 1, pool));
+      if (constant->value().isNull()) {
+        result = std::make_shared<ConstantExpr>(
+            BaseVector::createNullConstant(constant->type(), 1, pool));
+      } else {
+        result = std::make_shared<ConstantExpr>(
+            BaseVector::createConstant(constant->value(), 1, pool));
+      }
     }
   } else if (
       auto lambda = dynamic_cast<const core::LambdaTypedExpr*>(expr.get())) {

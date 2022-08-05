@@ -13,7 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "velox/dwio/dwrf/test/utils/BatchMaker.h"
+#include "velox/dwio/common/tests/utils/BatchMaker.h"
 #include "velox/exec/tests/utils/Cursor.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
 #include "velox/functions/prestosql/aggregates/tests/AggregationTestBase.h"
@@ -81,14 +81,10 @@ TEST_F(ArrayAggTest, groupBy) {
   }
 
   // Add local exchange before intermediate aggregation. Expect the same result.
-  auto planNodeIdGenerator = std::make_shared<PlanNodeIdGenerator>();
-  params.planNode = PlanBuilder(planNodeIdGenerator)
-                        .localPartition(
-                            {"c0"},
-                            {PlanBuilder(planNodeIdGenerator)
-                                 .values(batches)
-                                 .partialAggregation({"c0"}, {"array_agg(A)"})
-                                 .planNode()})
+  params.planNode = PlanBuilder()
+                        .values(batches)
+                        .partialAggregation({"c0"}, {"array_agg(A)"})
+                        .localPartition({"c0"})
                         .intermediateAggregation()
                         .planNode();
   params.maxDrivers = 2;

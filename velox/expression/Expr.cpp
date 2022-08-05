@@ -19,9 +19,10 @@
 
 #include "velox/common/base/SuccinctPrinter.h"
 #include "velox/core/Expressions.h"
-#include "velox/expression/ControlExpr.h"
+#include "velox/expression/ConstantExpr.h"
 #include "velox/expression/Expr.h"
 #include "velox/expression/ExprCompiler.h"
+#include "velox/expression/FieldReference.h"
 #include "velox/expression/VarSetter.h"
 #include "velox/expression/VectorFunction.h"
 
@@ -100,7 +101,37 @@ bool hasConditionals(Expr* expr) {
 
   return false;
 }
+
 } // namespace
+
+Expr::Expr(
+    TypePtr type,
+    std::vector<std::shared_ptr<Expr>>&& inputs,
+    std::shared_ptr<VectorFunction> vectorFunction,
+    std::string name,
+    bool trackCpuUsage)
+    : type_(std::move(type)),
+      inputs_(std::move(inputs)),
+      name_(std::move(name)),
+      vectorFunction_(std::move(vectorFunction)),
+      specialForm_{false},
+      supportsFlatNoNullsFastPath_{
+          vectorFunction_->supportsFlatNoNullsFastPath() &&
+          type_->isPrimitiveType() && type_->isFixedWidth() &&
+          allSupportFlatNoNullsFastPath(inputs_)},
+      trackCpuUsage_{trackCpuUsage} {
+  constantInputs_.reserve(inputs_.size());
+  inputIsConstant_.reserve(inputs_.size());
+  for (auto& expr : inputs_) {
+    if (auto constantExpr = std::dynamic_pointer_cast<ConstantExpr>(expr)) {
+      constantInputs_.emplace_back(constantExpr->value());
+      inputIsConstant_.push_back(true);
+    } else {
+      constantInputs_.emplace_back(nullptr);
+      inputIsConstant_.push_back(false);
+    }
+  }
+}
 
 // static
 bool Expr::isSameFields(
@@ -125,6 +156,18 @@ bool Expr::isSubsetOfFields(
       subset.begin(), subset.end(), [&superset](const auto& field) {
         return isMember(superset, *field);
       });
+}
+
+// static
+bool Expr::allSupportFlatNoNullsFastPath(
+    const std::vector<std::shared_ptr<Expr>>& exprs) {
+  for (const auto& expr : exprs) {
+    if (!expr->supportsFlatNoNullsFastPath()) {
+      return false;
+    }
+  }
+
+  return true;
 }
 
 void Expr::computeMetadata() {
@@ -208,6 +251,11 @@ void Expr::evalSimplified(
   addNulls(rows, remainingRows->asRange().bits(), context, result);
 }
 
+void Expr::releaseInputValues(EvalCtx& evalCtx) {
+  evalCtx.releaseVectors(inputValues_);
+  inputValues_.clear();
+}
+
 void Expr::evalSimplifiedImpl(
     const SelectivityVector& rows,
     EvalCtx& context,
@@ -222,6 +270,7 @@ void Expr::evalSimplifiedImpl(
   inputValues_.resize(inputs_.size());
   const bool defaultNulls = vectorFunction_->isDefaultNullBehavior();
 
+  LocalDecodedVector decodedVector(context);
   for (int32_t i = 0; i < inputs_.size(); ++i) {
     auto& inputValue = inputValues_[i];
     inputs_[i]->evalSimplified(remainingRows, context, inputValue);
@@ -232,15 +281,16 @@ void Expr::evalSimplifiedImpl(
     // If the resulting vector has nulls, merge them into our current remaining
     // rows bitmap.
     if (defaultNulls && inputValue->mayHaveNulls()) {
-      remainingRows.deselectNulls(
-          inputValue->flatRawNulls(rows),
-          remainingRows.begin(),
-          remainingRows.end());
+      decodedVector.get()->decode(*inputValue, rows);
+      if (auto* rawNulls = decodedVector->nulls()) {
+        remainingRows.deselectNulls(
+            rawNulls, remainingRows.begin(), remainingRows.end());
+      }
     }
 
     // All rows are null, return a null constant.
     if (!remainingRows.hasSelections()) {
-      inputValues_.clear();
+      releaseInputValues(context);
       result =
           BaseVector::createNullConstant(type(), rows.size(), context.pool());
       return;
@@ -253,13 +303,55 @@ void Expr::evalSimplifiedImpl(
 
   // Make sure the returned vector has its null bitmap properly set.
   addNulls(rows, remainingRows.asRange().bits(), context, result);
-  inputValues_.clear();
+  releaseInputValues(context);
+}
+
+void Expr::evalFlatNoNulls(
+    const SelectivityVector& rows,
+    EvalCtx& context,
+    VectorPtr& result) {
+  ExceptionContextSetter exceptionContext(
+      {[](auto* expr) { return static_cast<Expr*>(expr)->toString(); }, this});
+
+  if (isSpecialForm()) {
+    evalSpecialForm(rows, context, result);
+    return;
+  }
+
+  inputValues_.resize(inputs_.size());
+  for (int32_t i = 0; i < inputs_.size(); ++i) {
+    if (constantInputs_[i]) {
+      // No need to re-evaluate constant expression. Simply move constant values
+      // from constantInputs_.
+      inputValues_[i] = std::move(constantInputs_[i]);
+      inputValues_[i]->resize(rows.size());
+    } else {
+      inputs_[i]->evalFlatNoNulls(rows, context, inputValues_[i]);
+    }
+  }
+
+  applyFunction(rows, context, result);
+
+  // Move constant values back to constantInputs_.
+  for (int32_t i = 0; i < inputs_.size(); ++i) {
+    if (inputIsConstant_[i]) {
+      constantInputs_[i] = std::move(inputValues_[i]);
+      VELOX_CHECK_NULL(inputValues_[i]);
+    }
+  }
+  releaseInputValues(context);
 }
 
 void Expr::eval(
     const SelectivityVector& rows,
     EvalCtx& context,
     VectorPtr& result) {
+  if (supportsFlatNoNullsFastPath_ && context.throwOnError() &&
+      context.inputFlatNoNulls() && rows.countSelected() < 1'000) {
+    evalFlatNoNulls(rows, context, result);
+    return;
+  }
+
   // Make sure to include current expression in the error message in case of an
   // exception.
   ExceptionContextSetter exceptionContext(
@@ -384,7 +476,7 @@ SelectivityVector* translateToInnerRows(
   // indices for places that a dictionary sets to null are not
   // defined. Null adding dictionaries are not peeled off non
   // null-propagating Exprs.
-  auto flatNulls = decoded.nullIndices() != indices ? decoded.nulls() : nullptr;
+  auto flatNulls = decoded.hasExtraNulls() ? decoded.nulls() : nullptr;
 
   auto* newRows = newRowsHolder.get(baseSize, false);
   rows.applyToSelected([&](vector_size_t row) {
@@ -449,7 +541,7 @@ Expr::PeelEncodingsResult Expr::peelEncodings(
         continue;
       }
       if (numLevels == 0 && leaf->isConstant(rows)) {
-        context.ensureFieldLoaded(fieldIndex, rows);
+        leaf = context.ensureFieldLoaded(fieldIndex, rows);
         setPeeled(leaf, fieldIndex, context, maybePeeled);
         constantFields.resize(numFields);
         constantFields.at(fieldIndex) = true;
@@ -618,14 +710,19 @@ bool Expr::removeSureNulls(
   for (auto* field : distinctFields_) {
     VectorPtr values;
     field->evalSpecialForm(rows, context, values);
+
+    if (isLazyNotLoaded(*values)) {
+      continue;
+    }
+
     if (values->mayHaveNulls()) {
-      auto nulls = values->flatRawNulls(rows);
-      if (nulls) {
+      LocalDecodedVector decoded(context, *values, rows);
+      if (auto* rawNulls = decoded->nulls()) {
         if (!result) {
           result = nullHolder.get(rows);
         }
         auto bits = result->asMutableRange().bits();
-        bits::andBits(bits, nulls, rows.begin(), rows.end());
+        bits::andBits(bits, rawNulls, rows.begin(), rows.end());
       }
     }
   }
@@ -659,11 +756,7 @@ void Expr::addNulls(
   }
 
   if (result->size() < rows.end()) {
-    // Not all Vectors support resize.  Since we only want to append nulls,
-    // we can work around that by calling setSize to resize the vector and
-    // ensureNullsCapacity to resize the nulls_ bit vector.
-    result->setSize(rows.end());
-    result->ensureNullsCapacity(rows.end(), true);
+    result->resize(rows.end());
   }
 
   result->addNulls(rawNulls, rows);
@@ -682,7 +775,12 @@ void Expr::evalWithNulls(
   if (propagatesNulls_) {
     bool mayHaveNulls = false;
     for (const auto& field : distinctFields_) {
-      if (context.getField(field->index(context))->mayHaveNulls()) {
+      const auto& vector = context.getField(field->index(context));
+      if (isLazyNotLoaded(*vector)) {
+        continue;
+      }
+
+      if (vector->mayHaveNulls()) {
         mayHaveNulls = true;
         break;
       }
@@ -731,7 +829,7 @@ void Expr::evalWithMemo(
       assert(cached); // lint
       cached->intersect(*cachedDictionaryIndices_);
       if (cached->hasSelections()) {
-        BaseVector::ensureWritable(rows, type(), context.pool(), &result);
+        context.ensureWritable(rows, type(), result);
         result->copy(dictionaryCache_.get(), *cached, nullptr);
       }
     }
@@ -765,8 +863,7 @@ void Expr::evalWithMemo(
       LocalSelectivityVector allUncached(context, dictionaryCache_->size());
       allUncached.get()->setAll();
       allUncached.get()->deselect(*cachedDictionaryIndices_);
-      BaseVector::ensureWritable(
-          *allUncached.get(), type(), context.pool(), &dictionaryCache_);
+      context.ensureWritable(*allUncached.get(), type(), dictionaryCache_);
 
       if (cachedDictionaryIndices_->size() < newCacheSize) {
         cachedDictionaryIndices_->resize(newCacheSize, false);
@@ -780,10 +877,14 @@ void Expr::evalWithMemo(
       }
       dictionaryCache_->copy(result.get(), *uncached, nullptr);
     }
+    context.releaseVector(base);
     return;
   }
+  context.releaseVector(baseDictionary_);
   baseDictionary_ = base;
   evalWithNulls(rows, context, result);
+
+  context.releaseVector(dictionaryCache_);
   dictionaryCache_ = result;
   if (!cachedDictionaryIndices_) {
     cachedDictionaryIndices_ =
@@ -916,14 +1017,15 @@ void Expr::evalAll(
         remainingRows = nonNulls.get();
         assert(remainingRows); // lint
       }
-      nonNulls.get()->deselectNulls(
-          inputValues_[i]->flatRawNulls(rows),
-          remainingRows->begin(),
-          remainingRows->end());
-      if (!remainingRows->hasSelections()) {
-        inputValues_.clear();
-        setAllNulls(rows, context, result);
-        return;
+      LocalDecodedVector decoded(context, *inputValues_[i], rows);
+      if (auto* rawNulls = decoded->nulls()) {
+        nonNulls.get()->deselectNulls(
+            rawNulls, remainingRows->begin(), remainingRows->end());
+        if (!remainingRows->hasSelections()) {
+          releaseInputValues(context);
+          setAllNulls(rows, context, result);
+          return;
+        }
       }
     }
   }
@@ -941,7 +1043,7 @@ void Expr::evalAll(
     }
     deselectErrors(context, *nonNulls.get());
     if (!remainingRows->hasSelections()) {
-      inputValues_.clear();
+      releaseInputValues(context);
       setAllNulls(rows, context, result);
       return;
     }
@@ -954,7 +1056,7 @@ void Expr::evalAll(
   if (remainingRows != &rows) {
     addNulls(rows, remainingRows->asRange().bits(), context, result);
   }
-  inputValues_.clear();
+  releaseInputValues(context);
 }
 
 namespace {
@@ -1107,66 +1209,12 @@ void Expr::applyFunction(
   auto isAscii = type()->isVarchar()
       ? computeIsAsciiForResult(vectorFunction_.get(), inputValues_, rows)
       : std::nullopt;
-  applyVectorFunction(rows, context, result);
+
+  vectorFunction_->apply(rows, inputValues_, type(), &context, &result);
+
   if (isAscii.has_value()) {
     result->asUnchecked<SimpleVector<StringView>>()->setIsAscii(
         isAscii.value(), rows);
-  }
-}
-
-void Expr::applyVectorFunction(
-    const SelectivityVector& rows,
-    EvalCtx& context,
-    VectorPtr& result) {
-  // Single-argument deterministic functions expect their input as a flat
-  // vector. Check if input has constant wrapping and remove it.
-  if (deterministic_ && inputValues_.size() == 1 &&
-      inputValues_[0]->isConstantEncoding()) {
-    applySingleConstArgVectorFunction(rows, context, result);
-  } else {
-    vectorFunction_->apply(rows, inputValues_, type(), &context, &result);
-  }
-}
-
-void Expr::applySingleConstArgVectorFunction(
-    const SelectivityVector& rows,
-    EvalCtx& context,
-    VectorPtr& result) {
-  VELOX_CHECK_EQ(rows.countSelected(), 1);
-
-  auto inputValue = inputValues_[0];
-
-  auto resultRow = rows.begin();
-
-  auto inputRow = inputValue->wrappedIndex(resultRow);
-  LocalSelectivityVector rowHolder(context);
-  auto inputRows = singleRow(rowHolder, inputRow);
-
-  // VectorFunction expects flat input. If constant is of complex type, we can
-  // use valueVector(). Otherwise, need to make a new flat vector.
-  std::vector<VectorPtr> args;
-  if (inputValue->isScalar()) {
-    auto flat = BaseVector::create(inputValue->type(), 1, context.pool());
-    flat->copy(inputValue.get(), 0, 0, 1);
-    args = {flat};
-  } else {
-    args = {inputValue->valueVector()};
-  }
-
-  VectorPtr tempResult;
-  vectorFunction_->apply(*inputRows, args, type(), &context, &tempResult);
-
-  if (result && !context.isFinalSelection()) {
-    BaseVector::ensureWritable(rows, type(), context.pool(), &result);
-    result->copy(tempResult.get(), resultRow, inputRow, 1);
-  } else {
-    // TODO Move is available only for flat vectors. Check if tempResult is
-    // not flat and copy if so.
-    if (inputRow < resultRow) {
-      tempResult->resize(resultRow + 1);
-    }
-    tempResult->move(inputRow, resultRow);
-    result = std::move(tempResult);
   }
 }
 

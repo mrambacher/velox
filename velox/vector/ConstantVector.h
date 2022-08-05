@@ -251,10 +251,6 @@ class ConstantVector final : public SimpleVector<T> {
     return true;
   }
 
-  bool isConstantEncoding() const override {
-    return true;
-  }
-
   bool isScalar() const override {
     return valueVector_ ? valueVector_->isScalar() : true;
   }
@@ -296,11 +292,6 @@ class ConstantVector final : public SimpleVector<T> {
     VELOX_FAIL("addNulls not supported");
   }
 
-  void move(vector_size_t /*source*/, vector_size_t target) override {
-    VELOX_CHECK_LT(target, BaseVector::length_);
-    // nothing to do
-  }
-
   std::optional<int32_t> compare(
       const BaseVector* other,
       vector_size_t index,
@@ -323,19 +314,21 @@ class ConstantVector final : public SimpleVector<T> {
     return SimpleVector<T>::compare(other, index, otherIndex, flags);
   }
 
-  std::string toString() const override {
-    std::stringstream out;
-    out << "[" << BaseVector::encoding() << " " << this->type()->toString()
-        << ": " << toString(index_) << " value, " << this->size() << " size]";
-    return out.str();
-  }
-
   std::string toString(vector_size_t index) const override {
     if (isScalar()) {
       return SimpleVector<T>::toString(index);
     }
 
     return valueVector_->toString(index_);
+  }
+
+ protected:
+  std::string toSummaryString() const override {
+    std::stringstream out;
+    out << "[" << BaseVector::encoding() << " "
+        << BaseVector::type()->toString() << ": " << BaseVector::size()
+        << " elements, " << toString(index_) << "]";
+    return out.str();
   }
 
  private:

@@ -18,7 +18,7 @@
 #include "velox/common/base/tests/GTestUtils.h"
 #include "velox/connectors/hive/HiveConnector.h"
 #include "velox/connectors/hive/HiveConnectorSplit.h"
-#include "velox/dwio/dwrf/test/utils/DataFiles.h"
+#include "velox/dwio/common/tests/utils/DataFiles.h"
 #include "velox/exec/PartitionedOutputBufferManager.h"
 #include "velox/exec/PlanNodeStats.h"
 #include "velox/exec/tests/utils/Cursor.h"
@@ -81,12 +81,11 @@ class TableScanTest : public virtual HiveConnectorTestBase {
     return HiveConnectorTestBase::assertQuery(plan, filePaths, duckDbSql);
   }
 
-  std::shared_ptr<facebook::velox::core::PlanNode> tableScanNode() {
+  core::PlanNodePtr tableScanNode() {
     return PlanBuilder().tableScan(rowType_).planNode();
   }
 
-  static std::shared_ptr<facebook::velox::core::PlanNode> tableScanNode(
-      const RowTypePtr& outputType) {
+  static core::PlanNodePtr tableScanNode(const RowTypePtr& outputType) {
     return PlanBuilder().tableScan(outputType).planNode();
   }
 

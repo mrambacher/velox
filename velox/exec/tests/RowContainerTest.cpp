@@ -19,7 +19,7 @@
 #include <array>
 #include <random>
 #include "velox/common/file/FileSystems.h"
-#include "velox/dwio/dwrf/test/utils/BatchMaker.h"
+#include "velox/dwio/common/tests/utils/BatchMaker.h"
 #include "velox/exec/ContainerRowSerde.h"
 #include "velox/exec/VectorHasher.h"
 #include "velox/exec/tests/utils/RowContainerTestBase.h"
@@ -48,7 +48,7 @@ class RowContainerTest : public exec::test::RowContainerTestBase {
     auto result = BaseVector::create(expected->type(), size, pool_.get());
     container.extractColumn(oddRows.data(), size, column, result);
     EXPECT_EQ(size, result->size());
-    for (size_t row = 0; row < size; ++row) {
+    for (vector_size_t row = 0; row < size; ++row) {
       if (row % 2 == 0) {
         EXPECT_TRUE(result->isNullAt(row)) << "at " << row;
       } else {
@@ -68,12 +68,8 @@ class RowContainerTest : public exec::test::RowContainerTestBase {
 
     auto result = BaseVector::create(expected->type(), size, pool_.get());
     container.extractColumn(rows.data(), size, column, result);
-    EXPECT_EQ(size, result->size());
-    for (size_t row = 0; row < size; ++row) {
-      EXPECT_TRUE(expected->equalValueAt(result.get(), row, row))
-          << "at " << row << ": expected " << expected->toString(row)
-          << ", got " << result->toString(row);
-    }
+
+    assertEqualVectors(expected, result);
   }
 
   void checkSizes(std::vector<char*>& rows, RowContainer& data) {
@@ -325,7 +321,8 @@ TEST_F(RowContainerTest, types) {
     auto source = batch->childAt(column);
     auto columnType = batch->type()->as<TypeKind::ROW>().childAt(column);
     VectorHasher hasher(columnType, column);
-    hasher.hash(*source, allRows, false, hashes);
+    hasher.decode(*source, allRows);
+    hasher.hash(allRows, false, hashes);
     DecodedVector decoded(*extracted, allRows);
     std::vector<uint64_t> rowHashes(kNumRows);
     data->hash(

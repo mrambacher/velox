@@ -13,8 +13,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 #include <folly/Random.h>
+#include <folly/init/Init.h>
 
 #include "velox/exec/tests/utils/OperatorTestBase.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
@@ -58,6 +58,7 @@ class VeloxSubstraitRoundTripPlanConverterTest : public OperatorTestBase {
       const std::shared_ptr<const core::PlanNode>& plan,
       const std::string& duckDbSql) {
     assertQuery(plan, duckDbSql);
+
     // Convert Velox Plan to Substrait Plan.
     google::protobuf::Arena arena;
     auto substraitPlan = veloxConvertor_->toSubstrait(arena, plan);
@@ -89,8 +90,13 @@ TEST_F(VeloxSubstraitRoundTripPlanConverterTest, filter) {
   createDuckDbTable(vectors);
 
   auto plan = PlanBuilder().values(vectors).filter("c2 < 1000").planNode();
-
   assertPlanConversion(plan, "SELECT * FROM tmp WHERE c2 < 1000");
+}
+
+TEST_F(VeloxSubstraitRoundTripPlanConverterTest, null) {
+  auto vectors = makeRowVector(ROW({}, {}), 1);
+  auto plan = PlanBuilder().values({vectors}).project({"NULL"}).planNode();
+  assertPlanConversion(plan, "SELECT NULL ");
 }
 
 TEST_F(VeloxSubstraitRoundTripPlanConverterTest, values) {
@@ -201,4 +207,10 @@ TEST_F(VeloxSubstraitRoundTripPlanConverterTest, sumMask) {
       "SELECT sum(c0) FILTER (WHERE c2 % 2 < 10), "
       "sum(c0) FILTER (WHERE c3 % 3 = 0), sum(c1) FILTER (WHERE c3 % 3 = 0) "
       "FROM tmp");
+}
+
+int main(int argc, char** argv) {
+  testing::InitGoogleTest(&argc, argv);
+  folly::init(&argc, &argv, false);
+  return RUN_ALL_TESTS();
 }

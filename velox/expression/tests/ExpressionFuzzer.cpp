@@ -29,16 +29,24 @@
 #include "velox/vector/fuzzer/VectorFuzzer.h"
 #include "velox/vector/tests/VectorMaker.h"
 
+DEFINE_int32(steps, 10, "Number of expressions to generate and execute.");
+
+DEFINE_int32(
+    duration_sec,
+    0,
+    "For how long it should run (in seconds). If zero, "
+    "it executes exactly --steps iterations and exits.");
+
 DEFINE_int32(
     batch_size,
     100,
     "The number of elements on each generated vector.");
 
-DEFINE_int32(
-    null_chance,
-    10,
+DEFINE_double(
+    null_ratio,
+    0.1,
     "Chance of adding a null constant to the plan, or null value in a vector "
-    "(expressed using '1 in x' semantic).");
+    "(expressed as double from 0 to 1).");
 
 DEFINE_bool(
     retry_with_try,
@@ -171,7 +179,7 @@ VectorFuzzer::Options getFuzzerOptions() {
   opts.vectorSize = FLAGS_batch_size;
   opts.stringVariableLength = true;
   opts.stringLength = 100;
-  opts.nullChance = FLAGS_null_chance;
+  opts.nullRatio = FLAGS_null_ratio;
   return opts;
 }
 
@@ -203,7 +211,8 @@ std::optional<CallableSignature> processSignature(
     const exec::FunctionSignature& signature) {
   // Don't support functions with parametrized signatures or variable number of
   // arguments yet.
-  if (!signature.typeVariableConstants().empty() || signature.variableArity()) {
+  if (!signature.typeVariableConstants().empty() || signature.variableArity() ||
+      !signature.variables().empty()) {
     LOG(WARNING) << "Skipping unsupported signature: " << functionName
                  << signature.toString();
     return std::nullopt;
@@ -326,42 +335,23 @@ class ExpressionFuzzer {
     seed(folly::Random::rand32(rng_));
   }
 
-  // Returns true 1/n of times.
-  bool oneIn(size_t n) {
-    return folly::Random::oneIn(n, rng_);
-  }
-
   void printRowVector(const RowVectorPtr& rowVector) {
-    LOG(INFO) << "RowVector contents:";
+    LOG(INFO) << "RowVector contents (" << rowVector->type()->toString()
+              << "):";
 
-    for (size_t i = 0; i < rowVector->childrenSize(); ++i) {
-      LOG(INFO) << "Column C" << i << ":";
-      auto child = rowVector->childAt(i);
-
-      // If verbose mode, print the whole vector.
-      for (size_t j = 0; j < child->size(); ++j) {
-        LOG(INFO) << "\tC" << i << "[" << j << "]: " << child->toString(j);
-      }
+    for (vector_size_t i = 0; i < rowVector->size(); ++i) {
+      LOG(INFO) << "\tAt " << i << ": " << rowVector->toString(i);
     }
   }
 
   RowVectorPtr generateRowVector() {
-    std::vector<VectorPtr> vectors;
-    vectors.reserve(inputRowTypes_.size());
-    size_t idx = 0;
-
-    for (const auto& inputRowType : inputRowTypes_) {
-      auto vector = vectorFuzzer_.fuzz(inputRowType);
-
-      vectors.emplace_back(vector);
-      ++idx;
-    }
-    return vectors.empty() ? nullptr : vectorMaker_.rowVector(vectors);
+    return vectorFuzzer_.fuzzRow(
+        ROW(std::move(inputRowNames_), std::move(inputRowTypes_)));
   }
 
   core::TypedExprPtr generateArgConstant(const TypePtr& arg) {
-    // One in ten times return a NULL constant.
-    if (oneIn(FLAGS_null_chance)) {
+    // 10% of times return a NULL constant.
+    if (vectorFuzzer_.coinToss(FLAGS_null_ratio)) {
       return std::make_shared<core::ConstantTypedExpr>(
           variant::null(arg->kind()));
     }
@@ -371,15 +361,16 @@ class ExpressionFuzzer {
 
   core::TypedExprPtr generateArgColumn(const TypePtr& arg) {
     inputRowTypes_.emplace_back(arg);
+    inputRowNames_.emplace_back(fmt::format("c{}", inputRowTypes_.size() - 1));
 
     return std::make_shared<core::FieldAccessTypedExpr>(
-        arg, fmt::format("c{}", inputRowTypes_.size() - 1));
+        arg, inputRowNames_.back());
   }
 
   core::TypedExprPtr generateArg(const TypePtr& arg) {
     size_t argClass = folly::Random::rand32(3, rng_);
 
-    // Toss a coin a choose between a constant, a column reference, or another
+    // Toss a coin and choose between a constant, a column reference, or another
     // expression (function).
     //
     // TODO: Add more expression types:
@@ -552,14 +543,33 @@ class ExpressionFuzzer {
     return true;
   }
 
- public:
-  void go(size_t steps) {
-    VELOX_CHECK(!signatures_.empty(), "No function signatures available.");
+  // If --duration_sec > 0, check if we expired the time budget. Otherwise,
+  // check if we expired the number of iterations (--steps).
+  template <typename T>
+  bool isDone(size_t i, T startTime) const {
+    if (FLAGS_duration_sec > 0) {
+      std::chrono::duration<double> elapsed =
+          std::chrono::system_clock::now() - startTime;
+      return elapsed.count() >= FLAGS_duration_sec;
+    }
+    return i >= FLAGS_steps;
+  }
 
-    for (size_t i = 0; i < steps; ++i) {
+ public:
+  void go() {
+    VELOX_CHECK(!signatures_.empty(), "No function signatures available.");
+    VELOX_CHECK(
+        FLAGS_steps > 0 || FLAGS_duration_sec > 0,
+        "Either --steps or --duration_sec needs to be greater than zero.")
+
+    auto startTime = std::chrono::system_clock::now();
+    size_t i = 0;
+
+    while (!isDone(i, startTime)) {
       LOG(INFO) << "==============================> Started iteration " << i
                 << " (seed: " << currentSeed_ << ")";
-      inputRowTypes_.clear();
+      VELOX_CHECK(inputRowTypes_.empty());
+      VELOX_CHECK(inputRowNames_.empty());
 
       // Pick a random signature to chose the root return type.
       size_t idx = folly::Random::rand32(signatures_.size(), rng_);
@@ -585,6 +595,7 @@ class ExpressionFuzzer {
 
       LOG(INFO) << "==============================> Done with iteration " << i;
       reSeed();
+      ++i;
     }
   }
 
@@ -616,15 +627,13 @@ class ExpressionFuzzer {
   // Contains the input column references that need to be generated for one
   // particular iteration.
   std::vector<TypePtr> inputRowTypes_;
+  std::vector<std::string> inputRowNames_;
 };
 
 } // namespace
 
-void expressionFuzzer(
-    FunctionSignatureMap signatureMap,
-    size_t steps,
-    size_t seed) {
-  ExpressionFuzzer(std::move(signatureMap), seed).go(steps);
+void expressionFuzzer(FunctionSignatureMap signatureMap, size_t seed) {
+  ExpressionFuzzer(std::move(signatureMap), seed).go();
 }
 
 } // namespace facebook::velox::test

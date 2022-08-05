@@ -16,6 +16,7 @@ add_subdirectory(utils)
 add_executable(
   velox_exec_test
   AssertQueryBuilderTest.cpp
+  AsyncConnectorTest.cpp
   AggregationTest.cpp
   AggregateFunctionRegistryTest.cpp
   AssignUniqueIdTest.cpp
@@ -41,7 +42,7 @@ add_executable(
   PrintPlanWithStatsTest.cpp
   RoundRobinPartitionFunctionTest.cpp
   RowContainerTest.cpp
-  SimpleFunctionResolutionTest.cpp
+  FunctionResolutionTest.cpp
   SpillTest.cpp
   SpillerTest.cpp
   StreamingAggregationTest.cpp
@@ -52,7 +53,8 @@ add_executable(
   TopNTest.cpp
   TreeOfLosersTest.cpp
   UnnestTest.cpp
-  VectorHasherTest.cpp)
+  VectorHasherTest.cpp
+  WindowFunctionRegistryTest.cpp)
 
 add_test(
   NAME velox_exec_test
@@ -64,11 +66,13 @@ target_link_libraries(
   velox_functions_test_lib
   velox_exec
   velox_dwio_common
+  velox_dwio_common_test_utils
   velox_aggregates
   velox_aggregates_test_lib
   velox_functions_lib
   velox_functions_prestosql
   velox_hive_connector
+  velox_test_util
   velox_type
   velox_serialization
   velox_exec_test_util

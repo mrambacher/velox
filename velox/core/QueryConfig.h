@@ -77,6 +77,15 @@ class QueryConfig {
   static constexpr const char* kMaxPartialAggregationMemory =
       "max_partial_aggregation_memory";
 
+  static constexpr const char* kMaxExtendedPartialAggregationMemory =
+      "max_extended_partial_aggregation_memory";
+
+  /// Output volume as percentage of input volume below which we will not seek
+  /// to increase reduction by using more memory. the data volume is measured as
+  /// the number of rows.
+  static constexpr const char* kPartialAggregationGoodPct =
+      "partial_aggregation_reduction_ratio_threshold";
+
   static constexpr const char* kMaxPartitionedOutputBufferSize =
       "driver.max-page-partitioning-buffer-size";
 
@@ -97,9 +106,24 @@ class QueryConfig {
 
   static constexpr const char* kTestingSpillPct = "testing.spill-pct";
 
+  static constexpr const char* kSpillPartitionBits = "spiller-partition-bits";
+
+  static constexpr const char* kSpillFileSizeFactor =
+      "spiller-file-size-factor";
+
   uint64_t maxPartialAggregationMemoryUsage() const {
     static constexpr uint64_t kDefault = 1L << 24;
     return get<uint64_t>(kMaxPartialAggregationMemory, kDefault);
+  }
+
+  uint64_t maxExtendedPartialAggregationMemoryUsage() const {
+    static constexpr uint64_t kDefault = 1L << 24;
+    return get<uint64_t>(kMaxExtendedPartialAggregationMemory, kDefault);
+  }
+
+  double partialAggregationGoodPct() const {
+    static constexpr double kDefault = 0.5;
+    return get<double>(kPartialAggregationGoodPct, kDefault);
   }
 
   // Returns the target size for a Task's buffered output. The
@@ -190,6 +214,25 @@ class QueryConfig {
   // will be forced to spill for testing. 0 means no extra spilling.
   int32_t testingSpillPct() const {
     return get<int32_t>(kTestingSpillPct, 0);
+  }
+
+  /// Returns the number of bits used to calculate the spilling partition
+  /// number. The number of spilling partitions will be power of two.
+  ///
+  /// NOTE: as for now, we only support up to 8-way spill partitioning.
+  int32_t spillPartitionBits() const {
+    constexpr int32_t kDefaultBits = 2;
+    constexpr int32_t kMaxBits = 3;
+    return std::min(kMaxBits, get<int32_t>(kSpillPartitionBits, kDefaultBits));
+  }
+
+  /// Returns the factor used to determine the target spill file size based on
+  /// the spilling operator's memory usage. For instance, if the spilling
+  /// operator has used 1GB memory and this factor is 2, then the target spill
+  /// file size will be set to 512MB.
+  int32_t spillFileSizeFactor() const {
+    constexpr int32_t kDefaultFactor = 4;
+    return get<int32_t>(kSpillFileSizeFactor, kDefaultFactor);
   }
 
   bool exprTrackCpuUsage() const {

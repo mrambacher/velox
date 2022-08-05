@@ -14,6 +14,7 @@
 
 add_executable(
   velox_expression_test
+  ExprEncodingsTest.cpp
   ExprTest.cpp
   EvalCtxTest.cpp
   ExprStatsTest.cpp
@@ -38,7 +39,8 @@ add_executable(
   GenericViewTest.cpp
   TryExprTest.cpp
   VariadicViewTest.cpp
-  VectorReaderTest.cpp)
+  VectorReaderTest.cpp
+  GenericWriterTest.cpp)
 
 add_test(
   NAME velox_expression_test

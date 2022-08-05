@@ -19,6 +19,7 @@ add_subdirectory(tz)
 add_library(
   velox_type
   Date.cpp
+  DecimalUtil.cpp
   Filter.cpp
   IntervalDayTime.cpp
   LongDecimal.cpp

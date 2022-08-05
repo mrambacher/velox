@@ -19,6 +19,7 @@ target_link_libraries(velox_aggregates_test_lib velox_exec_test_util)
 add_executable(
   velox_aggregates_test
   ApproxDistinctTest.cpp
+  ApproxMostFrequentTest.cpp
   ApproxPercentileTest.cpp
   ArbitraryTest.cpp
   ArrayAggTest.cpp
@@ -36,8 +37,10 @@ add_executable(
   PrestoHasherTest.cpp
   SumTest.cpp
   MapAggTest.cpp
+  MapUnionAggregationTest.cpp
   ValueListTest.cpp
-  VarianceAggregationTest.cpp)
+  VarianceAggregationTest.cpp
+  MaxSizeForStatsTest.cpp)
 
 add_test(
   NAME velox_aggregates_test
@@ -49,9 +52,10 @@ target_link_libraries(
   velox_aggregates
   velox_aggregates_test_lib
   velox_core
-  velox_dwrf_test_utils
+  velox_dwio_common_test_utils
   velox_exec
   velox_exec_test_util
+  velox_file
   velox_functions_test_lib
   velox_functions_prestosql
   velox_functions_lib

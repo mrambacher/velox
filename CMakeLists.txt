@@ -47,6 +47,7 @@ option(VELOX_ENABLE_BENCHMARKS_BASIC "Build velox basic benchmarks." OFF)
 option(VELOX_ENABLE_S3 "Build S3 Connector" OFF)
 option(VELOX_ENABLE_HDFS "Build Hdfs Connector" OFF)
 option(VELOX_ENABLE_PARQUET "Enable Parquet support" OFF)
+option(VELOX_ENABLE_ARROW "Enable Arrow support" OFF)
 option(VELOX_BUILD_TEST_UTILS "Enable Velox test utilities" OFF)
 
 if(${VELOX_BUILD_MINIMAL})
@@ -120,6 +121,9 @@ endif()
 
 if(VELOX_ENABLE_PARQUET)
   add_definitions(-DVELOX_ENABLE_PARQUET)
+  # Native Parquet reader requires Apache Thrift and Arrow Parquet writer, which
+  # are included in Arrow.
+  set(VELOX_ENABLE_ARROW ON)
 endif()
 
 # Turn on Codegen only for Clang and non Mac systems.

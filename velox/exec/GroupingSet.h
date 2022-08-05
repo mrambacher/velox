@@ -29,10 +29,10 @@ class GroupingSet {
  public:
   GroupingSet(
       std::vector<std::unique_ptr<VectorHasher>>&& hashers,
-      std::vector<ChannelIndex>&& preGroupedKeys,
+      std::vector<column_index_t>&& preGroupedKeys,
       std::vector<std::unique_ptr<Aggregate>>&& aggregates,
-      std::vector<std::optional<ChannelIndex>>&& aggrMaskChannels,
-      std::vector<std::vector<ChannelIndex>>&& channelLists,
+      std::vector<std::optional<column_index_t>>&& aggrMaskChannels,
+      std::vector<std::vector<column_index_t>>&& channelLists,
       std::vector<std::vector<VectorPtr>>&& constantLists,
       std::vector<TypePtr>&& intermediateTypes,
       bool ignoreNullKeys,
@@ -78,6 +78,11 @@ class GroupingSet {
   std::pair<int64_t, int64_t> spilledBytesAndRows() const {
     return spiller_ ? spiller_->spilledBytesAndRows()
                     : std::pair<int64_t, int64_t>(0, 0);
+  }
+
+  /// Return the number of rows kept in memory.
+  int64_t numRows() const {
+    return table_ ? table_->rows()->numRows() : 0;
   }
 
  private:
@@ -146,10 +151,10 @@ class GroupingSet {
   // groups.
   void extractSpillResult(const RowVectorPtr& result);
 
-  std::vector<ChannelIndex> keyChannels_;
+  std::vector<column_index_t> keyChannels_;
 
   /// A subset of grouping keys on which the input is clustered.
-  const std::vector<ChannelIndex> preGroupedKeyChannels_;
+  const std::vector<column_index_t> preGroupedKeyChannels_;
 
   std::vector<std::unique_ptr<VectorHasher>> hashers_;
   const bool isGlobal_;
@@ -158,7 +163,7 @@ class GroupingSet {
   std::vector<std::unique_ptr<Aggregate>> aggregates_;
   AggregationMasks masks_;
   // Argument list for the corresponding element of 'aggregates_'.
-  const std::vector<std::vector<ChannelIndex>> channelLists_;
+  const std::vector<std::vector<column_index_t>> channelLists_;
   // Constant arguments to aggregates. Corresponds pairwise to
   // 'channelLists_'. This is used when channelLists_[i][j] ==
   // kConstantChannel.
@@ -168,6 +173,11 @@ class GroupingSet {
   const std::vector<TypePtr> intermediateTypes_;
 
   const bool ignoreNullKeys_;
+
+  /// Parameters used for spilling control.
+  const int32_t spillPartitionBits_;
+  const int32_t spillFileSizeFactor_;
+
   memory::MappedMemory* FOLLY_NONNULL const mappedMemory_;
 
   // Boolean indicating whether accumulators for a global aggregation (i.e.
@@ -187,8 +197,6 @@ class GroupingSet {
   HashStringAllocator stringAllocator_;
   AllocationPool rows_;
   const bool isAdaptive_;
-
-  core::ExecCtx& execCtx_;
 
   bool noMoreInput_{false};
 
@@ -211,7 +219,6 @@ class GroupingSet {
 
   std::unique_ptr<Spiller> spiller_;
   std::unique_ptr<TreeOfLosers<SpillStream>> merge_;
-  RowContainerIterator spillIterator_;
 
   // Container for materializing batches of output from spilling.
   std::unique_ptr<RowContainer> mergeRows_;
