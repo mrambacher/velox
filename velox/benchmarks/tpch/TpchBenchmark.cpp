@@ -100,9 +100,9 @@ class TpchBenchmark {
     parse::registerTypeResolver();
     filesystems::registerLocalFileSystem();
     if (FLAGS_use_native_parquet_reader) {
-      parquet::registerParquetReaderFactory(parquet::ParquetReaderType::NATIVE);
+      parquet::registerParquetReaderFactory(parquet::PARQUET_NATIVE);
     } else {
-      parquet::registerParquetReaderFactory(parquet::ParquetReaderType::DUCKDB);
+      parquet::registerParquetReaderFactory(parquet::PARQUET_DUCKDB);
     }
     dwrf::registerDwrfReaderFactory();
     auto hiveConnector =

@@ -21,17 +21,16 @@
 
 namespace facebook::velox::parquet {
 
-void registerParquetReaderFactory(ParquetReaderType parquetReaderType) {
-  switch (parquetReaderType) {
-    case ParquetReaderType::DUCKDB:
+void registerParquetReaderFactory(const std::string& parquetReaderType) {
+  unregisterParquetReaderFactory();
+  if (parquetReaderType == PARQUET_DUCKDB) {
       dwio::common::registerReaderFactory(
           std::make_shared<duckdb_reader::ParquetReaderFactory>());
-      break;
+  } else if (parquetReaderType == PARQUET_NATIVE) {
     case ParquetReaderType::NATIVE:
       dwio::common::registerReaderFactory(
           std::make_shared<ParquetReaderFactory>());
-      break;
-    default:
+  } else {
       VELOX_UNSUPPORTED(
           "Velox does not support ParquetReaderType ", parquetReaderType);
   }

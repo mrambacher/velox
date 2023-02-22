@@ -17,11 +17,11 @@
 #pragma once
 
 namespace facebook::velox::parquet {
-
-enum class ParquetReaderType { DUCKDB, NATIVE };
-
+constexpr const char* PARQUET_DUCKDB = "DUCKDB";
+constexpr const char* PARQUET_NATIVE = "NATIVE";
+  
 void registerParquetReaderFactory(
-    ParquetReaderType parquetReaderType = ParquetReaderType::DUCKDB);
+    const std::string&  parquetReaderType = PARQUET_DUCKDB);
 
 void unregisterParquetReaderFactory();
 
